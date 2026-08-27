@@ -20,8 +20,10 @@
 # None of this loosens the landed-work gates below: the transition runs only on
 # the paths that already proceed to remove the record.
 # REFUSES before any worktree-based mutation unless the shared ownership
-# resolver proves the recorded path still belongs only to this task, and retires
-# the worktree's .fm-task-owner marker only once its slot is actually released.
+# resolver proves the recorded path still belongs only to this task. The
+# worktree's .fm-task-owner marker retires atomically with its worktree= claim,
+# so a provider return can never make a slot reusable while a marker still names
+# the task that just left it, and a failed return puts both back.
 # A force-authorized discard never bypasses that independent ownership proof.
 # A provider return or removal clears worktree= before the slot can become
 # reusable and restores the claim if the provider operation fails.
@@ -169,7 +171,6 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
-TASK_OWNER_MARKER=".fm-task-owner"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
@@ -2629,13 +2630,12 @@ cleanup_firstmate_home_children() {
             return "$child_return_rc"
           fi
           teardown_safe_rm_child_worktree_claimed \
-            "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj"
+            "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
         fi
       else
         teardown_safe_rm_child_worktree_claimed \
-          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj"
+          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
       fi
-      rm -f "$child_wt/$TASK_OWNER_MARKER"
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
     remove_kimi_turnend_auth "$sub_state" "$child_id" || return 1
@@ -2891,7 +2891,6 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   }
-  rm -f "$WT/$TASK_OWNER_MARKER"
   [ "$branch" = HEAD ] || git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
 fi
 

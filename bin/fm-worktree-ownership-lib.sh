@@ -12,13 +12,14 @@
 # that cannot be read is inconclusive and the remaining proofs still decide.
 # A secondmate home must carry its exact .fm-secondmate-home marker.
 # A crewmate worktree must never carry another task's .fm-task-owner marker.
-# An ordinary ship or scout must be on refs/heads/fm/<task-id>, or detached at
-# that exact task branch tip, so a different task branch always refuses.
-# A worktree that is detached with no task branch yet carries no branch
-# evidence either way - the documented state of a scout and of any ship whose
-# agent has not run `git checkout -b fm/<id>` - so it falls back to its
-# .fm-task-owner marker, and only to membership in the task's recorded project
-# when the slot was acquired before any marker was stamped there.
+# An ordinary ship or scout is proved by being on refs/heads/fm/<task-id> or
+# detached at that exact task branch tip, and a checkout on some other fm/<id>
+# branch always refuses.
+# Every other checkout state attributes the worktree to nobody - a scout's
+# permanent detached HEAD, a ship before its first `git checkout -b fm/<id>`, a
+# conflicted rebase or bisect detached off the branch tip - so it falls back to
+# its .fm-task-owner marker, and only to membership in the task's recorded
+# project when the slot was acquired before any marker was stamped there.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -36,6 +37,8 @@
 # make the path reusable, while retaining a byte-for-byte recovery copy.
 # Call fm_worktree_claim_retire_commit after provider success, or
 # fm_worktree_claim_retire_restore after provider failure.
+# It retires the worktree's .fm-task-owner marker in the same step, since that
+# marker is the in-worktree half of the same claim.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
 # returned slot with a stale destructive claim, and every later refusal over a
 # record with no claim names the surviving backup as its recovery source.
@@ -47,9 +50,12 @@ FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+FM_WORKTREE_CLAIM_RETIRE_MARKER=
+FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
 # Stamped by bin/fm-spawn.sh into a crewmate worktree once the task owns it, and
 # removed by bin/fm-teardown.sh when the slot is released.
 FM_WORKTREE_TASK_OWNER_MARKER=.fm-task-owner
+FM_WORKTREE_TASK_BRANCH_CONFLICT=
 
 fm_worktree_meta_exact_value() {  # <meta-file> <key>
   local meta=$1 key=$2 count value
@@ -224,30 +230,32 @@ EOF
   return 0
 }
 
-# 0 when the checkout positively attributes the worktree to the task, 1 when it
-# attributes it to something else, and 2 when a detached HEAD with no task
-# branch yet carries no branch evidence either way. A scout never leaves that
-# state and a ship only leaves it once its agent runs `git checkout -b fm/<id>`,
-# so 2 must stay inconclusive rather than becoming a refusal.
+# 0 when the checkout positively attributes the worktree to this task, 1 only
+# when it positively attributes it to a DIFFERENT fm task, and 2 for every state
+# that attributes it to nobody. A checkout is legitimately unattributed far more
+# often than it is foreign: a scout never leaves a detached HEAD, a ship stays
+# detached until its agent runs `git checkout -b fm/<id>`, and a conflicted
+# rebase or a bisect detaches HEAD off the task branch tip for as long as the
+# operation is in progress - exactly the wedged state stuck-crewmate recovery
+# has to act on. Those must stay inconclusive so a lease or an owner marker can
+# still decide, rather than deadlocking every lifecycle verb.
 fm_worktree_task_branch_proves_owner() {  # <canonical-worktree> <task-id>
   local worktree=$1 id=$2 branch expected="fm/$2" head expected_head
+  FM_WORKTREE_TASK_BRANCH_CONFLICT=
   branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
   if [ -n "$branch" ]; then
-    if [ "$branch" != "$expected" ]; then
-      fm_worktree_refuse "worktree $worktree is checked out on branch $branch, not task $id branch $expected."
-      return 1
-    fi
-    return 0
+    [ "$branch" != "$expected" ] || return 0
+    case "$branch" in
+      fm/*)
+        FM_WORKTREE_TASK_BRANCH_CONFLICT=$branch
+        return 1
+        ;;
+    esac
+    return 2
   fi
-  head=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) || {
-    fm_worktree_refuse "worktree $worktree has no inspectable HEAD for task $id."
-    return 1
-  }
+  head=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) || return 2
   expected_head=$(git -C "$worktree" rev-parse --verify "refs/heads/$expected" 2>/dev/null) || return 2
-  if [ "$head" != "$expected_head" ]; then
-    fm_worktree_refuse "worktree $worktree is detached at $head, not task $id branch tip $expected_head."
-    return 1
-  fi
+  [ "$head" = "$expected_head" ] || return 2
 }
 
 # The weakest proof an unbranched worktree can still offer: it must be one of
@@ -429,7 +437,19 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
           provider_proof=project-worktree
         fi
         ;;
-      *) return 1 ;;
+      *)
+        # Another task's branch is the weakest of the three refutations: a
+        # positive lease or this task's own marker is evidence a recycled slot
+        # cannot produce, so either one still carries the proof.
+        if [ -n "$provider_proof" ]; then
+          :
+        elif [ "$marker_rc" -eq 0 ]; then
+          provider_proof=task-owner-marker
+        else
+          fm_worktree_refuse "worktree $canonical is checked out on task branch $FM_WORKTREE_TASK_BRANCH_CONFLICT, not task $id branch fm/$id, and nothing else proves task $id still owns it."
+          return 1
+        fi
+        ;;
     esac
   fi
 
@@ -468,6 +488,8 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
     # retirement exists to establish already holds.
     FM_WORKTREE_CLAIM_RETIRE_META=$meta
     FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+    FM_WORKTREE_CLAIM_RETIRE_MARKER=
+    FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
     FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
     return 0
   fi
@@ -496,28 +518,68 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   FM_WORKTREE_CLAIM_RETIRE_META=$meta
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=$backup
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
+  fm_worktree_marker_retire "$dir" "$base" "$expected" || {
+    fm_worktree_claim_retire_restore || true
+    return 1
+  }
+}
+
+# The in-worktree owner marker is the other half of the same claim, so it is
+# retired in the same step: gone before the provider can recycle the slot, and
+# put back with the claim if the provider operation fails.
+fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
+  local dir=$1 base=$2 expected=$3 marker stash
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
+  [ -n "$expected" ] && [ -d "$expected" ] || return 0
+  marker="$expected/$FM_WORKTREE_TASK_OWNER_MARKER"
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 0
+  stash=$(umask 077; mktemp "$dir/.${base}.task-owner-backup.XXXXXX") || return 1
+  if ! cp -p -- "$marker" "$stash" || ! rm -f -- "$marker"; then
+    rm -f -- "$stash"
+    fm_worktree_refuse "could not retire the $FM_WORKTREE_TASK_OWNER_MARKER in $expected before the provider could reuse it."
+    return 1
+  fi
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=$marker
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=$stash
 }
 
 fm_worktree_claim_retire_commit() {
   local backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
+  local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   if [ -n "$backup" ] && ! rm -f -- "$backup"; then
     fm_worktree_refuse "worktree claim was cleared, but its retirement backup could not be removed at $backup."
     return 1
   fi
+  if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
+    fm_worktree_refuse "the worktree owner marker was retired, but its backup could not be removed at $marker_backup."
+    return 1
+  fi
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }
 
 fm_worktree_claim_retire_restore() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
+  local marker=$FM_WORKTREE_CLAIM_RETIRE_MARKER
+  local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   if [ -n "$backup" ] && ! mv -f -- "$backup" "$meta"; then
     fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
     return 1
   fi
+  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] && ! mv -f -- "$marker_backup" "$marker"; then
+    fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
+    return 1
+  fi
+  [ -z "$marker_backup" ] || rm -f -- "$marker_backup"
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }

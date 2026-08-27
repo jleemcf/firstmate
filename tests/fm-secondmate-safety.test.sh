@@ -1981,6 +1981,70 @@ EOF
   pass "secondmate force teardown discards child work"
 }
 
+test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove() {
+  local home subhome childproj childwt fakebin log err rc
+  home="$TMP_ROOT/child-removal-refused-home"
+  subhome="$TMP_ROOT/child-removal-refused-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/child-removal-refused-worktree"
+  err="$TMP_ROOT/child-removal-refused.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  fm_git_worktree "$childproj" "$childwt" fm/child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+EOF
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-removal-refused-fake")
+  log="$TMP_ROOT/child-removal-refused-fake/tmux.log"
+  # The child's pool return fails after deregistering its worktree, so the raw
+  # removal fallback can no longer attribute the path it would delete. That is
+  # the state where erasing the child's record would leave an unattributable
+  # copy on disk - exactly what this whole gate exists to prevent.
+  cat > "$fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = return ]; then
+  git -C "$childproj" worktree remove --force "$childwt" >/dev/null 2>&1
+  mkdir -p "$childwt"
+  printf 'stranded child work\n' > "$childwt/live-work"
+  exit 17
+fi
+exit 0
+EOF
+  chmod +x "$fakebin/treehouse"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-removal-refused-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "teardown reported success after a child removal it could not perform"
+  [ -e "$subhome/state/child.meta" ] \
+    || fail "teardown erased the only record attributing the child copy it failed to remove"
+  [ -e "$childwt/live-work" ] || fail "teardown removed the child copy it refused to attribute"
+  [ -e "$home/state/domain.meta" ] || fail "teardown cleared the parent meta after a failed child removal"
+  pass "a child worktree removal that refuses keeps the record that attributes it"
+}
+
 test_secondmate_force_teardown_refuses_child_quarantine_symlink() {
   local home subhome childproj childwt external fakebin log err rc
   home="$TMP_ROOT/force-quarantine-home"
@@ -3055,6 +3119,8 @@ test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work
+test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove
+test_secondmate_force_teardown_refuses_child_quarantine_symlink
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_allows_non_state_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home

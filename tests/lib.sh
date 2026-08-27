@@ -179,6 +179,30 @@ SH
   done
 }
 
+# fm_fake_treehouse <fakebin> [worktree-path]: a treehouse stub matching the
+# real CLI's shape where fm-spawn depends on it - a durable acquire
+# (`get --lease`) prints ONLY the leased worktree path on stdout, and every
+# other verb succeeds silently. The path is the optional argument when given,
+# else FM_FAKE_TREEHOUSE_WT, else the same FM_FAKE_PANE_PATH the tmux, herdr,
+# and zellij stubs report as the pane's cwd, so a case that already models a
+# settled pane needs no extra wiring.
+fm_fake_treehouse() {
+  local fakebin=$1 wt=${2:-}
+  cat > "$fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = get ]; then
+  for a in "\$@"; do
+    [ "\$a" = --lease ] || continue
+    printf '%s\\n' "\${FM_FAKE_TREEHOUSE_WT:-\${FM_FAKE_PANE_PATH:-$wt}}"
+    exit 0
+  done
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+}
+
 # fm_fake_version_tool <fakebin> <tool> <override-env-var> <default-version>
 # The stub answers `--version` with <override-env-var> when that variable is set
 # and non-empty, and with <default-version> otherwise; every other invocation

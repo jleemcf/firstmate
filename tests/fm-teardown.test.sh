@@ -188,6 +188,18 @@ write_meta() {
     "spawn_gen=teardown-test-task-x1"
 }
 
+# Stamp a worktree's owner marker exactly as bin/fm-spawn.sh does: excluded
+# from git first, so it never reads as uncommitted work.
+# Args: worktree task-id
+stamp_owner_marker() {
+  local wt=$1 id=$2 excl
+  excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
+    || printf '%s\n' '.fm-task-owner' >> "$excl"
+  printf '%s\n' "$id" > "$wt/.fm-task-owner"
+}
+
 # Commit something on the worktree's task branch. Args: case_dir [message]
 wt_commit() {
   local case_dir=$1 msg=${2:-wt work}
@@ -1199,7 +1211,7 @@ test_unbranched_worktree_marked_for_another_task_refuses() {
   # branch is gone, so nothing else distinguishes it from A's own workspace.
   git -C "$case_dir/wt" checkout -q --detach
   git -C "$case_dir/wt" branch -q -D fm/task-x1
-  printf '%s\n' task-b > "$case_dir/wt/.fm-task-owner"
+  stamp_owner_marker "$case_dir/wt" task-b
   printf '%s\n' "task B live work" > "$case_dir/wt/live-work"
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
@@ -1222,6 +1234,86 @@ EOF
   assert_present "$case_dir/state/task-x1.meta" \
     "unbranched-recycled: the refusal removed the task record"
   pass "an unbranched pool slot marked for another task refuses before any destructive act"
+}
+
+test_worktree_detached_off_its_task_branch_tip_is_still_torn_down() {
+  local case_dir rc
+  case_dir=$(make_case mid-operation-detached)
+  write_meta "$case_dir" no-mistakes ship
+  # The state a conflicted rebase or a bisect leaves a wedged crewmate in: HEAD
+  # is detached at a commit that is not the task branch tip, while fm/task-x1
+  # still points at the pre-operation tip.
+  wt_commit "$case_dir" "pre-operation tip"
+  git -C "$case_dir/wt" checkout -q --detach HEAD~1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "mid-operation-detached: a HEAD detached off the task branch tip must not deadlock teardown"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "mid-operation-detached: the pool slot was never returned"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "mid-operation-detached: teardown left the task record and its endpoint behind"
+  pass "a worktree detached off its own task branch tip is still proved and torn down"
+}
+
+test_owner_marker_carries_a_foreign_branch_checkout() {
+  local case_dir rc
+  case_dir=$(make_case marked-foreign-branch)
+  write_meta "$case_dir" no-mistakes ship
+  # An agent that checked out another task's branch in its OWN leased slot: the
+  # branch attributes the checkout elsewhere, but the slot's owner marker is
+  # evidence a recycled slot could never produce, so cleanup must still proceed.
+  git -C "$case_dir/wt" branch -m fm/task-b
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "marked-foreign-branch: this task's own owner marker must carry a foreign branch checkout"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "marked-foreign-branch: the pool slot was never returned"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "marked-foreign-branch: teardown left the task record behind"
+  pass "a foreign branch checkout is carried by this task's own owner marker"
+}
+
+test_owner_marker_is_retired_before_the_pool_return() {
+  local case_dir rc
+  case_dir=$(make_case marker-retired-first)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+if [ -e "$case_dir/wt/.fm-task-owner" ]; then
+  echo 'owner marker survived until the pool return' >&2
+  exit 26
+fi
+printf 'marker retired before return\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "marker-retired-first: teardown should retire the marker and return the slot"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "marker retired before return" "$case_dir/treehouse.log" \
+    "marker-retired-first: the pool return still saw a marker naming the departing task"
+  pass "the worktree owner marker is retired before the slot can become reusable"
 }
 
 test_dirty_worktree_refuses() {
@@ -2960,6 +3052,9 @@ test_vanished_worktree_path_still_releases_the_task_record
 test_ownership_proof_stays_conclusive_without_jq
 test_unbranched_worktree_with_uninspectable_project_refuses
 test_unbranched_worktree_marked_for_another_task_refuses
+test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
+test_owner_marker_carries_a_foreign_branch_checkout
+test_owner_marker_is_retired_before_the_pool_return
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds
