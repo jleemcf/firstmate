@@ -17,6 +17,12 @@
 #   Writes a task-private chrome-devtools-axi launcher. Before any browser action
 #   can auto-start the bridge, the launcher atomically changes started=0 to
 #   started=1. Read-only home/help/version and setup/stop commands do not mark it.
+#   The launcher becomes the first entry on the worker's PATH, so it is written
+#   only into a directory this user owns that no one else can write, and both the
+#   directory and its parent are checked: the task temp root is a predictable
+#   /tmp path, and a pre-created one must never let a local user shadow the
+#   worker's commands. A directory that fails the check is refused, and the
+#   caller drops the PATH prepend instead of launching through it.
 #
 # fm_chrome_axi_run <session> [args...]
 #   The single door to the browser tool. Every call names the session, drops an
@@ -36,6 +42,13 @@
 #   A PATH shim that rewrites every invocation onto one shared bridge, or an
 #   inherited port that pins every invocation to one bridge, answers active or
 #   unrecognized for that unused name and fails the proof.
+#   Consequence worth stating plainly: on a host whose resolved chrome-devtools-axi
+#   is such a wrapper - one that hardcodes a single shared session name for every
+#   call - the proof fails every time, so this reclamation is inert there and says
+#   so on each teardown. That is the deliberate trade: the only stop that wrapper
+#   would carry out is a stop of the captain's own bridge. Task-scoped reclamation
+#   starts working on that host as soon as its wrapper passes
+#   CHROME_DEVTOOLS_AXI_SESSION through instead of pinning it.
 #
 # fm_chrome_bridge_cleanup <state-dir> <task-id>
 #   Reads only that task's validated binding and never targets the default or
@@ -104,13 +117,33 @@ fm_chrome_binding_write() {  # <state-dir> <task-id>
   FM_CHROME_TASK_SESSION=$session
 }
 
+fm_chrome_dir_is_task_private() {  # <dir>
+  local dir=$1 mode
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  [ -O "$dir" ] || return 1
+  if [ "$(uname)" = Darwin ]; then
+    mode=$(stat -f %Lp "$dir" 2>/dev/null) || return 1
+  else
+    mode=$(stat -c %a "$dir" 2>/dev/null) || return 1
+  fi
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  case "${mode: -1}" in 2|3|6|7) return 1 ;; esac
+  case "${mode: -2:1}" in 2|3|6|7) return 1 ;; esac
+  return 0
+}
+
 fm_chrome_wrapper_write() {  # <state-dir> <task-id> <wrapper-path> <real-tool>
-  local state=$1 id=$2 wrapper=$3 tool=$4 record tmp old_umask
+  local state=$1 id=$2 wrapper=$3 tool=$4 record tmp old_umask wrapper_dir
   record="$state/$id.chrome-devtools-session"
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
   case "$tool" in /*) ;; *) return 1 ;; esac
   [ -x "$tool" ] || return 1
-  mkdir -p -- "$(dirname -- "$wrapper")" || return 1
+  wrapper_dir=$(dirname -- "$wrapper") || return 1
+  fm_chrome_dir_is_task_private "$(dirname -- "$wrapper_dir")" || return 1
+  (umask 077; mkdir -p -- "$wrapper_dir") || return 1
+  fm_chrome_dir_is_task_private "$wrapper_dir" || return 1
   tmp="$wrapper.tmp.${BASHPID:-$$}"
   old_umask=$(umask)
   umask 077
@@ -152,7 +185,8 @@ fm_chrome_axi_run() {  # <session> [args...]
   local session=$1 bound=${FM_CHROME_BRIDGE_TIMEOUT:-20}
   shift
   case "$bound" in ''|*[!0-9]*|0) bound=20 ;; esac
-  env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
+  fm_run_timed "$bound" \
+    env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
     chrome-devtools-axi "$@" < /dev/null
 }
 

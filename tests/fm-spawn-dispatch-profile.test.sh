@@ -917,8 +917,38 @@ test_missing_chrome_devtools_tool_does_not_block_the_launch() {
   pass "an absent chrome-devtools-axi degrades to a warning and still scopes the task's bridge session"
 }
 
+test_world_writable_task_temp_root_never_reaches_the_worker_path() {
+  local rec id out status record session textlog tasktmp
+  id=profile-chrome-untrusted-z22
+  tasktmp="/tmp/fm-$id"
+  rm -rf "$tasktmp"
+  mkdir -p "$tasktmp"
+  chmod 777 "$tasktmp"
+  rec=$(make_spawn_case profile-chrome-untrusted claude "$id")
+  read_case_record "$rec"
+  textlog="$CASE_DIR/text.log"
+
+  out=$(FM_TEST_TEXT_LOG="$textlog" \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "a pre-created task temp root must not block a ship launch"$'\n'"$out"
+  assert_contains "$out" "spawned $id harness=claude" "the launch did not complete"
+  record="$HOME_DIR/state/$id.chrome-devtools-session"
+  assert_present "$record" "spawn dropped the task-scoped Chrome binding"
+  session=$(sed -n 's/^session=//p' "$record")
+  assert_grep "export CHROME_DEVTOOLS_AXI_SESSION=$session" "$textlog" \
+    "spawn stopped scoping the task's Chrome session"
+  ! grep -q "export PATH=$tasktmp/bin" "$textlog" \
+    || fail "spawn put a world-writable task temp directory first on the worker's PATH"
+  assert_absent "$tasktmp/bin/chrome-devtools-axi" \
+    "spawn wrote its task-private launcher into a world-writable directory"
+  rm -rf "$tasktmp"
+  pass "a pre-created world-writable task temp root never becomes the worker's first PATH entry"
+}
+
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_missing_chrome_devtools_tool_does_not_block_the_launch
+test_world_writable_task_temp_root_never_reaches_the_worker_path
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

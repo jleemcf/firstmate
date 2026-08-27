@@ -2343,8 +2343,11 @@ fi
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
+# The root is created private (700) because it also carries the task-private
+# launcher directory that goes first on the worker's PATH, and /tmp/fm-<id> is a
+# name any local user could have created first.
 TASK_TMP="/tmp/fm-$ID"
-mkdir -p "$TASK_TMP/gotmp"
+(umask 077; mkdir -p "$TASK_TMP" && mkdir -p "$TASK_TMP/gotmp")
 
 # Per-harness turn-end hook where enabled: a file that touches
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
