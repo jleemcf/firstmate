@@ -185,19 +185,23 @@ write_meta() {
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode" \
-    "spawn_gen=teardown-test-task-x1"
+    "spawn_gen=test-generation-task-x1"
 }
 
 # Stamp a worktree's owner marker exactly as bin/fm-spawn.sh does: excluded
 # from git first, so it never reads as uncommitted work.
-# Args: worktree task-id
+# Args: worktree task-id [spawn-generation]
 stamp_owner_marker() {
-  local wt=$1 id=$2 excl
+  local wt=$1 id=$2 generation=${3:-test-generation-$2} excl
   excl=$(git -C "$wt" rev-parse --git-path info/exclude)
   mkdir -p "$(dirname "$excl")"
   grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
     || printf '%s\n' '.fm-task-owner' >> "$excl"
-  printf '%s\n' "$id" > "$wt/.fm-task-owner"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf 'task_id=%s\n' "$id"
+    printf 'spawn_gen=%s\n' "$generation"
+  } > "$wt/.fm-task-owner"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -987,28 +991,8 @@ EOF
   pass "recycled pooled worktree ownership conflict refuses before touching the live task"
 }
 
-test_treehouse_lease_and_task_branch_mismatches_refuse_concretely() {
+test_task_branch_mismatch_refuses_without_an_owner_marker() {
   local case_dir rc
-  case_dir=$(make_case lease-owner-refusal)
-  write_meta "$case_dir" no-mistakes ship
-  cat > "$case_dir/fakebin/treehouse" <<EOF
-#!/usr/bin/env bash
-if [ "\${1:-}" = status ]; then
-  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-b","lease_holder":"task-b"}]'
-  exit 0
-fi
-printf 'return reached\n' > "$case_dir/treehouse.log"
-EOF
-  chmod +x "$case_dir/fakebin/treehouse"
-
-  rc=0
-  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
-  expect_code 1 "$rc" "lease-owner-refusal: another task's provider lease must refuse"
-  assert_contains "$(cat "$case_dir/stderr")" "leased to task task-b, not task task-x1" \
-    "lease-owner-refusal: refusal did not name the conflicting provider owner"
-  assert_absent "$case_dir/treehouse.log" \
-    "lease-owner-refusal: provider mismatch still reached return"
-
   case_dir=$(make_case branch-owner-refusal)
   write_meta "$case_dir" no-mistakes ship
   git -C "$case_dir/wt" branch -m fm/task-b
@@ -1026,7 +1010,7 @@ EOF
     "branch-owner-refusal: refusal did not name the conflicting branch proof"
   assert_absent "$case_dir/treehouse.log" \
     "branch-owner-refusal: branch mismatch still reached return"
-  pass "provider leases and task branches must positively agree with the recorded owner"
+  pass "another task branch refuses when no owner marker proves the recorded owner"
 }
 
 test_normal_return_clears_the_worktree_claim_before_pool_release() {
@@ -1034,21 +1018,18 @@ test_normal_return_clears_the_worktree_claim_before_pool_release() {
   case_dir=$(make_case normal-return-clears-claim)
   write_meta "$case_dir" no-mistakes ship
   land_shippable_commit "$case_dir"
+  stamp_owner_marker "$case_dir/wt" task-x1
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
-if [ "\${1:-}" = status ]; then
-  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-x1","lease_holder":"task-x1"}]'
-  exit 0
-fi
 if grep -q '^worktree=' "$case_dir/state/task-x1.meta"; then
   echo 'worktree claim survived until pool return' >&2
   exit 23
 fi
-printf '%s\n' "\$*" | grep -F -- '--if-lease-id lease-task-x1' >/dev/null \
-  || { echo "conditional lease id missing from return: \$*" >&2; exit 24; }
-printf '%s\n' "\$*" | grep -F -- '--if-lease-holder task-x1' >/dev/null \
-  || { echo "conditional lease holder missing from return: \$*" >&2; exit 25; }
-printf 'claim cleared before conditional return\n' > "$case_dir/treehouse.log"
+if [ -e "$case_dir/wt/.fm-task-owner" ]; then
+  echo 'owner marker survived until pool return' >&2
+  exit 24
+fi
+printf 'claim and marker cleared before return\n' > "$case_dir/treehouse.log"
 EOF
   chmod +x "$case_dir/fakebin/treehouse"
 
@@ -1056,19 +1037,20 @@ EOF
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 0 "$rc" "normal-return-clears-claim: teardown should clear the claim and return the slot"
-  assert_grep "claim cleared before conditional return" "$case_dir/treehouse.log" \
-    "normal-return-clears-claim: pool return did not observe the cleared claim and positive lease proof"
-  pass "normal pool return clears the owning task's worktree claim in the same operation"
+  assert_grep "claim and marker cleared before return" "$case_dir/treehouse.log" \
+    "normal-return-clears-claim: pool return did not observe the cleared claim and owner marker"
+  pass "normal pool return clears the owning task's worktree claim and owner marker in the same operation"
 }
 
-test_unbranched_worktree_is_still_proved_and_torn_down() {
+test_unbranched_scout_owner_marker_is_proved_and_torn_down() {
   local case_dir rc
-  case_dir=$(make_case unbranched-owner)
-  write_meta "$case_dir" no-mistakes ship
-  # The state every scout works in, and the state any ship sits in until its
-  # agent runs `git checkout -b fm/<id>`: detached, with no task branch at all.
+  case_dir=$(make_case unbranched-scout-owner)
+  write_meta "$case_dir" no-mistakes scout
+  # The exact state every scout works in: detached, with no task branch at all.
+  # Its matching task-and-generation marker is the positive ownership binding.
   git -C "$case_dir/wt" checkout -q --detach
   git -C "$case_dir/wt" branch -q -D fm/task-x1
+  stamp_owner_marker "$case_dir/wt" task-x1
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
@@ -1079,12 +1061,12 @@ EOF
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
-  expect_code 0 "$rc" "unbranched-owner: a worktree with no task branch must not deadlock teardown"$'\n'"$(cat "$case_dir/stderr")"
+  expect_code 0 "$rc" "unbranched-scout-owner: a matching marker must protect a scout with no task branch"$'\n'"$(cat "$case_dir/stderr")"
   assert_grep "returned" "$case_dir/treehouse.log" \
-    "unbranched-owner: the pool slot was never returned"
+    "unbranched-scout-owner: the pool slot was never returned"
   assert_absent "$case_dir/state/task-x1.meta" \
-    "unbranched-owner: teardown left the task record and its endpoint behind"
-  pass "an unbranched detached worktree is proved by its project and torn down"
+    "unbranched-scout-owner: teardown left the scout record and endpoint behind"
+  pass "an unbranched scout is positively proved by its task-and-generation owner marker"
 }
 
 test_unbranched_worktree_outside_its_project_still_refuses() {
@@ -1145,8 +1127,8 @@ test_ownership_proof_stays_conclusive_without_jq() {
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then
-  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-x1","lease_holder":"task-x1"}]'
-  exit 0
+  echo 'ownership proof must not inspect treehouse leases' >&2
+  exit 71
 fi
 printf 'returned\n' > "$case_dir/treehouse.log"
 EOF
@@ -1163,7 +1145,7 @@ EOF
     "jqless-owner: the pool slot was never returned"
   assert_absent "$case_dir/state/task-x1.meta" \
     "jqless-owner: teardown left the task record and its endpoint behind"
-  pass "an unreadable treehouse pool stays inconclusive instead of deadlocking a jq-free home"
+  pass "ordinary ownership proof neither requires jq nor inspects Treehouse leases"
 }
 
 test_unbranched_worktree_with_uninspectable_project_refuses() {
@@ -1263,13 +1245,41 @@ EOF
   pass "a worktree detached off its own task branch tip is still proved and torn down"
 }
 
+test_same_task_id_with_a_different_marker_generation_refuses() {
+  local case_dir rc
+  case_dir=$(make_case same-id-recycled-generation)
+  write_meta "$case_dir" no-mistakes ship
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  stamp_owner_marker "$case_dir/wt" task-x1 later-generation-task-x1
+  printf '%s\n' "later spawn live work" > "$case_dir/wt/live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+printf 'returned\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" clean -qfdx >/dev/null 2>&1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "same-id-recycled-generation: stale generation must refuse"
+  assert_grep "generation later-generation-task-x1, not recorded generation test-generation-task-x1" "$case_dir/stderr" \
+    "same-id-recycled-generation: refusal did not name the generation mismatch"
+  assert_absent "$case_dir/treehouse.log" \
+    "same-id-recycled-generation: generation mismatch still reached pool return"
+  [ "$(cat "$case_dir/wt/live-work")" = "later spawn live work" ] \
+    || fail "same-id-recycled-generation: later spawn work was destroyed"
+  pass "a recycled slot reusing the same task id is distinguished by spawn generation"
+}
+
 test_owner_marker_carries_a_foreign_branch_checkout() {
   local case_dir rc
   case_dir=$(make_case marked-foreign-branch)
   write_meta "$case_dir" no-mistakes ship
   # An agent that checked out another task's branch in its OWN leased slot: the
   # branch attributes the checkout elsewhere, but the slot's owner marker is
-  # evidence a recycled slot could never produce, so cleanup must still proceed.
+  # the stronger positive binding, so cleanup must still proceed.
   git -C "$case_dir/wt" branch -m fm/task-b
   stamp_owner_marker "$case_dir/wt" task-x1
   cat > "$case_dir/fakebin/treehouse" <<EOF
@@ -3044,15 +3054,16 @@ test_pr_check_records_remote_head_when_local_lags
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_recycled_worktree_claim_refuses_before_live_work_is_touched
-test_treehouse_lease_and_task_branch_mismatches_refuse_concretely
+test_task_branch_mismatch_refuses_without_an_owner_marker
 test_normal_return_clears_the_worktree_claim_before_pool_release
-test_unbranched_worktree_is_still_proved_and_torn_down
+test_unbranched_scout_owner_marker_is_proved_and_torn_down
 test_unbranched_worktree_outside_its_project_still_refuses
 test_vanished_worktree_path_still_releases_the_task_record
 test_ownership_proof_stays_conclusive_without_jq
 test_unbranched_worktree_with_uninspectable_project_refuses
 test_unbranched_worktree_marked_for_another_task_refuses
 test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
+test_same_task_id_with_a_different_marker_generation_refuses
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_dirty_worktree_refuses

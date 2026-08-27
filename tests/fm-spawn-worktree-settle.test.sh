@@ -54,23 +54,7 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  # Record the durable acquire's own argv so the lease identity it carries is
-  # observable, then answer it with the leased path like the real CLI does.
-  cat > "$fakebin/treehouse" <<'SH'
-#!/usr/bin/env bash
-set -u
-if [ "${1:-}" = get ]; then
-  for a in "$@"; do
-    [ "$a" = --lease ] || continue
-    [ -z "${FM_FAKE_TREEHOUSE_ACQUIRE_LOG:-}" ] \
-      || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_ACQUIRE_LOG"
-    printf '%s\n' "${FM_FAKE_TREEHOUSE_WT:-${FM_FAKE_PANE_PATH:-}}"
-    exit 0
-  done
-fi
-exit 0
-SH
-  chmod +x "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" treehouse
   printf '%s\n' "$fakebin"
 }
 
@@ -112,9 +96,6 @@ run_settle_spawn() {
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$WT_DIR" FM_FAKE_PANE_STALE="$STALE_DIR" \
     FM_FAKE_PANE_STALE_READS="$STALE_READS" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
-    FM_FAKE_TREEHOUSE_ACQUIRE_LOG="${FM_FAKE_TREEHOUSE_ACQUIRE_LOG:-}" \
-    FM_FAKE_TREEHOUSE_WT="${FM_FAKE_TREEHOUSE_WT:-}" \
-    FM_SPAWN_WORKTREE_SETTLE_POLLS="${FM_SPAWN_WORKTREE_SETTLE_POLLS:-60}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -160,52 +141,7 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
-# The worktree a task works in is whatever the pool durably leased to it, never
-# whatever path the pane's shell is observed sitting in. A pane that never
-# reaches the leased slot must refuse rather than adopt the path it did reach -
-# that other path is a real, distinct worktree, so every structural check would
-# otherwise pass on it.
-test_a_pane_that_never_reaches_the_leased_worktree_refuses() {
-  local rec id out status
-  id=settle-never-arrives-z3
-  rec=$(make_settle_case settle-never-arrives "$id" 999)
-  read_settle_record "$rec"
-
-  out=$(FM_FAKE_TREEHOUSE_WT="$WT_DIR" FM_SPAWN_WORKTREE_SETTLE_POLLS=2 run_settle_spawn "$id")
-  status=$?
-
-  [ "$status" -ne 0 ] || fail "spawn should refuse when the pane never reaches the leased worktree"
-  assert_contains "$out" "not its leased worktree" \
-    "the refusal should name the leased worktree the endpoint never reached"
-  assert_absent "$HOME_DIR/state/$id.meta" \
-    "a refused spawn must not publish a task record"
-  pass "a pane that never reaches the leased worktree refuses instead of adopting the path it did reach"
-}
-
-# The acquire itself must carry the task identity, because that is what makes
-# the pool refuse to hand the same copy to a second task.
-test_acquire_carries_a_durable_lease_under_the_task_id() {
-  local rec id out status acquire
-  id=settle-lease-identity-z4
-  rec=$(make_settle_case settle-lease-identity "$id" 0)
-  read_settle_record "$rec"
-  acquire="$TMP_ROOT/settle-lease-identity-acquire.log"
-  : > "$acquire"
-
-  out=$(FM_FAKE_TREEHOUSE_ACQUIRE_LOG="$acquire" run_settle_spawn "$id")
-  status=$?
-
-  expect_code 0 "$status" "spawn should succeed"$'\n'"$out"
-  assert_grep "--lease-holder $id" "$acquire" \
-    "the pool acquire did not record this task as the lease holder"
-  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
-    "meta did not record the leased worktree"
-  pass "a crewmate slot is acquired as a durable lease held under the task id"
-}
-
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
-test_a_pane_that_never_reaches_the_leased_worktree_refuses
-test_acquire_carries_a_durable_lease_under_the_task_id
 
 echo "# all fm-spawn-worktree-settle tests passed"

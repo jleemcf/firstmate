@@ -1347,20 +1347,9 @@ cleanup_stale_lock_for_safety_check() {
 # stale git index.lock left by a killed crew process. See the script header.
 # The wrapper proves ownership again at the provider boundary, clears the claim
 # before Treehouse can recycle the slot, and restores it on every failed return.
-TEARDOWN_TREEHOUSE_RETURN_LEASE_ID=
-TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER=
-
 treehouse_return_once() {  # <worktree> <project>
   local dir=$1 cd_dir=$2
-  local -a args=(return --force)
-  if [ -n "$TEARDOWN_TREEHOUSE_RETURN_LEASE_ID" ]; then
-    args+=(--if-lease-id "$TEARDOWN_TREEHOUSE_RETURN_LEASE_ID")
-  fi
-  if [ -n "$TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER" ]; then
-    args+=(--if-lease-holder "$TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER")
-  fi
-  args+=("$dir")
-  (CDPATH='' cd -- "$cd_dir" && treehouse "${args[@]}")
+  (CDPATH='' cd -- "$cd_dir" && treehouse return --force "$dir")
 }
 
 teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-check]
@@ -1443,8 +1432,6 @@ teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <stat
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
   local claim_state=$5 claim_id=$6 claim_meta=$7 rc
   fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
-  TEARDOWN_TREEHOUSE_RETURN_LEASE_ID=$FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID
-  TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER=$FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER
   fm_worktree_claim_retire_begin "$claim_meta" "$dir" || return 1
   if teardown_treehouse_return_raw "$dir" "$cd_dir" "$label" "$post_cleanup_check"; then
     fm_worktree_claim_retire_commit

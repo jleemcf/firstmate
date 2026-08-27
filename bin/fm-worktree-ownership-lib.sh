@@ -6,20 +6,16 @@
 # proves that the meta has one inspectable worktree claim, no other task in the
 # same home claims the canonical path, and the strongest available positive
 # provider binding agrees with the task.
-# A Treehouse lease is authoritative when status exposes one for the path, and
-# an Orca worktree id must resolve back to the exact path. Treehouse inspection
-# needs jq, which only the JSON-emitting session adapters declare, so a pool
-# that cannot be read is inconclusive and the remaining proofs still decide.
+# An Orca worktree id must resolve back to the exact path.
 # A secondmate home must carry its exact .fm-secondmate-home marker.
-# A crewmate worktree must never carry another task's .fm-task-owner marker.
-# An ordinary ship or scout is proved by being on refs/heads/fm/<task-id> or
-# detached at that exact task branch tip, and a checkout on some other fm/<id>
-# branch always refuses.
-# Every other checkout state attributes the worktree to nobody - a scout's
-# permanent detached HEAD, a ship before its first `git checkout -b fm/<id>`, a
-# conflicted rebase or bisect detached off the branch tip - so it falls back to
-# its .fm-task-owner marker, and only to membership in the task's recorded
-# project when the slot was acquired before any marker was stamped there.
+# A crewmate worktree must never carry another task's .fm-task-owner marker;
+# that marker binds both task id and spawn generation to protect a slot recycled
+# to a later spawn of the same task id.
+# A matching owner marker proves an ordinary ship or scout without requiring a
+# branch, which covers every unbranched scout and ship before its first action.
+# When no marker exists for a pre-marker task, refs/heads/fm/<task-id> proves
+# ownership, another fm/<id> branch refuses, and an unattributed checkout falls
+# back to membership in the task's recorded project.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -28,9 +24,8 @@
 # refuses through fm_worktree_claim_retire_begin's expected-path match.
 # The function prints a concrete REFUSED reason and returns nonzero whenever a
 # proof is missing, contradictory, unreadable, or ambiguous.
-# On success it sets FM_WORKTREE_OWNERSHIP_PATH,
-# FM_WORKTREE_OWNERSHIP_PROOF, FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID,
-# and FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER.
+# On success it sets FM_WORKTREE_OWNERSHIP_PATH and
+# FM_WORKTREE_OWNERSHIP_PROOF.
 #
 # fm_worktree_claim_retire_begin <meta-file> <expected-worktree>
 # removes the exact worktree= claim before a provider return or removal can
@@ -45,8 +40,6 @@
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
-FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
-FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
@@ -173,63 +166,6 @@ fm_worktree_no_conflicting_claim() {  # <state-dir> <task-id> <meta-file> <canon
   done
 }
 
-# 0 when a Treehouse lease positively binds the slot to this task, 1 when it
-# binds it to someone else or the pool answer is self-contradictory, and 2 when
-# the pool cannot be inspected at all. Inspection needs treehouse plus jq, and
-# jq is only a declared dependency of the JSON-emitting session adapters
-# (fm_backend_required_tools in bin/fm-backend.sh), so its absence has to stay
-# inconclusive rather than deadlock every lifecycle verb on a tmux home.
-fm_worktree_treehouse_binding() {  # <project> <canonical-worktree> <task-id>
-  local project=$1 canonical=$2 id=$3 json rows path lease_id holder
-  local path_canonical matches=0 matched_lease_id= matched_holder=
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
-  command -v treehouse >/dev/null 2>&1 || return 2
-  command -v jq >/dev/null 2>&1 || return 2
-  [ -d "$project" ] || return 2
-  json=$(CDPATH='' cd -- "$project" 2>/dev/null && treehouse status --json 2>/dev/null) || return 2
-  [ -n "$json" ] || return 2
-  rows=$(printf '%s' "$json" | jq -r '
-    if type == "array" then
-      .[] | [(.path // ""), (.lease_id // ""), (.lease_holder // "")] | @tsv
-    else
-      error("treehouse status is not an array")
-    end
-  ' 2>/dev/null) || {
-    fm_worktree_refuse "treehouse status returned unreadable ownership data for task $id worktree $canonical."
-    return 1
-  }
-  while IFS=$'\t' read -r path lease_id holder; do
-    [ -n "$path" ] || continue
-    path_canonical=$(fm_worktree_claim_comparison_path "$path" 2>/dev/null || true)
-    [ "$path_canonical" = "$canonical" ] || continue
-    matches=$((matches + 1))
-    matched_lease_id=$lease_id
-    matched_holder=$holder
-  done <<EOF
-$rows
-EOF
-  if [ "$matches" -gt 1 ]; then
-    fm_worktree_refuse "treehouse status returned $matches ownership records for task $id worktree $canonical."
-    return 1
-  fi
-  [ "$matches" -eq 1 ] || return 2
-  if [ -z "$matched_holder" ] && [ -z "$matched_lease_id" ]; then
-    return 2
-  fi
-  if [ -z "$matched_holder" ] || [ -z "$matched_lease_id" ]; then
-    fm_worktree_refuse "Treehouse slot $canonical has an incomplete lease binding (holder ${matched_holder:-missing}, lease ${matched_lease_id:-missing}) for task $id."
-    return 1
-  fi
-  if [ "$matched_holder" != "$id" ]; then
-    fm_worktree_refuse "Treehouse slot $canonical is leased to task $matched_holder, not task $id."
-    return 1
-  fi
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=$matched_lease_id
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=$matched_holder
-  return 0
-}
-
 # 0 when the checkout positively attributes the worktree to this task, 1 only
 # when it positively attributes it to a DIFFERENT fm task, and 2 for every state
 # that attributes it to nobody. A checkout is legitimately unattributed far more
@@ -237,8 +173,8 @@ EOF
 # detached until its agent runs `git checkout -b fm/<id>`, and a conflicted
 # rebase or a bisect detaches HEAD off the task branch tip for as long as the
 # operation is in progress - exactly the wedged state stuck-crewmate recovery
-# has to act on. Those must stay inconclusive so a lease or an owner marker can
-# still decide, rather than deadlocking every lifecycle verb.
+# has to act on. Those stay inconclusive so the owner marker or legacy project
+# membership can decide rather than deadlocking every lifecycle verb.
 fm_worktree_task_branch_proves_owner() {  # <canonical-worktree> <task-id>
   local worktree=$1 id=$2 branch expected="fm/$2" head expected_head
   FM_WORKTREE_TASK_BRANCH_CONFLICT=
@@ -296,36 +232,46 @@ EOF
 }
 
 # The per-task ownership marker bin/fm-spawn.sh stamps into every crewmate
-# worktree once it owns the slot. 0 when it names this task, 1 when it names
-# another task or cannot be read, 2 when no marker has been stamped there yet
-# (a slot acquired before this marker existed, or one the pool just cleaned).
-fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id>
-  local canonical=$1 id=$2 marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER owner
+# worktree once it owns the slot. 0 when task id and spawn generation match this
+# task's metadata, 1 when either differs or the marker cannot be read, and 2
+# when no marker has been stamped there yet (a pre-marker task or a returned
+# slot). A generation mismatch refuses even when the task id was reused.
+fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation>
+  local canonical=$1 id=$2 expected_gen=$3 marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
+  local schema owner generation
   [ -e "$marker" ] || [ -L "$marker" ] || return 2
   if [ ! -f "$marker" ] || [ -L "$marker" ]; then
     fm_worktree_refuse "worktree $canonical has a $FM_WORKTREE_TASK_OWNER_MARKER that is not a regular ownership marker, so task $id cannot be proved to own it."
     return 1
   fi
-  owner=$(head -n 1 -- "$marker" 2>/dev/null || true)
-  if [ -z "$owner" ]; then
-    fm_worktree_refuse "worktree $canonical has an unreadable or empty $FM_WORKTREE_TASK_OWNER_MARKER, so task $id cannot be proved to own it."
+  schema=$(fm_worktree_meta_exact_value "$marker" schema 2>/dev/null || true)
+  owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
+  generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
+  if [ "$schema" != fm-task-owner.v1 ] || [ -z "$owner" ] || [ -z "$generation" ]; then
+    fm_worktree_refuse "worktree $canonical has an unreadable or incomplete $FM_WORKTREE_TASK_OWNER_MARKER, so task $id cannot be proved to own it."
     return 1
   fi
   if [ "$owner" != "$id" ]; then
     fm_worktree_refuse "worktree $canonical is marked as task $owner's workspace, not task $id's."
     return 1
   fi
+  if [ -z "$expected_gen" ]; then
+    fm_worktree_refuse "worktree $canonical is marked for task $id generation $generation, but task metadata has no exact spawn generation."
+    return 1
+  fi
+  if [ "$generation" != "$expected_gen" ]; then
+    fm_worktree_refuse "worktree $canonical is marked for task $id generation $generation, not recorded generation $expected_gen."
+    return 1
+  fi
   return 0
 }
 
 fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
-  local state=$1 id=$2 meta=$3 worktree canonical kind backend project
-  local marker worktree_id resolved resolved_canonical provider_proof= rc=0 claim_rc=0 present=0
+  local state=$1 id=$2 meta=$3 worktree canonical kind backend project spawn_gen
+  local marker worktree_id resolved resolved_canonical provider_proof='' rc=0 claim_rc=0 present=0
   local backup marker_rc=0
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
-  FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
   case "$id" in
     ''|*[!A-Za-z0-9._-]*)
       fm_worktree_refuse "cannot prove worktree ownership for invalid task id '${id:-missing}'."
@@ -342,6 +288,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   backend=$(fm_worktree_meta_exact_value "$meta" backend 2>/dev/null || true)
   [ -n "$backend" ] || backend=tmux
   project=$(fm_worktree_meta_exact_value "$meta" project 2>/dev/null || true)
+  spawn_gen=$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)
 
   worktree=$(fm_worktree_meta_claim "$meta" worktree) || claim_rc=$?
   if [ "$claim_rc" -eq 1 ]; then
@@ -395,13 +342,6 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
         return 1
       fi
     fi
-  else
-    if fm_worktree_treehouse_binding "$project" "$canonical" "$id"; then
-      provider_proof=treehouse-lease
-    else
-      rc=$?
-      [ "$rc" -eq 2 ] || return 1
-    fi
   fi
 
   if [ "$present" -eq 0 ]; then
@@ -421,39 +361,33 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
     marker_rc=0
-    fm_worktree_task_owner_marker_binding "$canonical" "$id" || marker_rc=$?
+    fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" || marker_rc=$?
     [ "$marker_rc" -ne 1 ] || return 1
-    rc=0
-    fm_worktree_task_branch_proves_owner "$canonical" "$id" || rc=$?
-    case "$rc" in
-      0) [ -n "$provider_proof" ] || provider_proof=task-branch ;;
-      2)
-        if [ -n "$provider_proof" ]; then
-          :
-        elif [ "$marker_rc" -eq 0 ]; then
-          provider_proof=task-owner-marker
-        else
+    if [ "$marker_rc" -eq 0 ]; then
+      provider_proof=task-owner-marker
+    elif [ -n "$provider_proof" ]; then
+      :
+    else
+      rc=0
+      fm_worktree_task_branch_proves_owner "$canonical" "$id" || rc=$?
+      case "$rc" in
+        0) provider_proof=task-branch ;;
+        2)
           fm_worktree_project_worktree_binding "$project" "$canonical" "$id" || return 1
-          provider_proof=project-worktree
-        fi
-        ;;
-      *)
-        # Another task's branch is the weakest of the three refutations: a
-        # positive lease or this task's own marker is evidence a recycled slot
-        # cannot produce, so either one still carries the proof.
-        if [ -n "$provider_proof" ]; then
-          :
-        elif [ "$marker_rc" -eq 0 ]; then
-          provider_proof=task-owner-marker
-        else
+          provider_proof='project-worktree'
+          ;;
+        *)
           fm_worktree_refuse "worktree $canonical is checked out on task branch $FM_WORKTREE_TASK_BRANCH_CONFLICT, not task $id branch fm/$id, and nothing else proves task $id still owns it."
           return 1
-        fi
-        ;;
-    esac
+          ;;
+      esac
+    fi
   fi
 
+  # Published to callers that source this library.
+  # shellcheck disable=SC2034
   FM_WORKTREE_OWNERSHIP_PATH=$canonical
+  # shellcheck disable=SC2034
   FM_WORKTREE_OWNERSHIP_PROOF=$provider_proof
   return 0
 }

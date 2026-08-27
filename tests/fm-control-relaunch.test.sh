@@ -155,6 +155,7 @@ add_ship_task() {
     echo "tasktmp=/tmp/fm-$id"
     echo "model=default"
     echo "effort=default"
+    echo "spawn_gen=prior-$id"
   } > "$home/state/$id.meta"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$wt" > "$dir/fake/cwd"
@@ -1375,8 +1376,12 @@ test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view() {
   out=$(run_control "$dir" rl32 relaunch --note "stopped mid-refactor"); rc=$?
 
   expect_code 0 "$rc" "a same-harness relaunch should succeed"$'\n'"$out"
-  [ "$(cat "$dir/wt/.fm-task-owner")" = rl32 ] \
-    || fail "relaunch did not stamp the worktree with its own task identity"
+  assert_grep 'schema=fm-task-owner.v1' "$dir/wt/.fm-task-owner" \
+    "relaunch did not stamp a versioned worktree owner marker"
+  assert_grep 'task_id=rl32' "$dir/wt/.fm-task-owner" \
+    "relaunch did not stamp the worktree with its own task identity"
+  assert_grep "spawn_gen=$(meta_field "$dir" rl32 spawn_gen)" "$dir/wt/.fm-task-owner" \
+    "relaunch marker generation does not match the published task generation"
   [ -z "$(git -C "$dir/wt" status --porcelain)" ] \
     || fail "the owner marker reads as uncommitted work: $(git -C "$dir/wt" status --porcelain)"
   pass "fm-control relaunch: the worktree carries this task's owner marker, excluded from git"
@@ -1389,7 +1394,11 @@ test_relaunch_refuses_a_worktree_marked_for_another_task() {
   printf 'zsh' > "$dir/fake/command"
   # A pool slot that has already been handed to a live task carries that task's
   # marker; adopting it would put two agents in one copy of the work.
-  printf '%s\n' live-task-b > "$dir/wt/.fm-task-owner"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=live-task-b'
+    printf '%s\n' 'spawn_gen=live-task-b-generation'
+  } > "$dir/wt/.fm-task-owner"
 
   out=$(run_control "$dir" rl33 relaunch --note "recover the dead task"); rc=$?
 
@@ -1398,8 +1407,8 @@ test_relaunch_refuses_a_worktree_marked_for_another_task() {
     "the refusal should name the marked owner"
   assert_no_grep "encode launch-brief" "$dir/fake/literal" \
     "a foreign owner marker must not launch a replacement into that worktree"
-  [ "$(cat "$dir/wt/.fm-task-owner")" = live-task-b ] \
-    || fail "the refused relaunch overwrote the other task's ownership marker"
+  assert_grep 'task_id=live-task-b' "$dir/wt/.fm-task-owner" \
+    "the refused relaunch overwrote the other task's ownership marker"
   pass "fm-control relaunch: a worktree marked for another task is refused before any launch"
 }
 
