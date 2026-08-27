@@ -684,6 +684,28 @@ SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
 }
 
+# A tool that answers plainly about every session name except one, which it fails
+# on with no output at all. The probe stays readable, so the ownership proof still
+# passes - the task's own session is the only name there is no evidence about.
+install_selectively_mute_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+case "${1:-}" in
+  '')
+    [ "$session" != "${FM_FAKE_CHROME_MUTE_SESSION:-}" ] || exit 1
+    printf '%s\n' 'browser: no active session'
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
 # A browser whose bridge stopped answering: every call blocks well past any
 # teardown the operator would wait for.
 install_hanging_chrome_devtools() {  # <case-dir>
@@ -695,6 +717,14 @@ set -u
 exec sleep 90
 SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+chrome_record_mode() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
 }
 
 write_chrome_binding() {  # <case-dir> [task-id]
@@ -3084,6 +3114,77 @@ test_idle_shared_bridge_still_reports_inert_reclamation() {
   pass "a task that started a bridge and needed no stop is told plainly what that answer does not establish"
 }
 
+# The task-private launcher's startup marker is what separates "the tool will not
+# talk about this name" from "this task never opened a bridge". The tool here is
+# readable everywhere except the task's own session, so the ownership proof passes
+# and only the marker decides: without a recorded start there is no evidence any
+# bridge exists under that name and no stop may be issued; with one, the stop is
+# warranted precisely because the launcher saw the task open a bridge.
+test_the_startup_marker_decides_a_stop_the_tool_will_not_talk_about() {
+  local case_dir rc session stop_log
+  case_dir=$(make_case chrome-unreadable-marker)
+  install_selectively_mute_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  stop_log="$case_dir/chrome-stop.log"
+
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_MUTE_SESSION="$session"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    export FM_FAKE_CHROME_MUTE_SESSION FM_FAKE_CHROME_STOP_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an unreadable per-session status must not fail cleanup"
+  [ ! -s "$stop_log" ] \
+    || fail "cleanup stopped a session for a task whose launcher recorded no bridge start"
+  assert_grep 'recorded no bridge start' "$case_dir/stderr" \
+    "cleanup skipped an unreadable status for an unstarted task without saying so"
+
+  mark_chrome_binding_started "$case_dir"
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_MUTE_SESSION="$session"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    export FM_FAKE_CHROME_MUTE_SESSION FM_FAKE_CHROME_STOP_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+  expect_code 0 "$rc" "a recorded start with an unreadable status must not fail cleanup"
+  assert_grep "$session|stop" "$stop_log" \
+    "a recorded bridge start did not warrant stopping a session the tool would not report on"
+  pass "the launcher's startup marker alone decides whether a session the tool will not report on is stopped"
+}
+
+# The binding record is a 0600 task-private file. Cleanup's marker reset rewrites
+# it from the operator's shell, whose umask is not the record's business.
+test_marker_reset_keeps_the_binding_record_private() {
+  local case_dir rc record mode
+  case_dir=$(make_case chrome-record-mode)
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  record="$case_dir/state/task-x1.chrome-devtools-session"
+  chmod 600 "$record"
+  mkdir -p "$case_dir/chrome-active"
+
+  rc=0
+  (
+    umask 022
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_ACTIVE_DIR="$case_dir/chrome-active"
+    export FM_FAKE_CHROME_ACTIVE_DIR
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "resetting the startup marker must not fail cleanup"
+  grep -q '^started=0$' "$record" || fail "cleanup did not reset the startup marker"
+  mode=$(chrome_record_mode "$record")
+  [ "$mode" = 600 ] \
+    || fail "cleanup widened the task binding record from 0600 to 0$mode"
+  pass "resetting the startup marker preserves the binding record's private mode"
+}
+
 # Mutation proof for this regression suite:
 # - deleting the cleanup call leaves the active-session test red;
 # - deciding cleanup from the recorded marker alone makes the launcher-bypass
@@ -3105,7 +3206,14 @@ test_idle_shared_bridge_still_reports_inert_reclamation() {
 #   exit, makes the stderr-status test red;
 # - reporting nothing when a task that started a bridge needs no stop makes the
 #   idle-shared-bridge test red;
-# - running the browser tool unbounded makes the hung-tool test red.
+# - running the browser tool unbounded makes the hung-tool test red;
+# - dropping the recorded-start requirement for an unreadable status, or reading
+#   an unreadable status as evidence of a live bridge, makes the startup-marker
+#   test red;
+# - rewriting the binding record under the ambient umask makes the record-mode
+#   test red.
+test_the_startup_marker_decides_a_stop_the_tool_will_not_talk_about
+test_marker_reset_keeps_the_binding_record_private
 test_unrecognized_live_status_is_still_reclaimed
 test_status_reported_on_stderr_is_understood_as_gone
 test_idle_shared_bridge_still_reports_inert_reclamation

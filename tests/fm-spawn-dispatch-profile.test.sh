@@ -861,7 +861,7 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
 }
 
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
-  local rec id out status record session textlog tasktmp wrapper launcher_dir
+  local rec id out status record session textlog tasktmp wrapper launcher_dir mode
   id=profile-chrome-session-z20
   rm -rf "/tmp/fm-$id"
   rec=$(make_spawn_case profile-chrome-session claude "$id")
@@ -894,10 +894,18 @@ test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
     "spawn created the task-private Chrome launcher at a name derivable from the task id"
   wrapper="$launcher_dir/chrome-devtools-axi"
   assert_present "$wrapper" "spawn did not create the task-private Chrome launcher"
-  CHROME_DEVTOOLS_AXI_SESSION="$session" "$wrapper" pages \
+  chmod 600 "$record"
+  ( umask 022; CHROME_DEVTOOLS_AXI_SESSION="$session" "$wrapper" pages ) \
     || fail "the task-private Chrome launcher did not delegate to the real tool"
   assert_grep 'started=1' "$record" \
     "the task-private Chrome launcher did not mark a bridge-starting action"
+  if [ "$(uname)" = Darwin ]; then
+    mode=$(stat -f %Lp "$record" 2>/dev/null)
+  else
+    mode=$(stat -c %a "$record" 2>/dev/null)
+  fi
+  [ "$mode" = 600 ] \
+    || fail "the launcher's startup marking widened the task binding record from 0600 to 0$mode"
   pass "spawn records and exports one non-default chrome-devtools bridge session per task"
 }
 

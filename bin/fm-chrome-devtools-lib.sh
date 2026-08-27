@@ -7,11 +7,14 @@
 #   the digest prevents equal task ids in separate homes from sharing a bridge.
 #
 # fm_chrome_binding_write <state-dir> <task-id>
-#   Atomically writes <state-dir>/<task-id>.chrome-devtools-session with the
-#   exact session and a started marker, then exports the session through
-#   FM_CHROME_TASK_SESSION. A fresh record starts at started=0; rewriting the
-#   record for the same session (relaunch) keeps an existing started=1 so a
-#   prior incarnation's live bridge stays owned by the task.
+#   Atomically writes <state-dir>/<task-id>.chrome-devtools-session, mode 0600,
+#   with the exact session and a started marker, then exports the session through
+#   FM_CHROME_TASK_SESSION. Every later rewriter of that record - the worker's
+#   launcher under its own ambient umask, and cleanup's marker reset - restores
+#   the same mode, so the record never widens after the task's first browser call.
+#   A fresh record starts at started=0; rewriting the record for the same session
+#   (relaunch) keeps an existing started=1 so a prior incarnation's live bridge
+#   stays owned by the task.
 #
 # fm_chrome_launcher_dir_create <parent-dir>
 #   Prints a fresh launcher directory created under an already-verified private
@@ -39,12 +42,16 @@
 #   tool can be a wrapper chain onto a browser that stopped answering.
 #
 # fm_chrome_session_liveness <session>
-#   Prints inactive or unknown for that exact named session by asking the tool
-#   for its status. The tool's only statement this repo has evidence for is the
-#   negative one - it reports "no active session" for a name with no bridge
-#   behind it - so that is the single confident answer. No wording for a live
-#   bridge is guessed at: every other answer, including an error, an empty
-#   answer, and a timeout, is unknown, which callers treat as possibly live.
+#   Prints inactive, present, or unreadable for that exact named session by asking
+#   the tool for its status. The tool's only statement this repo has evidence for
+#   is the negative one - it reports "no active session" for a name with no bridge
+#   behind it - so inactive is the single confident answer, and no wording for a
+#   live bridge is guessed at. The other two separate "the tool said something
+#   about this name that was not the gone answer" (present) from "the tool said
+#   nothing usable at all" - empty output, or the bound was hit (unreadable).
+#   That distinction is the difference between evidence a bridge exists under this
+#   exact name and no evidence either way, which is what decides whether the
+#   recorded startup marker is needed to justify a stop.
 #
 # fm_chrome_session_is_owned <session>
 #   Proof, not assumption, that the resolved tool acts on the session it is
@@ -65,19 +72,30 @@
 #   does and does not establish whenever a task that recorded a bridge start needs
 #   no stop, instead of letting that read as a completed reclamation.
 #
+# fm_chrome_binding_clear_started <state-dir> <task-id>
+#   Resets the startup marker to 0 once the task's bridge is known gone or has
+#   been stopped, preserving the record's 0600 mode.
+#
 # fm_chrome_bridge_cleanup <state-dir> <task-id>
 #   Reads only that task's validated binding and never targets the default or
 #   another task's session. A confident inactive makes no stop call, so a task
 #   that never started a bridge and a bridge this teardown already stopped are
-#   both silent. Anything else is treated as possibly live and reaches the stop
-#   only through the ownership proof, which itself needs a confident inactive on
-#   a never-used probe name. That pairing is the whole warrant for a stop: the
-#   same tool answers "gone" for a name nobody started and something else for
-#   this task's name. A tool that cannot produce that pair - one that pins every
-#   call to one bridge, or whose answers cannot be read at all - never reaches a
-#   stop, so the captain's own bridge is never the thing that gets stopped.
-#   Missing bindings are no-ops, missing tools, unproved ownership, timeouts, and
-#   stop errors warn but remain non-fatal, and callers own record retirement.
+#   both silent. A present answer is evidence a bridge exists under this task's
+#   own derived name - which a task that never started one cannot have - so it
+#   reaches the stop whether or not the launcher marked the start; that is what
+#   reclaims a bridge the worker opened around the launcher. An unreadable answer
+#   is no evidence at all, so it reaches the stop only when the task-private
+#   launcher recorded a start: the marker is the sole warrant for stopping a
+#   session the tool will not talk about, and without it no stop call is made.
+#   Every stop still passes the ownership proof, which itself needs a confident
+#   inactive on a never-used probe name. That pairing is the whole warrant for
+#   acting: the same tool answers "gone" for a name nobody started and something
+#   else for this task's name. A tool that cannot produce that pair - one that
+#   pins every call to one bridge, or whose answers cannot be read at all - never
+#   reaches a stop, so the captain's own bridge is never the thing that gets
+#   stopped. Missing bindings are no-ops, missing tools, unproved ownership,
+#   unreadable answers, and stop errors warn but remain non-fatal, and callers own
+#   record retirement.
 
 # Directory of this library, used to locate the sibling bounded runner. Resolved
 # at source time from BASH_SOURCE so it works whether sourced by a bin/ script
@@ -190,11 +208,12 @@ case "${1:-}" in
       exit 1
     fi
     marker_tmp="$record.started.${BASHPID:-$$}"
-    if ! awk -F= '
+    if ! (umask 077; awk -F= '
       $1 == "started" { print "started=1"; found=1; next }
       { print }
       END { if (!found) exit 1 }
-    ' "$record" > "$marker_tmp" || ! mv -f -- "$marker_tmp" "$record"; then
+    ' "$record" > "$marker_tmp") || ! chmod 600 -- "$marker_tmp" \
+      || ! mv -f -- "$marker_tmp" "$record"; then
       rm -f -- "$marker_tmp" 2>/dev/null || true
       echo "chrome-devtools-axi: could not record task bridge startup; refusing to start an untracked bridge" >&2
       exit 1
@@ -221,15 +240,22 @@ fm_chrome_axi_run() {  # <session> [args...]
 }
 
 fm_chrome_session_liveness() {  # <session>
-  local session=$1 status
+  local session=$1 status answer
   # Both streams and any exit status: a tool that reports the one contract line
   # this repo has evidence for on stderr, or alongside a nonzero status, is still
   # understood. Nothing is inferred from a positive-sounding answer.
-  status=$(fm_chrome_axi_run "$session" 2>&1) || true
-  case "$status" in
-    *'no active session'*) printf 'inactive\n' ;;
-    *) printf 'unknown\n' ;;
+  answer=$(fm_chrome_axi_run "$session" 2>&1) && status=0 || status=$?
+  case "$answer" in
+    *'no active session'*) printf 'inactive\n'; return 0 ;;
   esac
+  # 124 is fm_run_timed's bound-was-hit status, so a truncated answer counts as
+  # no answer. Anything else the tool actually said about this name is a readable
+  # answer that is not the gone answer.
+  if [ "$status" = 124 ] || [ -z "$answer" ]; then
+    printf 'unreadable\n'
+  else
+    printf 'present\n'
+  fi
 }
 
 fm_chrome_probe_session_name() {  # <session>
@@ -250,7 +276,8 @@ fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
   grep -q '^started=1$' "$record" 2>/dev/null || return 0
   tmp="$record.cleanup.${BASHPID:-$$}"
-  if ! sed 's/^started=1$/started=0/' "$record" > "$tmp" || ! mv -f -- "$tmp" "$record"; then
+  if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$tmp") \
+    || ! chmod 600 -- "$tmp" || ! mv -f -- "$tmp" "$record"; then
     rm -f -- "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -291,7 +318,8 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
   fi
   # The marker only covers bridges opened through the task-private launcher. Ask
   # the tool about this exact session so a bridge started around the launcher is
-  # still stopped, and so an already-stopped session raises no false failure.
+  # still stopped, so an already-stopped session raises no false failure, and so
+  # the marker is consulted only where the tool itself says nothing usable.
   liveness=$(fm_chrome_session_liveness "$session")
   if [ "$liveness" = inactive ]; then
     # A tool that pins every call to one shared bridge says exactly this, for any
@@ -305,6 +333,10 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
     fi
     fm_chrome_binding_clear_started "$state" "$id" \
       || echo "warning: chrome-devtools bridge for task $id is already gone, but its binding could not be reset" >&2
+    return 0
+  fi
+  if [ "$liveness" = unreadable ] && [ "$started" != 1 ]; then
+    echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
     return 0
   fi
   if ! fm_chrome_session_is_owned "$session"; then
