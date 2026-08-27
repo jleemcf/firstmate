@@ -632,6 +632,58 @@ SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
 }
 
+# The tool's status wording for a live bridge is not a contract this repo owns.
+# This one reports a live bridge in a shape no allowlist would have guessed.
+install_unworded_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+case "${1:-}" in
+  '')
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'Connected: https://example.invalid (2 tabs)'
+    else
+      printf '%s\n' 'browser: no active session'
+    fi
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+# Same answers, delivered the other legitimate way a CLI reports state: on stderr
+# with a nonzero exit. The one line this repo does have evidence for must still be
+# read as the tool saying the session is gone.
+install_stderr_status_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+case "${1:-}" in
+  '')
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'Connected: https://example.invalid (2 tabs)' >&2
+    else
+      printf '%s\n' 'browser: no active session' >&2
+    fi
+    exit 3
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
 # A browser whose bridge stopped answering: every call blocks well past any
 # teardown the operator would wait for.
 install_hanging_chrome_devtools() {  # <case-dir>
@@ -2940,6 +2992,98 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
   pass "an unresponsive browser bridge is bounded instead of stalling teardown"
 }
 
+# The status wording for a live bridge is unverified, so an unrecognized answer
+# must mean "possibly live", not "nothing to do". The ownership proof, which needs
+# the tool to answer "gone" for a name nothing ever started, is what makes the
+# stop safe - not a guess about how a live bridge is described.
+test_unrecognized_live_status_is_still_reclaimed() {
+  local case_dir rc session active_dir stop_log
+  case_dir=$(make_case chrome-unworded-status)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_unworded_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an unrecognized bridge status must not break teardown"
+  assert_grep "$session|stop" "$stop_log" \
+    "a live task bridge whose status wording was unrecognized was left orphaned"
+  assert_absent "$active_dir/$session" \
+    "a live task bridge whose status wording was unrecognized survived teardown"
+  pass "a live task bridge is reclaimed without guessing how the tool words a live status"
+}
+
+# The one line this repo has evidence for is the negative one. A tool that emits
+# it on stderr with a nonzero exit is still saying the bridge is gone: that must
+# read as a completed reclamation, not as an unreadable answer to warn about.
+test_status_reported_on_stderr_is_understood_as_gone() {
+  local case_dir rc active_dir stop_log record
+  case_dir=$(make_case chrome-stderr-status)
+  install_stderr_status_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  record="$case_dir/state/task-x1.chrome-devtools-session"
+  mkdir -p "$active_dir"
+
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOP_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a status reported on stderr must not fail cleanup"
+  [ ! -s "$stop_log" ] \
+    || fail "cleanup stopped a bridge the tool had already reported gone"
+  ! grep -q 'skipping the bridge stop' "$case_dir/stderr" \
+    || fail "cleanup treated a plainly reported gone bridge as an unreadable answer"
+  grep -q '^started=0$' "$record" \
+    || fail "cleanup did not retire the marker for a bridge the tool reported gone"
+  pass "a bridge status delivered on stderr with a nonzero exit is read as an already-gone bridge"
+}
+
+# The incident host's dispatcher answers for one shared bridge whatever session it
+# is handed, so while the captain's browser is idle it reports the task's session
+# gone too - indistinguishable, in that moment, from an honest tool with nothing
+# running. Teardown must not let that silence read as a completed reclamation for
+# a task that did start a bridge: the operator has to be told that reclamation is
+# inert on a host whose tool pins every call to one shared bridge.
+test_idle_shared_bridge_still_reports_inert_reclamation() {
+  local case_dir rc active_dir stop_log
+  case_dir=$(make_case chrome-session-blind-idle)
+  install_session_blind_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOP_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an idle shared bridge must not fail cleanup"
+  [ ! -s "$stop_log" ] \
+    || fail "cleanup issued a stop through a tool that discards the task session"
+  assert_grep 'reclamation is inert on such a host' "$case_dir/stderr" \
+    "cleanup silently accepted a session-blind tool's answer as a completed reclamation"
+  pass "a task that started a bridge and needed no stop is told plainly what that answer does not establish"
+}
+
 # Mutation proof for this regression suite:
 # - deleting the cleanup call leaves the active-session test red;
 # - deciding cleanup from the recorded marker alone makes the launcher-bypass
@@ -2955,7 +3099,16 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
 #   makes the session-blind test red;
 # - letting an inherited CHROME_DEVTOOLS_AXI_PORT through to the tool makes the
 #   ambient-port test red;
+# - classifying a live bridge from a guessed list of status words makes the
+#   unrecognized-status test red;
+# - reading the tool's status from stdout alone, or discarding it on a nonzero
+#   exit, makes the stderr-status test red;
+# - reporting nothing when a task that started a bridge needs no stop makes the
+#   idle-shared-bridge test red;
 # - running the browser tool unbounded makes the hung-tool test red.
+test_unrecognized_live_status_is_still_reclaimed
+test_status_reported_on_stderr_is_understood_as_gone
+test_idle_shared_bridge_still_reports_inert_reclamation
 test_active_chrome_bridge_is_stopped_without_touching_second_task
 test_unused_chrome_binding_makes_no_stop_call
 test_bridge_started_outside_the_task_launcher_is_still_stopped

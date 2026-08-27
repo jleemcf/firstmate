@@ -12,6 +12,9 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+# shellcheck source=bin/fm-chrome-devtools-lib.sh
+# shellcheck disable=SC1091
+. "$ROOT/bin/fm-chrome-devtools-lib.sh"
 
 make_spawn_pi_probe() {
   local fakebin=$1 tool=$2
@@ -858,8 +861,9 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
 }
 
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
-  local rec id out status record session textlog tasktmp wrapper
+  local rec id out status record session textlog tasktmp wrapper launcher_dir
   id=profile-chrome-session-z20
+  rm -rf "/tmp/fm-$id"
   rec=$(make_spawn_case profile-chrome-session claude "$id")
   read_case_record "$rec"
   textlog="$CASE_DIR/text.log"
@@ -879,7 +883,16 @@ test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
   assert_grep "unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$session; export PATH=" "$textlog" \
     "spawn did not export the recorded Chrome session and task-private launcher before launching the worker"
   tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
-  wrapper="$tasktmp/bin/chrome-devtools-axi"
+  launcher_dir=$(sed -n 's/.*export PATH=\([^:]*\):.*/\1/p' "$textlog" | tail -n 1)
+  case "$launcher_dir" in
+    "$tasktmp"/?*) ;;
+    *) fail "spawn put an unexpected directory first on the worker's PATH: ${launcher_dir:-empty}" ;;
+  esac
+  [ "$launcher_dir" != "$tasktmp/bin" ] \
+    || fail "the task-private Chrome launcher lives at a path derivable from the task id"
+  assert_absent "$tasktmp/bin" \
+    "spawn created the task-private Chrome launcher at a name derivable from the task id"
+  wrapper="$launcher_dir/chrome-devtools-axi"
   assert_present "$wrapper" "spawn did not create the task-private Chrome launcher"
   CHROME_DEVTOOLS_AXI_SESSION="$session" "$wrapper" pages \
     || fail "the task-private Chrome launcher did not delegate to the real tool"
@@ -891,6 +904,7 @@ test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
 test_missing_chrome_devtools_tool_does_not_block_the_launch() {
   local rec id out status record session textlog chromeless tasktmp
   id=profile-chrome-missing-z21
+  rm -rf "/tmp/fm-$id"
   rec=$(make_spawn_case profile-chrome-missing claude "$id")
   read_case_record "$rec"
   rm -f "$FAKEBIN_DIR/chrome-devtools-axi"
@@ -912,8 +926,10 @@ test_missing_chrome_devtools_tool_does_not_block_the_launch() {
   assert_grep "export CHROME_DEVTOOLS_AXI_SESSION=$session" "$textlog" \
     "spawn stopped scoping the task's Chrome session when the tool was absent"
   tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
-  assert_absent "$tasktmp/bin/chrome-devtools-axi" \
-    "spawn wrote a task-private Chrome launcher with no real tool behind it"
+  [ -z "$(find "$tasktmp" -name chrome-devtools-axi -print -quit 2>/dev/null)" ] \
+    || fail "spawn wrote a task-private Chrome launcher with no real tool behind it"
+  ! grep -q 'export PATH=' "$textlog" \
+    || fail "spawn prepended a launcher directory to the worker PATH with no real tool behind it"
   pass "an absent chrome-devtools-axi degrades to a warning and still scopes the task's bridge session"
 }
 
@@ -938,17 +954,50 @@ test_world_writable_task_temp_root_never_reaches_the_worker_path() {
   session=$(sed -n 's/^session=//p' "$record")
   assert_grep "export CHROME_DEVTOOLS_AXI_SESSION=$session" "$textlog" \
     "spawn stopped scoping the task's Chrome session"
-  ! grep -q "export PATH=$tasktmp/bin" "$textlog" \
+  ! grep -q "export PATH=$tasktmp" "$textlog" \
     || fail "spawn put a world-writable task temp directory first on the worker's PATH"
-  assert_absent "$tasktmp/bin/chrome-devtools-axi" \
-    "spawn wrote its task-private launcher into a world-writable directory"
+  [ -z "$(find "$tasktmp" -name chrome-devtools-axi -print -quit 2>/dev/null)" ] \
+    || fail "spawn wrote its task-private launcher into a world-writable directory"
   rm -rf "$tasktmp"
   pass "a pre-created world-writable task temp root never becomes the worker's first PATH entry"
+}
+
+# The launcher directory goes first on the worker's PATH, so its name must not be
+# reconstructible from anything an onlooker knows - the task id and its /tmp root
+# are both visible in fleet output. Minting it twice under one root must not
+# produce the same path.
+test_task_private_launcher_directory_is_unpredictable() {
+  local parent first second
+  parent="$TMP_ROOT/launcher-unpredictable"
+  rm -rf "$parent"
+  mkdir -p "$parent"
+  chmod 700 "$parent"
+
+  first=$(fm_chrome_launcher_dir_create "$parent") \
+    || fail "could not create a task-private Chrome launcher directory"
+  second=$(fm_chrome_launcher_dir_create "$parent") \
+    || fail "could not create a second task-private Chrome launcher directory"
+  [ "$first" != "$second" ] \
+    || fail "two launcher directories under one task temp root reused a single derivable name"
+  case "$first" in
+    "$parent"/?*) ;;
+    *) fail "the launcher directory escaped its verified task temp root: $first" ;;
+  esac
+  fm_chrome_dir_is_task_private "$first" \
+    || fail "the launcher directory was not created private to this user"
+
+  chmod 777 "$parent"
+  ! fm_chrome_launcher_dir_create "$parent" >/dev/null 2>&1 \
+    || fail "a launcher directory was minted under a world-writable parent"
+  chmod 700 "$parent"
+  rm -rf "$parent"
+  pass "the task-private Chrome launcher directory is minted unpredictably inside a verified private root"
 }
 
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path
+test_task_private_launcher_directory_is_unpredictable
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

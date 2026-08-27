@@ -2345,7 +2345,9 @@ fi
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 # The root is created private (700) because it also carries the task-private
 # launcher directory that goes first on the worker's PATH, and /tmp/fm-<id> is a
-# name any local user could have created first.
+# name any local user could have created first. The launcher directory itself is
+# minted with an unpredictable name inside it, so its exact path is never
+# derivable from the task id.
 TASK_TMP="/tmp/fm-$ID"
 (umask 077; mkdir -p "$TASK_TMP" && mkdir -p "$TASK_TMP/gotmp")
 
@@ -2877,12 +2879,16 @@ if [ "$KIND" != secondmate ]; then
     echo "warning: could not create the task-scoped chrome-devtools bridge binding for $ID; this task will not isolate a browser bridge" >&2
   else
     CHROME_DEVTOOLS_AXI_BIN=$(command -v chrome-devtools-axi 2>/dev/null || true)
-    CHROME_DEVTOOLS_AXI_WRAPPER="$TASK_TMP/bin/chrome-devtools-axi"
     CHROME_DEVTOOLS_AXI_EXPORTS="unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$FM_CHROME_TASK_SESSION"
     case "$CHROME_DEVTOOLS_AXI_BIN" in
       /*)
-        if fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_WRAPPER" "$CHROME_DEVTOOLS_AXI_BIN"; then
-          CHROME_DEVTOOLS_AXI_EXPORTS="$CHROME_DEVTOOLS_AXI_EXPORTS; export PATH=$TASK_TMP/bin:\$PATH"
+        # The launcher dir is minted fresh under the task temp root rather than
+        # named from the task id: it goes first on the worker's PATH, and
+        # /tmp/fm-<id>/bin would be a name any local user could reach for.
+        CHROME_DEVTOOLS_AXI_BINDIR=$(fm_chrome_launcher_dir_create "$TASK_TMP" || true)
+        if [ -n "$CHROME_DEVTOOLS_AXI_BINDIR" ] \
+          && fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_BINDIR/chrome-devtools-axi" "$CHROME_DEVTOOLS_AXI_BIN"; then
+          CHROME_DEVTOOLS_AXI_EXPORTS="$CHROME_DEVTOOLS_AXI_EXPORTS; export PATH=$CHROME_DEVTOOLS_AXI_BINDIR:\$PATH"
         else
           echo "warning: could not create the task-scoped chrome-devtools bridge launcher for $ID; the session stays task-scoped and teardown still reclaims it" >&2
         fi
