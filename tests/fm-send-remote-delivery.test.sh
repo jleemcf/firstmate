@@ -617,6 +617,27 @@ test_remote_send_budget_bounds_busy_lane() {
   home=$(setup_remote_parent_home remote-budget "$rhome")
   delivery=aaaabbbbccccdddd
 
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" FM_SEND_REMOTE_BUDGET=invalid \
+    "$SEND" rsm --key Enter >"$dir/key-invalid.out" 2>"$dir/key-invalid.err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "an invalid remote key budget must fail"
+  assert_contains "$(cat "$dir/key-invalid.err")" "must be a positive integer" \
+    "an invalid remote key budget must explain its validation failure"
+  [ ! -f "$ssh_log.count" ] || fail "an invalid remote key budget reached the transport"
+
+  began=$(date +%s)
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" FM_FAKE_SSH_HANG=60 FM_SEND_REMOTE_BUDGET=2 \
+    "$SEND" rsm --key Enter >"$dir/key.out" 2>"$dir/key.err" || rc=$?
+  elapsed=$(( $(date +%s) - began ))
+  expect_code 1 "$rc" "a bounded remote key must preserve the existing failure contract"
+  [ "$elapsed" -le 15 ] || fail "the bounded remote key waited ${elapsed}s behind the busy lane"
+  assert_contains "$(cat "$dir/key.err")" "completion may be unknown" \
+    "a bounded remote key failure must preserve its existing diagnostic"
+  [ "$(cat "$ssh_log.count")" = 1 ] \
+    || fail "a bounded remote key must make exactly one transport attempt"
+  printf '0\n' > "$ssh_log.count"
+
   # T5: a fire-and-forget send to a mate behind a busy lane returns its
   # unconfirmed result within its own budget instead of waiting the lane out.
   began=$(date +%s)

@@ -154,6 +154,19 @@ SEQ_RESULTS=$(printf '%s\n%s\n' "$(cat "$TMP_ROOT/seq-first")" "$(cat "$TMP_ROOT
 [ "$(cat "$STATE_ROOT/seq")" = 2 ] || fail "the sequence counter did not retain both allocations"
 pass "a displaced stale-lock holder retries without reusing a sequence"
 
+mkdir "$STATE_ROOT/.seq.lock"
+printf 'orphaned-holder\n' > "$STATE_ROOT/.seq.lock/owner"
+chmod 600 "$STATE_ROOT/.seq.lock/owner"
+SEQ_RECOVERY_BEGAN=$(date +%s)
+fm_remote_job_next_seq > "$TMP_ROOT/seq-after-fresh-orphan" \
+  || fail "a fresh orphaned sequence lock was not recovered"
+SEQ_RECOVERY_ELAPSED=$(( $(date +%s) - SEQ_RECOVERY_BEGAN ))
+[ "$(cat "$TMP_ROOT/seq-after-fresh-orphan")" = 3 ] \
+  || fail "fresh orphan recovery did not allocate the next sequence"
+[ "$SEQ_RECOVERY_ELAPSED" -le 10 ] \
+  || fail "fresh orphan recovery exceeded its retry deadline: ${SEQ_RECOVERY_ELAPSED}s"
+pass "a fresh orphaned sequence lock survives until stale recovery"
+
 fm_on() {
   FM_HOME="$LOCAL_HOME" \
   FM_ROOT_OVERRIDE="$REMOTE_ROOT" \

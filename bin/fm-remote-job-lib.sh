@@ -502,11 +502,12 @@ fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
 
 fm_remote_job_next_seq() { # [stage-dir destination]
   local stage=${1:-} destination=${2:-} published=0
-  local lock counter tmp value attempt=0 mtime now token stolen file
+  local lock counter tmp value attempt=0 mtime now token stolen file retry_deadline
   [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
   lock="$FM_REMOTE_JOB_STATE/.seq.lock"
   counter="$FM_REMOTE_JOB_STATE/seq"
-  while [ "$attempt" -lt 200 ]; do
+  retry_deadline=$(( $(date +%s) + 10 ))
+  while :; do
     attempt=$((attempt + 1))
     if (umask 077; mkdir "$lock") 2>/dev/null; then
       token="${BASHPID:-$$}-$RANDOM-$attempt-$(date +%s)"
@@ -570,9 +571,10 @@ fm_remote_job_next_seq() { # [stage-dir destination]
           ;;
       esac
     fi
+    now=$(date +%s)
+    [ "$now" -lt "$retry_deadline" ] || return 1
     sleep 0.02
   done
-  return 1
 }
 
 fm_remote_job_cancelled() { # <job-dir>
