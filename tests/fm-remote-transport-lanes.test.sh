@@ -116,6 +116,44 @@ export FM_REMOTE_JOB_STAGE_REAP_SECONDS=1
 # shellcheck source=bin/fm-remote-job-lib.sh
 . "$ROOT/bin/fm-remote-job-lib.sh"
 
+fm_remote_job_prepare_state "$ACCOUNT_HOME" || fail "$FM_REMOTE_JOB_ERROR"
+rm -f -- "$STATE_ROOT/seq"
+SEQ_READ_BLOCKED="$TMP_ROOT/seq-read-blocked"
+SEQ_READ_RELEASE="$TMP_ROOT/seq-read-release"
+cat() {
+  if [ "${1:-}" = "$STATE_ROOT/seq" ] && mkdir "$TMP_ROOT/seq-read-once" 2>/dev/null; then
+    : > "$SEQ_READ_BLOCKED"
+    while [ ! -f "$SEQ_READ_RELEASE" ]; do sleep 0.02; done
+    printf '0\n'
+    return 0
+  fi
+  command cat "$@"
+}
+fm_remote_job_next_seq > "$TMP_ROOT/seq-first" &
+SEQ_FIRST_PID=$!
+for _ in $(seq 1 200); do
+  [ -f "$STATE_ROOT/.seq.lock/owner" ] && [ -f "$SEQ_READ_BLOCKED" ] && break
+  sleep 0.02
+done
+assert_present "$STATE_ROOT/.seq.lock/owner" "the first sequence allocator did not acquire its lock"
+touch -t 200001010000 "$STATE_ROOT/.seq.lock"
+fm_remote_job_next_seq > "$TMP_ROOT/seq-second" &
+SEQ_SECOND_PID=$!
+for _ in $(seq 1 400); do
+  [ -f "$STATE_ROOT/seq" ] && break
+  sleep 0.02
+done
+assert_present "$STATE_ROOT/seq" "the replacement sequence allocator did not publish"
+: > "$SEQ_READ_RELEASE"
+wait "$SEQ_FIRST_PID" || fail "the displaced sequence allocator did not retry"
+wait "$SEQ_SECOND_PID" || fail "the replacement sequence allocator failed"
+unset -f cat
+SEQ_RESULTS=$(printf '%s\n%s\n' "$(cat "$TMP_ROOT/seq-first")" "$(cat "$TMP_ROOT/seq-second")" | sort -n)
+[ "$SEQ_RESULTS" = "$(printf '1\n2')" ] \
+  || fail "stale-lock recovery reused or regressed sequence values: $SEQ_RESULTS"
+[ "$(cat "$STATE_ROOT/seq")" = 2 ] || fail "the sequence counter did not retain both allocations"
+pass "a displaced stale-lock holder retries without reusing a sequence"
+
 fm_on() {
   FM_HOME="$LOCAL_HOME" \
   FM_ROOT_OVERRIDE="$REMOTE_ROOT" \

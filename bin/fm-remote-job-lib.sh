@@ -492,36 +492,69 @@ fm_remote_job_read_deadline() { # <job-dir>
 # Allocate the next queue-wide staging sequence value. The critical section is
 # a read-increment-publish on one counter file, held for microseconds under a
 # mkdir lock. A holder killed inside that window would wedge every later stage,
-# so a lock older than five seconds is stolen; the worst outcome of a wrong
-# steal is one duplicated sequence value, which the deterministic job-id
-# tiebreak resolves.
+# so a lock older than five seconds is stolen. Each holder publishes through a
+# token-specific file inside its lock and retries if the lock was displaced.
+fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
+  local owner
+  owner=$(fm_remote_job_read_single_line "$1/owner" 128 2>/dev/null) || return 1
+  [ "$owner" = "$2" ]
+}
+
 fm_remote_job_next_seq() {
-  local lock counter tmp value attempt=0 mtime now
+  local lock counter tmp value attempt=0 mtime now token stolen file
   [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
   lock="$FM_REMOTE_JOB_STATE/.seq.lock"
   counter="$FM_REMOTE_JOB_STATE/seq"
-  while ! (umask 077; mkdir "$lock") 2>/dev/null; do
+  while [ "$attempt" -lt 200 ]; do
     attempt=$((attempt + 1))
-    [ "$attempt" -le 200 ] || return 1
-    mtime=$(fm_remote_job_path_mtime "$lock" 2>/dev/null || true)
-    now=$(date +%s)
-    case "$mtime" in
-      ''|*[!0-9]*) ;;
-      *) [ $((now - mtime)) -le 5 ] || rmdir "$lock" 2>/dev/null || true ;;
-    esac
+    if (umask 077; mkdir "$lock") 2>/dev/null; then
+      token="${BASHPID:-$$}-$RANDOM-$attempt-$(date +%s)"
+      if (umask 077; set -C; printf '%s\n' "$token" > "$lock/owner") 2>/dev/null \
+        && chmod 600 "$lock/owner" \
+        && fm_remote_job_seq_lock_owned "$lock" "$token"; then
+        value=$(cat "$counter" 2>/dev/null || true)
+        case "$value" in ''|*[!0-9]*) value=0 ;; esac
+        value=$((value + 1))
+        tmp="$lock/.seqval.$token"
+        if { printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
+          && fm_remote_job_seq_lock_owned "$lock" "$token" \
+          && mv -f -- "$tmp" "$counter"; } 2>/dev/null; then
+          if fm_remote_job_seq_lock_owned "$lock" "$token"; then
+            rm -f -- "$lock/owner"
+            rmdir "$lock" 2>/dev/null || true
+          fi
+          printf '%s\n' "$value"
+          return 0
+        fi
+        rm -f -- "$tmp"
+        if fm_remote_job_seq_lock_owned "$lock" "$token"; then
+          rm -f -- "$lock/owner"
+          rmdir "$lock" 2>/dev/null || true
+        fi
+      fi
+    else
+      mtime=$(fm_remote_job_path_mtime "$lock" 2>/dev/null || true)
+      now=$(date +%s)
+      case "$mtime" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ $((now - mtime)) -gt 5 ]; then
+            stolen="$FM_REMOTE_JOB_STATE/.seq.stale.${BASHPID:-$$}.$RANDOM.$attempt"
+            if [ ! -e "$stolen" ] && [ ! -L "$stolen" ] && mv -- "$lock" "$stolen" 2>/dev/null; then
+              rm -f -- "$stolen/owner"
+              for file in "$stolen"/.seqval.*; do
+                [ -e "$file" ] || [ -L "$file" ] || continue
+                rm -f -- "$file"
+              done
+              rmdir "$stolen" 2>/dev/null || true
+            fi
+          fi
+          ;;
+      esac
+    fi
     sleep 0.02
   done
-  value=$(cat "$counter" 2>/dev/null || true)
-  case "$value" in ''|*[!0-9]*) value=0 ;; esac
-  value=$((value + 1))
-  tmp=$(umask 077; mktemp "$FM_REMOTE_JOB_STATE/.seqval.XXXXXX") || { rmdir "$lock" 2>/dev/null || true; return 1; }
-  if ! printf '%s\n' "$value" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$counter"; then
-    rm -f -- "$tmp"
-    rmdir "$lock" 2>/dev/null || true
-    return 1
-  fi
-  rmdir "$lock" 2>/dev/null || true
-  printf '%s\n' "$value"
+  return 1
 }
 
 fm_remote_job_cancelled() { # <job-dir>
