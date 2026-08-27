@@ -890,6 +890,11 @@ test_teardown_removes_orca_worktree_when_path_missing() {
     "backend=orca" "orca_worktree_id=wt-missing-path" \
     "decisions_reviewed=1" "decision_keys="
   orca_case missing-path
+  # The provider still knows the worktree by id and reports the recorded path,
+  # so the id can be proved to bind to nothing but this task's own slot.
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-missing-path","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/2.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/3.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
@@ -897,12 +902,13 @@ test_teardown_removes_orca_worktree_when_path_missing() {
     "$ROOT/bin/fm-teardown.sh" "$id" 2>&1 )
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "Orca teardown should refuse when the recorded path is unavailable"
-  assert_contains "$out" "recorded worktree $wt is unavailable" \
-    "pathless Orca teardown should name the unavailable ownership proof"
-  [ ! -s "$LOG" ] || fail "pathless Orca teardown should refuse before provider mutation"
-  assert_present "$state/$id.meta" "pathless ownership refusal should preserve task metadata"
-  pass "fm-teardown.sh backend=orca: refuses provider removal when path ownership is unavailable"
+  expect_code 0 "$rc" "Orca teardown should release helpers even when the path is absent"$'\n'"$out"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-missing-path'$'\x1f''--json' \
+    "teardown did not close the recorded Orca terminal when the path was absent"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-missing-path'$'\x1f''--force'$'\x1f''--json' \
+    "teardown did not remove the recorded Orca worktree when the path was absent"
+  assert_absent "$state/$id.meta" "successful helper cleanup should remove task metadata"
+  pass "fm-teardown.sh backend=orca: releases terminal/worktree when path is absent"
 }
 
 test_teardown_preserves_metadata_when_orca_remove_error_json() {
@@ -984,6 +990,7 @@ test_ship_teardown_refuses_orca_missing_worktree_path() {
     "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
     "backend=orca" "orca_worktree_id=wt-missing-ship"
   orca_case missing-ship-path
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-missing-ship","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
   neutral=$(neutral_fm_root "$CASE_DIR/neutral")
   set +e
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
@@ -992,9 +999,12 @@ test_ship_teardown_refuses_orca_missing_worktree_path() {
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "Orca ship teardown should refuse a missing worktree path"
-  assert_contains "$out" "recorded worktree $wt is unavailable" \
-    "Orca ship teardown should explain the fail-safe ownership requirement"
-  [ ! -s "$LOG" ] || fail "refused Orca ship teardown should not close terminals or remove worktrees"
+  assert_contains "$out" "no inspectable git worktree" \
+    "Orca ship teardown should explain the fail-closed worktree requirement"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close' \
+    "refused Orca ship teardown should not close terminals"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm' \
+    "refused Orca ship teardown should not remove worktrees"
   assert_present "$state/$id.meta" "refused Orca ship teardown should preserve metadata"
   pass "fm-teardown.sh backend=orca: ship teardown fails closed when worktree path is missing"
 }

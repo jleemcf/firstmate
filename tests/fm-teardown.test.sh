@@ -1036,6 +1036,81 @@ EOF
   pass "normal pool return clears the owning task's worktree claim in the same operation"
 }
 
+test_unbranched_worktree_is_still_proved_and_torn_down() {
+  local case_dir rc
+  case_dir=$(make_case unbranched-owner)
+  write_meta "$case_dir" no-mistakes ship
+  # The state every scout works in, and the state any ship sits in until its
+  # agent runs `git checkout -b fm/<id>`: detached, with no task branch at all.
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "unbranched-owner: a worktree with no task branch must not deadlock teardown"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "unbranched-owner: the pool slot was never returned"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "unbranched-owner: teardown left the task record and its endpoint behind"
+  pass "an unbranched detached worktree is proved by its project and torn down"
+}
+
+test_unbranched_worktree_outside_its_project_still_refuses() {
+  local case_dir foreign rc
+  case_dir=$(make_case unbranched-foreign)
+  foreign="$case_dir/foreign-project"
+  git init -q "$foreign"
+  git -C "$foreign" -c user.email=t@t -c user.name=t commit -q --allow-empty -m foreign
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  git -C "$foreign" worktree add -q --detach "$case_dir/wt" HEAD
+  : > "$case_dir/wt/foreign-work"
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "unbranched-foreign: an unbranched worktree of another project must refuse"
+  assert_grep "no longer a registered worktree of its project" "$case_dir/stderr" \
+    "unbranched-foreign: the refusal did not name the broken project binding"
+  assert_absent "$case_dir/treehouse.log" \
+    "unbranched-foreign: the refusal still reached the destructive pool return"
+  assert_present "$case_dir/wt/foreign-work" \
+    "unbranched-foreign: the other project's work was destroyed"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "unbranched-foreign: the refusal removed the task record"
+  pass "an unbranched worktree that left its project still refuses"
+}
+
+test_vanished_worktree_path_still_releases_the_task_record() {
+  local case_dir rc
+  case_dir=$(make_case vanished-owner)
+  write_meta "$case_dir" no-mistakes ship
+  # A pruned pool slot, or a teardown killed after its provider return: the
+  # record, its endpoint, and its pool slot must still be releasable.
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "vanished-owner: a recorded path that is already gone must not deadlock teardown"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "vanished-owner: teardown left the task record and its endpoint behind"
+  pass "a recorded worktree that is already gone still releases the task record"
+}
+
 test_dirty_worktree_refuses() {
   local case_dir rc pr_head
   case_dir=$(make_case dirty-wt)
@@ -2766,6 +2841,9 @@ test_content_fallback_refreshes_stale_origin_ref
 test_recycled_worktree_claim_refuses_before_live_work_is_touched
 test_treehouse_lease_and_task_branch_mismatches_refuse_concretely
 test_normal_return_clears_the_worktree_claim_before_pool_release
+test_unbranched_worktree_is_still_proved_and_torn_down
+test_unbranched_worktree_outside_its_project_still_refuses
+test_vanished_worktree_path_still_releases_the_task_record
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds

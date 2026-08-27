@@ -1888,6 +1888,51 @@ EOF
   pass "secondmate teardown raw-removes plain-clone homes"
 }
 
+test_secondmate_teardown_refuses_a_home_its_proof_never_covered() {
+  local home subhome otherhome fakebin log err rc
+  home="$TMP_ROOT/divergent-home-home"
+  subhome="$TMP_ROOT/divergent-home-subhome"
+  otherhome="$TMP_ROOT/divergent-home-other"
+  err="$TMP_ROOT/divergent-home.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$otherhome/state"
+  mark_firstmate_home "$subhome"
+  mark_firstmate_home "$otherhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  printf 'domain\n' > "$otherhome/.fm-secondmate-home"
+  : > "$otherhome/live-work"
+  # The ownership proof covers worktree=, so a home= that points somewhere else
+  # must never be the path teardown actually destroys.
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$otherhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$otherhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/divergent-home-fake")
+  log="$TMP_ROOT/divergent-home-fake/tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/divergent-home-fake/pane.txt" \
+    FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "teardown removed a home its ownership proof never covered"
+  grep -F "not the secondmate home" "$err" >/dev/null \
+    || fail "teardown did not explain that the removal target was never proved"
+  [ -e "$otherhome/live-work" ] || fail "teardown destroyed the unproved home anyway"
+  [ -d "$subhome" ] || fail "teardown destroyed the proved worktree instead"
+  [ -e "$home/state/domain.meta" ] || fail "refused teardown cleared the parent meta"
+  pass "secondmate teardown refuses a home its worktree ownership proof never covered"
+}
+
 test_secondmate_force_teardown_discards_child_work() {
   local home subhome childproj childwt fakebin log
   home="$TMP_ROOT/force-teardown-home"
@@ -3008,6 +3053,7 @@ test_secondmate_force_teardown_sweeps_nested_homes
 test_secondmate_force_teardown_preserves_nested_restore_status
 test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
+test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_allows_non_state_operational_dir_symlinks_inside_home

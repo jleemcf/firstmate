@@ -383,6 +383,17 @@ fm_backend_endpoint_atom_valid() {  # <value>
   esac
 }
 
+# An interrupted worktree-claim retirement (bin/fm-worktree-ownership-lib.sh)
+# is the one way a live record loses its worktree identity, and its backup is
+# the only remaining copy, so name it wherever that loss surfaces.
+fm_backend_report_worktree_claim_backup() {  # <meta-file>
+  local meta=$1 backup
+  declare -F fm_worktree_claim_backup_hint >/dev/null 2>&1 || return 0
+  backup=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || return 0
+  [ -n "$backup" ] || return 0
+  echo "An interrupted worktree claim retirement left the recoverable claim at $backup; restore it there before retrying." >&2
+}
+
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
   local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
   local session pane recorded_session workspace tab terminal worktree_id surface
@@ -402,6 +413,7 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
   }
   worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
     echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
+    fm_backend_report_worktree_claim_backup "$meta"
     return 1
   }
   project=$(fm_backend_meta_exact_value "$meta" project) || {

@@ -1344,6 +1344,29 @@ test_relaunch_refuses_a_recycled_worktree_claimed_by_another_task() {
   pass "relaunch paths refuse before a dead task can act on a recycled live task worktree"
 }
 
+test_relaunch_names_the_backup_holding_an_interrupted_claim_retirement() {
+  local dir backup out rc
+  dir=$(new_case interrupted-claim rl31)
+  add_ship_task "$dir" rl31 claude
+  printf 'zsh' > "$dir/fake/command"
+  # A kill between the claim rewrite and its commit or restore: the record has
+  # lost worktree=, and only the retirement backup still holds it.
+  backup="$dir/home/state/.rl31.meta.worktree-claim-backup.aB3xY9"
+  cp "$dir/home/state/rl31.meta" "$backup"
+  grep -v '^worktree=' "$backup" > "$dir/home/state/rl31.meta"
+
+  out=$(run_control "$dir" rl31 relaunch --note "recover the dead task"); rc=$?
+
+  expect_code 1 "$rc" "a claim stranded in its retirement backup must refuse"
+  assert_contains "$out" "$backup" \
+    "the refusal should name the copy that still holds the recoverable claim"
+  assert_no_grep "encode launch-brief" "$dir/fake/literal" \
+    "a stranded claim must not launch a replacement"
+  assert_grep "worktree=$dir/wt" "$backup" \
+    "the refusal should leave the recoverable claim intact"
+  pass "relaunch names the backup holding an interrupted claim retirement"
+}
+
 test_spawn_relaunch_refuses_a_live_agent() {
   local dir out rc
   dir=$(new_case live rl15)
@@ -1555,6 +1578,7 @@ test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
 test_relaunch_refuses_a_recycled_worktree_claimed_by_another_task
+test_relaunch_names_the_backup_holding_an_interrupted_claim_retirement
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_a_symlinked_task_record_before_inspection
 test_spawn_relaunch_keeps_its_early_meta_lock_continuous

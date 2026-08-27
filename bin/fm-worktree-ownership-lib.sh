@@ -10,8 +10,17 @@
 # an Orca worktree id must resolve back to the exact path.
 # A secondmate home must carry its exact .fm-secondmate-home marker.
 # An ordinary ship or scout must be on refs/heads/fm/<task-id>, or detached at
-# that exact task branch tip, so a different task branch or unattributed HEAD
-# always refuses.
+# that exact task branch tip, so a different task branch always refuses.
+# A worktree that is detached with no task branch yet carries no branch
+# evidence either way - the documented state of a scout and of any ship whose
+# agent has not run `git checkout -b fm/<id>` - so it is proved instead by
+# remaining a registered worktree of the task's recorded project.
+# A recorded path that no longer exists holds nothing this task could destroy,
+# so it is proved once no other task claims it and no provider binding
+# contradicts it. A record that claims no path at all has nothing to prove and
+# publishes an empty path, unless an interrupted retirement's backup is still
+# sitting beside it; either way every path-keyed destructive helper still
+# refuses through fm_worktree_claim_retire_begin's expected-path match.
 # The function prints a concrete REFUSED reason and returns nonzero whenever a
 # proof is missing, contradictory, unreadable, or ambiguous.
 # On success it sets FM_WORKTREE_OWNERSHIP_PATH,
@@ -24,7 +33,8 @@
 # Call fm_worktree_claim_retire_commit after provider success, or
 # fm_worktree_claim_retire_restore after provider failure.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
-# returned slot with a stale destructive claim.
+# returned slot with a stale destructive claim, and every later refusal over a
+# record with no claim names the surviving backup as its recovery source.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
@@ -32,6 +42,7 @@ FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
 FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 
 fm_worktree_meta_exact_value() {  # <meta-file> <key>
   local meta=$1 key=$2 count value
@@ -39,6 +50,22 @@ fm_worktree_meta_exact_value() {  # <meta-file> <key>
   [ "$count" -eq 1 ] || return 1
   value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
   [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+# 0 and prints the single nonempty claim, 2 when the record carries no claim at
+# all (absent or empty), 1 when several lines make the claim ambiguous.
+fm_worktree_meta_claim() {  # <meta-file> <key>
+  local meta=$1 key=$2 count value
+  count=$(grep -c "^${key}=" "$meta" 2>/dev/null || true)
+  [ -n "$count" ] || count=0
+  case "$count" in
+    0) return 2 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
+  [ -n "$value" ] || return 2
   printf '%s' "$value"
 }
 
@@ -61,8 +88,28 @@ fm_worktree_claim_comparison_path() {  # <path>
   parent=${path%/*}
   base=${path##*/}
   [ -n "$parent" ] || parent=/
-  parent=$(fm_worktree_canonical_existing_dir "$parent") || return 1
+  # A vanished parent still leaves the absolute claim comparable against every
+  # other absolute claim, so a removed pool root cannot strand the record.
+  parent=$(fm_worktree_canonical_existing_dir "$parent") || {
+    printf '%s\n' "$path"
+    return 0
+  }
   printf '%s/%s\n' "${parent%/}" "$base"
+}
+
+# Names an interrupted claim retirement's recovery copy, so a record whose
+# worktree= was stripped between the rewrite and the commit/restore points at
+# the file that still holds it.
+fm_worktree_claim_backup_hint() {  # <meta-file>
+  local meta=$1 dir base candidate
+  dir=${meta%/*}
+  base=${meta##*/}
+  for candidate in "$dir/.${base}.worktree-claim-backup."*; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
 }
 
 fm_worktree_refuse() {  # <message>
@@ -200,6 +247,11 @@ EOF
   return 0
 }
 
+# 0 when the checkout positively attributes the worktree to the task, 1 when it
+# attributes it to something else, and 2 when a detached HEAD with no task
+# branch yet carries no branch evidence either way. A scout never leaves that
+# state and a ship only leaves it once its agent runs `git checkout -b fm/<id>`,
+# so 2 must stay inconclusive rather than becoming a refusal.
 fm_worktree_task_branch_proves_owner() {  # <canonical-worktree> <task-id>
   local worktree=$1 id=$2 branch expected="fm/$2" head expected_head
   branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
@@ -214,19 +266,40 @@ fm_worktree_task_branch_proves_owner() {  # <canonical-worktree> <task-id>
     fm_worktree_refuse "worktree $worktree has no inspectable HEAD for task $id."
     return 1
   }
-  expected_head=$(git -C "$worktree" rev-parse --verify "refs/heads/$expected" 2>/dev/null) || {
-    fm_worktree_refuse "worktree $worktree is detached at $head and task $id has no branch ref refs/heads/$expected to prove that HEAD is its work."
-    return 1
-  }
+  expected_head=$(git -C "$worktree" rev-parse --verify "refs/heads/$expected" 2>/dev/null) || return 2
   if [ "$head" != "$expected_head" ]; then
     fm_worktree_refuse "worktree $worktree is detached at $head, not task $id branch tip $expected_head."
     return 1
   fi
 }
 
+# The proof left for an unbranched worktree: it must still be one of the
+# recorded project's registered worktrees, so a claim that now points outside
+# the task's own project refuses instead of being acted on.
+fm_worktree_project_worktree_binding() {  # <project> <canonical-worktree> <task-id>
+  local project=$1 canonical=$2 id=$3 listed line listed_path
+  [ -n "$project" ] && [ -d "$project" ] || return 0
+  git -C "$project" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  listed=$(git -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *)
+        listed_path=$(fm_worktree_claim_comparison_path "${line#worktree }" 2>/dev/null || true)
+        [ "$listed_path" = "$canonical" ] || continue
+        return 0
+        ;;
+    esac
+  done <<EOF
+$listed
+EOF
+  fm_worktree_refuse "worktree $canonical is detached with no task $id branch and is no longer a registered worktree of its project $project."
+  return 1
+}
+
 fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   local state=$1 id=$2 meta=$3 worktree canonical kind backend project recorded_lease_id
-  local marker worktree_id resolved resolved_canonical provider_proof= treehouse_rc=0
+  local marker worktree_id resolved resolved_canonical provider_proof= rc=0 claim_rc=0 present=0
+  local backup
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
   FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
@@ -241,15 +314,6 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     fm_worktree_refuse "task $id has no regular metadata at $meta for worktree ownership proof."
     return 1
   }
-  worktree=$(fm_worktree_meta_exact_value "$meta" worktree) || {
-    fm_worktree_refuse "task $id has a missing, empty, or ambiguous worktree claim in $meta."
-    return 1
-  }
-  canonical=$(fm_worktree_canonical_existing_dir "$worktree") || {
-    fm_worktree_refuse "task $id's recorded worktree $worktree is unavailable, so ownership cannot be proved."
-    return 1
-  }
-  fm_worktree_no_conflicting_claim "$state" "$id" "$meta" "$canonical" || return 1
 
   kind=$(fm_worktree_meta_exact_value "$meta" kind 2>/dev/null || true)
   [ -n "$kind" ] || kind=ship
@@ -257,6 +321,31 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   [ -n "$backend" ] || backend=tmux
   project=$(fm_worktree_meta_exact_value "$meta" project 2>/dev/null || true)
   recorded_lease_id=$(fm_worktree_meta_exact_value "$meta" treehouse_lease_id 2>/dev/null || true)
+
+  worktree=$(fm_worktree_meta_claim "$meta" worktree) || claim_rc=$?
+  if [ "$claim_rc" -eq 1 ]; then
+    fm_worktree_refuse "task $id has an ambiguous worktree claim in $meta."
+    return 1
+  fi
+  if [ "$claim_rc" -eq 2 ]; then
+    # No recorded path at all: there is nothing this task could destroy by
+    # path, and fm_worktree_claim_retire_begin still refuses every path-keyed
+    # helper whose target the record does not claim.
+    backup=$(fm_worktree_claim_backup_hint "$meta" || true)
+    if [ -n "$backup" ]; then
+      fm_worktree_refuse "task $id has no worktree claim in $meta; an interrupted claim retirement left its recoverable copy at $backup."
+      return 1
+    fi
+    FM_WORKTREE_OWNERSHIP_PROOF=no-worktree-claim
+    return 0
+  fi
+
+  canonical=$(fm_worktree_claim_comparison_path "$worktree") || {
+    fm_worktree_refuse "task $id's recorded worktree $worktree is not an absolute path, so ownership cannot be proved."
+    return 1
+  }
+  if [ -d "$canonical" ]; then present=1; fi
+  fm_worktree_no_conflicting_claim "$state" "$id" "$meta" "$canonical" || return 1
 
   if [ "$backend" = orca ] && [ "$kind" != secondmate ]; then
     worktree_id=$(fm_worktree_meta_exact_value "$meta" orca_worktree_id) || {
@@ -267,29 +356,38 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
       fm_worktree_refuse "Orca ownership resolver is unavailable for task $id worktree id $worktree_id."
       return 1
     fi
-    resolved=$(fm_backend_worktree_path orca "$worktree_id") || {
-      fm_worktree_refuse "Orca worktree id $worktree_id for task $id could not be resolved."
-      return 1
-    }
-    resolved_canonical=$(fm_worktree_canonical_existing_dir "$resolved") || {
-      fm_worktree_refuse "Orca worktree id $worktree_id for task $id resolved to unavailable path ${resolved:-missing}."
-      return 1
-    }
-    if [ "$resolved_canonical" != "$canonical" ]; then
-      fm_worktree_refuse "Orca worktree id $worktree_id for task $id resolves to $resolved_canonical, not recorded path $canonical."
-      return 1
+    if resolved=$(fm_backend_worktree_path orca "$worktree_id"); then
+      resolved_canonical=$(fm_worktree_claim_comparison_path "$resolved") || {
+        fm_worktree_refuse "Orca worktree id $worktree_id for task $id resolved to unusable path ${resolved:-missing}."
+        return 1
+      }
+      if [ "$resolved_canonical" != "$canonical" ]; then
+        fm_worktree_refuse "Orca worktree id $worktree_id for task $id resolves to $resolved_canonical, not recorded path $canonical."
+        return 1
+      fi
+      provider_proof=orca-worktree-id
+    else
+      # An id the provider cannot resolve binds to no live worktree, so it can
+      # only stay a refusal while the recorded path is still there to inspect.
+      if [ "$present" -eq 1 ]; then
+        fm_worktree_refuse "Orca worktree id $worktree_id for task $id could not be resolved."
+        return 1
+      fi
     fi
-    provider_proof=orca-worktree-id
   else
     if fm_worktree_treehouse_binding "$project" "$canonical" "$id" "$recorded_lease_id"; then
       provider_proof=treehouse-lease
     else
-      treehouse_rc=$?
-      [ "$treehouse_rc" -eq 2 ] || return 1
+      rc=$?
+      [ "$rc" -eq 2 ] || return 1
     fi
   fi
 
-  if [ "$kind" = secondmate ]; then
+  if [ "$present" -eq 0 ]; then
+    # The recorded path holds nothing: no marker, HEAD, or branch survives to
+    # inspect, and no live worker can be destroyed at a path that is gone.
+    [ -n "$provider_proof" ] || provider_proof=vacant-worktree
+  elif [ "$kind" = secondmate ]; then
     marker="$canonical/.fm-secondmate-home"
     if [ ! -f "$marker" ] || [ -L "$marker" ]; then
       fm_worktree_refuse "secondmate $id worktree $canonical has no regular .fm-secondmate-home ownership marker."
@@ -301,8 +399,18 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     fi
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
-    fm_worktree_task_branch_proves_owner "$canonical" "$id" || return 1
-    [ -n "$provider_proof" ] || provider_proof=task-branch
+    rc=0
+    fm_worktree_task_branch_proves_owner "$canonical" "$id" || rc=$?
+    case "$rc" in
+      0) [ -n "$provider_proof" ] || provider_proof=task-branch ;;
+      2)
+        if [ -z "$provider_proof" ]; then
+          fm_worktree_project_worktree_binding "$project" "$canonical" "$id" || return 1
+          provider_proof=project-worktree
+        fi
+        ;;
+      *) return 1 ;;
+    esac
   fi
 
   FM_WORKTREE_OWNERSHIP_PATH=$canonical
@@ -312,18 +420,37 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
 
 fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   local meta=$1 expected=$2 recorded expected_canonical recorded_canonical dir base backup tmp
-  if [ -n "$FM_WORKTREE_CLAIM_RETIRE_BACKUP" ]; then
-    fm_worktree_refuse "cannot retire worktree claim in $meta because another claim retirement is already active at $FM_WORKTREE_CLAIM_RETIRE_BACKUP."
+  local claim_rc=0 hint
+  if [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ]; then
+    fm_worktree_refuse "cannot retire worktree claim in $meta because another claim retirement is already active on $FM_WORKTREE_CLAIM_RETIRE_META."
     return 1
   fi
   [ -f "$meta" ] && [ ! -L "$meta" ] || {
     fm_worktree_refuse "cannot clear worktree claim because $meta is not a regular metadata file."
     return 1
   }
-  recorded=$(fm_worktree_meta_exact_value "$meta" worktree) || {
-    fm_worktree_refuse "cannot clear worktree claim because $meta has no exact nonempty worktree claim."
+  recorded=$(fm_worktree_meta_claim "$meta" worktree) || claim_rc=$?
+  if [ "$claim_rc" -eq 1 ]; then
+    fm_worktree_refuse "cannot clear worktree claim because $meta has an ambiguous worktree claim."
     return 1
-  }
+  fi
+  if [ "$claim_rc" -eq 2 ]; then
+    if [ -n "$expected" ]; then
+      hint=$(fm_worktree_claim_backup_hint "$meta" || true)
+      if [ -n "$hint" ]; then
+        fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected; an interrupted claim retirement left its recoverable copy at $hint."
+      else
+        fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected."
+      fi
+      return 1
+    fi
+    # Nothing is claimed and nothing is targeted by path, so the invariant the
+    # retirement exists to establish already holds.
+    FM_WORKTREE_CLAIM_RETIRE_META=$meta
+    FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+    FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
+    return 0
+  fi
   recorded_canonical=$(fm_worktree_claim_comparison_path "$recorded" 2>/dev/null || true)
   expected_canonical=$(fm_worktree_claim_comparison_path "$expected" 2>/dev/null || true)
   if [ -z "$recorded_canonical" ] || [ -z "$expected_canonical" ] \
@@ -348,26 +475,29 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   fi
   FM_WORKTREE_CLAIM_RETIRE_META=$meta
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=$backup
+  FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
 }
 
 fm_worktree_claim_retire_commit() {
   local backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
-  [ -n "$backup" ] || return 0
-  if ! rm -f -- "$backup"; then
+  [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
+  if [ -n "$backup" ] && ! rm -f -- "$backup"; then
     fm_worktree_refuse "worktree claim was cleared, but its retirement backup could not be removed at $backup."
     return 1
   fi
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }
 
 fm_worktree_claim_retire_restore() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
-  [ -n "$backup" ] || return 0
-  if ! mv -f -- "$backup" "$meta"; then
+  [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
+  if [ -n "$backup" ] && ! mv -f -- "$backup" "$meta"; then
     fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
     return 1
   fi
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }

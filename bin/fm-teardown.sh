@@ -2106,6 +2106,10 @@ remove_firstmate_home() {
   }
   claim_state=${claim_meta%/*}
   fm_worktree_ownership_prove "$claim_state" "$expected_id" "$claim_meta" || return 1
+  if [ "$FM_WORKTREE_OWNERSHIP_PATH" != "$abs_home_path" ]; then
+    echo "REFUSED: task $expected_id proves ownership of ${FM_WORKTREE_OWNERSHIP_PATH:-no path}, not the $label $abs_home_path this teardown would remove" >&2
+    return 1
+  fi
   process_event_backup=$(snapshot_firstmate_home_process_events "$abs_home_path" "$label") || return 1
   if ! cleanup_firstmate_home_process_events "$abs_home_path" "$label"; then
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
@@ -2766,7 +2770,7 @@ if [ "$KIND" != secondmate ]; then
   # Prove it before path-based safety inspection, run abort, process reap, hook
   # removal, provider return, or provider removal can touch the recorded path.
   fm_worktree_ownership_prove "$STATE" "$ID" "$META" || exit 1
-  if [ "$BACKEND" = orca ]; then
+  if [ "$BACKEND" = orca ] && [ "$FM_WORKTREE_OWNERSHIP_PROOF" = orca-worktree-id ]; then
     ORCA_PATH_MATCH_VERIFIED=1
   fi
 fi
