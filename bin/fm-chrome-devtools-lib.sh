@@ -129,8 +129,10 @@ fm_chrome_dir_is_task_private() {  # <dir>
   case "$mode" in
     ''|*[!0-7]*) return 1 ;;
   esac
-  case "${mode: -1}" in 2|3|6|7) return 1 ;; esac
-  case "${mode: -2:1}" in 2|3|6|7) return 1 ;; esac
+  case "$mode" in
+    *[2367]) return 1 ;;
+    *[2367]?) return 1 ;;
+  esac
   return 0
 }
 
@@ -171,7 +173,7 @@ case "${1:-}" in
     fi
     ;;
 esac
-exec "$tool" "$@"
+exec "$tool" ${1+"$@"}
 SH
   } > "$tmp" || ! chmod 700 "$tmp" || ! mv -f -- "$tmp" "$wrapper"; then
     rm -f -- "$tmp" 2>/dev/null || true
@@ -187,7 +189,7 @@ fm_chrome_axi_run() {  # <session> [args...]
   case "$bound" in ''|*[!0-9]*|0) bound=20 ;; esac
   fm_run_timed "$bound" \
     env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
-    chrome-devtools-axi "$@" < /dev/null
+    chrome-devtools-axi ${1+"$@"} < /dev/null
 }
 
 fm_chrome_session_liveness() {  # <session>
