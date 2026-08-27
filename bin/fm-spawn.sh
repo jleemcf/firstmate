@@ -181,7 +181,10 @@
 # cursor installs no per-task hook either: it writes state/<id>.cursor-session to
 # bind the pane to cursor's own conversation transcript (projects root, the exact
 # workspace path cursor records in .workspace-trusted, and the conversations that
-# already existed for that workspace). It is launched through the verified binary
+# already existed for that workspace). Every crewmate and scout also receives one
+# lazy task-scoped chrome-devtools-axi session recorded in
+# state/<id>.chrome-devtools-session; no bridge starts until the worker uses it.
+# It is launched through the verified binary
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
@@ -257,6 +260,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
+# shellcheck source=bin/fm-chrome-devtools-lib.sh
+. "$SCRIPT_DIR/fm-chrome-devtools-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
@@ -2857,6 +2862,29 @@ spawn_record_traceparent() {
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Bind browser automation lazily to one non-default bridge session for this task.
+# The task-private launcher marks the binding before a browser action can start
+# the bridge, so teardown distinguishes an unused session from an unhealthy one.
+if [ "$KIND" != secondmate ]; then
+  if ! fm_chrome_binding_write "$STATE_REAL" "$ID"; then
+    echo "error: could not create the task-scoped chrome-devtools bridge binding for $ID" >&2
+    exit 1
+  fi
+  CHROME_DEVTOOLS_AXI_BIN=$(command -v chrome-devtools-axi 2>/dev/null || true)
+  case "$CHROME_DEVTOOLS_AXI_BIN" in
+    /*) ;;
+    *)
+      echo "error: chrome-devtools-axi is required to create the task-scoped bridge launcher for $ID" >&2
+      exit 1
+      ;;
+  esac
+  CHROME_DEVTOOLS_AXI_WRAPPER="$TASK_TMP/bin/chrome-devtools-axi"
+  if ! fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_WRAPPER" "$CHROME_DEVTOOLS_AXI_BIN"; then
+    echo "error: could not create the task-scoped chrome-devtools bridge launcher for $ID" >&2
+    exit 1
+  fi
+  spawn_send_text_line "$T" "unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$FM_CHROME_TASK_SESSION; export PATH=$TASK_TMP/bin:\$PATH"
+fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped
 # entirely when trace context is off.

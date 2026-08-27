@@ -53,13 +53,20 @@ case "${1:-}" in
         prev=$a
       done
     fi
+    if [ -n "${FM_FAKE_TEXT_LOG:-}" ]; then
+      for a in "$@"; do
+        case "$a" in
+          *CHROME_DEVTOOLS_AXI_SESSION=*) printf '%s\n' "$a" >> "$FM_FAKE_TEXT_LOG" ;;
+        esac
+      done
+    fi
     exit 0
     ;;
 esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  fm_fake_exit0 "$fakebin" treehouse chrome-devtools-axi
   cat > "$fakebin/timeout" <<'SH'
 #!/usr/bin/env bash
 shift
@@ -126,7 +133,8 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     CLAUDE_CONFIG_DIR="${FM_TEST_CLAUDE_CONFIG_DIR:-}" \
-    FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
+    FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_TEXT_LOG="${FM_TEST_TEXT_LOG:-}" \
+    FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
@@ -826,6 +834,38 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
+  local rec id out status record session textlog tasktmp wrapper
+  id=profile-chrome-session-z20
+  rec=$(make_spawn_case profile-chrome-session claude "$id")
+  read_case_record "$rec"
+  textlog="$CASE_DIR/text.log"
+
+  out=$(FM_TEST_TEXT_LOG="$textlog" \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "spawn with a task-scoped Chrome binding should succeed"
+  record="$HOME_DIR/state/$id.chrome-devtools-session"
+  assert_present "$record" "spawn did not record the task-scoped Chrome binding"
+  session=$(sed -n 's/^session=//p' "$record")
+  case "$session" in
+    fm-*) ;;
+    *) fail "spawn recorded an invalid or default Chrome session: ${session:-empty}" ;;
+  esac
+  assert_grep 'started=0' "$record" "a fresh Chrome binding was not marked unused"
+  assert_grep "unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$session; export PATH=" "$textlog" \
+    "spawn did not export the recorded Chrome session and task-private launcher before launching the worker"
+  tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
+  wrapper="$tasktmp/bin/chrome-devtools-axi"
+  assert_present "$wrapper" "spawn did not create the task-private Chrome launcher"
+  CHROME_DEVTOOLS_AXI_SESSION="$session" "$wrapper" pages \
+    || fail "the task-private Chrome launcher did not delegate to the real tool"
+  assert_grep 'started=1' "$record" \
+    "the task-private Chrome launcher did not mark a bridge-starting action"
+  pass "spawn records and exports one non-default chrome-devtools bridge session per task"
+}
+
+test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

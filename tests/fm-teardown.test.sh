@@ -57,6 +57,8 @@ fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
+# shellcheck source=bin/fm-chrome-devtools-lib.sh
+. "$ROOT/bin/fm-chrome-devtools-lib.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
@@ -545,8 +547,50 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_FAKE_CHROME_ACTIVE_DIR="${FM_FAKE_CHROME_ACTIVE_DIR:-}" \
+  FM_FAKE_CHROME_STOP_LOG="${FM_FAKE_CHROME_STOP_LOG:-}" \
+  FM_FAKE_CHROME_STOP_FAIL="${FM_FAKE_CHROME_STOP_FAIL:-0}" \
   PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
     "$TEARDOWN" task-x1 "$@"
+}
+
+install_fake_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+case "${1:-}" in
+  '')
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'page:' '  title: active bridge'
+    else
+      printf '%s\n' 'browser: no active session'
+    fi
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ "${FM_FAKE_CHROME_STOP_FAIL:-0}" = 0 ] || exit 9
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+write_chrome_binding() {  # <case-dir> [task-id]
+  local case_dir=$1 id=${2:-task-x1}
+  fm_chrome_binding_write "$case_dir/state" "$id" \
+    || fail "could not write the Chrome binding fixture for $id"
+}
+
+mark_chrome_binding_started() {  # <case-dir> [task-id]
+  local case_dir=$1 id=${2:-task-x1} record tmp
+  record="$case_dir/state/$id.chrome-devtools-session"
+  tmp="$record.tmp"
+  if ! sed 's/^started=0$/started=1/' "$record" > "$tmp" || ! mv "$tmp" "$record"; then
+    fail "could not mark the Chrome binding fixture started for $id"
+  fi
 }
 
 # Build the teardown test's executable search path without lsof, regardless of
@@ -2590,6 +2634,147 @@ EOF
     "abort-then-reap-then-remove-order: the leaked process was not yet reaped when the worktree return ran"
   pass "the run abort and the leaked-process reap both complete before the destructive worktree return"
 }
+
+test_active_chrome_bridge_is_stopped_without_touching_second_task() {
+  local case_dir rc session foreign_session active_dir stop_log
+  case_dir=$(make_case chrome-active-scope)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  foreign_session=$(fm_chrome_task_session_name "$case_dir/state" task-y2)
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session" "$active_dir/$foreign_session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "active Chrome bridge cleanup should not break teardown"
+  assert_grep "$session|stop" "$stop_log" \
+    "teardown did not stop the task's exact named Chrome bridge"
+  assert_absent "$active_dir/$session" "the task's active Chrome bridge survived teardown"
+  assert_present "$active_dir/$foreign_session" \
+    "teardown stopped a second task's Chrome bridge"
+  assert_absent "$case_dir/state/task-x1.chrome-devtools-session" \
+    "successful teardown retained the Chrome binding"
+  pass "teardown stops only the task's active named Chrome bridge and preserves a second task's bridge"
+}
+
+test_unused_chrome_binding_makes_no_stop_call() {
+  local case_dir rc active_dir stop_log
+  case_dir=$(make_case chrome-unused)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "unused Chrome bridge binding should not break teardown"
+  [ ! -s "$stop_log" ] || fail "an unused task produced a chrome-devtools stop call"
+  pass "a task that never started a Chrome bridge produces no stop call"
+}
+
+test_forged_chrome_binding_never_stops_foreign_session() {
+  local case_dir rc foreign_session active_dir stop_log record
+  case_dir=$(make_case chrome-forged-binding)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  foreign_session=$(fm_chrome_task_session_name "$case_dir/state" task-y2)
+  record="$case_dir/state/task-x1.chrome-devtools-session"
+  printf 'session=%s\nstarted=1\n' "$foreign_session" > "$record"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$foreign_session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a foreign Chrome binding should be skipped without breaking teardown"
+  [ ! -s "$stop_log" ] || fail "a forged binding produced a chrome-devtools stop call"
+  assert_present "$active_dir/$foreign_session" "a forged binding stopped a foreign Chrome bridge"
+  assert_grep 'does not match its task-scoped session' "$case_dir/stderr" \
+    "a forged Chrome binding was not reported"
+  pass "a forged binding cannot make teardown stop another task's Chrome bridge"
+}
+
+test_chrome_stop_failure_is_reported_and_nonfatal() {
+  local case_dir rc session active_dir stop_log
+  case_dir=$(make_case chrome-stop-failure)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  FM_FAKE_CHROME_STOP_FAIL=1 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a Chrome bridge stop failure must not fail teardown"
+  assert_grep "chrome-devtools bridge stop failed for task task-x1 session $session" "$case_dir/stderr" \
+    "a Chrome stop failure was not reported"
+  assert_grep "$session|stop" "$stop_log" "the failing stop was not scoped to the task session"
+  assert_absent "$case_dir/state/task-x1.chrome-devtools-session" \
+    "completed teardown retained the Chrome binding after a reported stop failure"
+  pass "a task-scoped Chrome stop failure is reported without breaking teardown"
+}
+
+test_unlanded_refusal_still_stops_chrome_bridge() {
+  local case_dir rc session active_dir stop_log
+  case_dir=$(make_case chrome-unlanded-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "unpushed work"
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "unlanded work should still refuse teardown"
+  assert_grep 'REFUSED:' "$case_dir/stderr" "unlanded-work refusal disappeared"
+  assert_grep "$session|stop" "$stop_log" \
+    "the unlanded-work refusal stranded the task's Chrome bridge"
+  assert_absent "$active_dir/$session" "the Chrome bridge survived an unlanded-work refusal"
+  assert_present "$case_dir/state/task-x1.chrome-devtools-session" \
+    "a refused teardown discarded the binding needed for a safe retry"
+  pass "an unlanded-work refusal still stops the task's Chrome bridge and retains its binding"
+}
+
+# Mutation proof for this regression suite:
+# - deleting the cleanup call leaves the active-session test red;
+# - removing the started marker makes the unused-task test red;
+# - dropping the exact session export makes the cross-task survival test red;
+# - trusting the recorded name without deriving ownership makes the forged-binding test red;
+# - propagating `stop` failure makes the nonfatal-failure test red;
+# - moving cleanup below landed-work validation makes the refusal test red.
+test_active_chrome_bridge_is_stopped_without_touching_second_task
+test_unused_chrome_binding_makes_no_stop_call
+test_forged_chrome_binding_never_stops_foreign_session
+test_chrome_stop_failure_is_reported_and_nonfatal
+test_unlanded_refusal_still_stops_chrome_bridge
 
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
