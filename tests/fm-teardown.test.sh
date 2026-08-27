@@ -563,6 +563,19 @@ make_path_without_lsof() {  # <case-dir>
   printf '%s\n' "$path_dir"
 }
 
+# The same whitelist as make_path_without_lsof, but keeping lsof, so the only
+# tool genuinely absent is jq - which no tmux home declares as a dependency.
+make_path_without_jq() {  # <case-dir>
+  local case_dir=$1 path_dir="$1/path-without-jq" cmd resolved
+  mkdir -p "$path_dir"
+  for cmd in awk bash basename cat chmod cp cut date dirname env find git grep head hostname id ln \
+    lsof mkdir mktemp mv perl ps readlink realpath rm sed sh sleep sort stat tail timeout tr uname wc xargs; do
+    resolved=$(command -v "$cmd" 2>/dev/null) || continue
+    case "$resolved" in /*) ln -sf "$resolved" "$path_dir/$cmd" ;; esac
+  done
+  printf '%s\n' "$path_dir"
+}
+
 test_local_only_fork_remote_allows() {
   local case_dir rc
   case_dir=$(make_case fork-allow)
@@ -1109,6 +1122,106 @@ test_vanished_worktree_path_still_releases_the_task_record() {
   assert_absent "$case_dir/state/task-x1.meta" \
     "vanished-owner: teardown left the task record and its endpoint behind"
   pass "a recorded worktree that is already gone still releases the task record"
+}
+
+test_ownership_proof_stays_conclusive_without_jq() {
+  local case_dir jqless rc
+  command -v jq >/dev/null 2>&1 || { echo "skip - jq is not installed, so its absence proves nothing"; return 0; }
+  case_dir=$(make_case jqless-owner)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then
+  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-x1","lease_holder":"task-x1"}]'
+  exit 0
+fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  jqless=$(make_path_without_jq "$case_dir")
+  [ ! -e "$jqless/jq" ] || fail "jqless-owner: the jq-free PATH still exposes jq"
+
+  rc=0
+  FM_TEARDOWN_TEST_PATH="$jqless" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "jqless-owner: jq is not a tmux home's dependency, so its absence must not block teardown"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "jqless-owner: the pool slot was never returned"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "jqless-owner: teardown left the task record and its endpoint behind"
+  pass "an unreadable treehouse pool stays inconclusive instead of deadlocking a jq-free home"
+}
+
+test_unbranched_worktree_with_uninspectable_project_refuses() {
+  local case_dir rc
+  case_dir=$(make_case unbranched-no-project)
+  mkdir -p "$case_dir/not-a-repo"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/not-a-repo" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  : > "$case_dir/wt/live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "unbranched-no-project: an unbranched worktree with no inspectable project must refuse"
+  assert_grep "is not an inspectable git repository" "$case_dir/stderr" \
+    "unbranched-no-project: the refusal did not name the uninspectable project"
+  assert_absent "$case_dir/treehouse.log" \
+    "unbranched-no-project: the refusal still reached the destructive pool return"
+  assert_present "$case_dir/wt/live-work" \
+    "unbranched-no-project: the unproved worktree's contents were destroyed"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "unbranched-no-project: the refusal removed the task record"
+  pass "an unbranched worktree whose project cannot be inspected proves nothing and refuses"
+}
+
+test_unbranched_worktree_marked_for_another_task_refuses() {
+  local case_dir rc
+  case_dir=$(make_case unbranched-recycled)
+  write_meta "$case_dir" no-mistakes ship
+  # The recycled pool slot the intent forbids acting on: task A's record still
+  # claims it, but the slot now carries live task B's ownership marker and A's
+  # branch is gone, so nothing else distinguishes it from A's own workspace.
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  printf '%s\n' task-b > "$case_dir/wt/.fm-task-owner"
+  printf '%s\n' "task B live work" > "$case_dir/wt/live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" clean -qfdx >/dev/null 2>&1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "unbranched-recycled: a slot marked for another task must refuse"
+  assert_grep "marked as task task-b's workspace" "$case_dir/stderr" \
+    "unbranched-recycled: the refusal did not name the marked owner"
+  assert_absent "$case_dir/treehouse.log" \
+    "unbranched-recycled: the refusal still reached the destructive pool return"
+  [ "$(cat "$case_dir/wt/live-work")" = "task B live work" ] \
+    || fail "unbranched-recycled: task B's live work was destroyed"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "unbranched-recycled: the refusal removed the task record"
+  pass "an unbranched pool slot marked for another task refuses before any destructive act"
 }
 
 test_dirty_worktree_refuses() {
@@ -2844,6 +2957,9 @@ test_normal_return_clears_the_worktree_claim_before_pool_release
 test_unbranched_worktree_is_still_proved_and_torn_down
 test_unbranched_worktree_outside_its_project_still_refuses
 test_vanished_worktree_path_still_releases_the_task_record
+test_ownership_proof_stays_conclusive_without_jq
+test_unbranched_worktree_with_uninspectable_project_refuses
+test_unbranched_worktree_marked_for_another_task_refuses
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds

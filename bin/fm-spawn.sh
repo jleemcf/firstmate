@@ -31,8 +31,9 @@
 #   agent-free on a backend with a recovery-grade agent-state classifier (tmux
 #   or herdr), refuses unless the endpoint's shell is sitting in the recorded
 #   worktree, proves that path still belongs only to this task through
-#   bin/fm-worktree-ownership-lib.sh, and clears the previous harness's per-task
-#   wiring before arming the new incarnation.
+#   bin/fm-worktree-ownership-lib.sh, restamps the worktree's .fm-task-owner
+#   marker, and clears the previous harness's per-task wiring before arming the
+#   new incarnation.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -276,6 +277,7 @@ if [ -e "$STATE" ] || [ -L "$STATE" ]; then
     exit 1
   }
 fi
+SPAWN_TASK_OWNER_MARKER=".fm-task-owner"
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
@@ -2407,6 +2409,28 @@ kimi_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
 }
 
+exclude_path() {
+  local rel=$1 EXCL
+  EXCL=$(git -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
+  [ -n "$EXCL" ] || return 0
+  mkdir -p "$(dirname "$EXCL")"
+  grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
+}
+
+# Stamp this task's identity into the worktree it just took ownership of, so a
+# pooled slot carries a positive owner even before its agent creates fm/<id> -
+# the state every scout stays in. bin/fm-worktree-ownership-lib.sh reads this
+# marker, and bin/fm-teardown.sh removes it when the slot is released. Excluded
+# from git first so it can never read as uncommitted work.
+stamp_task_worktree_owner() {
+  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  exclude_path "$SPAWN_TASK_OWNER_MARKER"
+  printf '%s\n' "$ID" > "$WT/$SPAWN_TASK_OWNER_MARKER" || {
+    echo "error: could not stamp task $ID's ownership marker into $WT; refusing to launch into a worktree nothing can attribute" >&2
+    return 1
+  }
+}
+
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
   # proven instead is that the adopted endpoint's shell is actually sitting in
@@ -2473,6 +2497,9 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
 
   validate_spawn_worktree "treehouse get" "$T"
 fi
+if [ "$KIND" != secondmate ]; then
+  stamp_task_worktree_owner || exit 1
+fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
 fi
@@ -2492,13 +2519,6 @@ mkdir -p "$TASK_TMP/gotmp"
 mkdir -p "$STATE"
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
-exclude_path() {
-  local rel=$1 EXCL
-  EXCL=$(git -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
-  [ -n "$EXCL" ] || return 0
-  mkdir -p "$(dirname "$EXCL")"
-  grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
-}
 if [ "$RELAUNCH" -eq 1 ]; then
   # Retire the previous incarnation's per-task harness wiring before arming the
   # new one. Without this, a harness switch would leave the old adapter's hook

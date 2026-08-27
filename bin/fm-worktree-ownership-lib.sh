@@ -7,14 +7,18 @@
 # same home claims the canonical path, and the strongest available positive
 # provider binding agrees with the task.
 # A Treehouse lease is authoritative when status exposes one for the path, and
-# an Orca worktree id must resolve back to the exact path.
+# an Orca worktree id must resolve back to the exact path. Treehouse inspection
+# needs jq, which only the JSON-emitting session adapters declare, so a pool
+# that cannot be read is inconclusive and the remaining proofs still decide.
 # A secondmate home must carry its exact .fm-secondmate-home marker.
+# A crewmate worktree must never carry another task's .fm-task-owner marker.
 # An ordinary ship or scout must be on refs/heads/fm/<task-id>, or detached at
 # that exact task branch tip, so a different task branch always refuses.
 # A worktree that is detached with no task branch yet carries no branch
 # evidence either way - the documented state of a scout and of any ship whose
-# agent has not run `git checkout -b fm/<id>` - so it is proved instead by
-# remaining a registered worktree of the task's recorded project.
+# agent has not run `git checkout -b fm/<id>` - so it falls back to its
+# .fm-task-owner marker, and only to membership in the task's recorded project
+# when the slot was acquired before any marker was stamped there.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -43,10 +47,14 @@ FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+# Stamped by bin/fm-spawn.sh into a crewmate worktree once the task owns it, and
+# removed by bin/fm-teardown.sh when the slot is released.
+FM_WORKTREE_TASK_OWNER_MARKER=.fm-task-owner
 
 fm_worktree_meta_exact_value() {  # <meta-file> <key>
   local meta=$1 key=$2 count value
   count=$(grep -c "^${key}=" "$meta" 2>/dev/null || true)
+  [ -n "$count" ] || count=0
   [ "$count" -eq 1 ] || return 1
   value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
   [ -n "$value" ] || return 1
@@ -133,6 +141,10 @@ fm_worktree_no_conflicting_claim() {  # <state-dir> <task-id> <meta-file> <canon
       return 1
     fi
     count=$(grep -c '^worktree=' "$other_meta" 2>/dev/null || true)
+    if [ -z "$count" ]; then
+      fm_worktree_refuse "cannot prove task $id owns $canonical because task $other_id's metadata at $other_meta could not be read."
+      return 1
+    fi
     case "$count" in
       0) continue ;;
       1) ;;
@@ -155,43 +167,22 @@ fm_worktree_no_conflicting_claim() {  # <state-dir> <task-id> <meta-file> <canon
   done
 }
 
-fm_worktree_treehouse_binding() {  # <project> <canonical-worktree> <task-id> <recorded-lease-id>
-  local project=$1 canonical=$2 id=$3 recorded_lease_id=$4 json rows path lease_id holder
+# 0 when a Treehouse lease positively binds the slot to this task, 1 when it
+# binds it to someone else or the pool answer is self-contradictory, and 2 when
+# the pool cannot be inspected at all. Inspection needs treehouse plus jq, and
+# jq is only a declared dependency of the JSON-emitting session adapters
+# (fm_backend_required_tools in bin/fm-backend.sh), so its absence has to stay
+# inconclusive rather than deadlock every lifecycle verb on a tmux home.
+fm_worktree_treehouse_binding() {  # <project> <canonical-worktree> <task-id>
+  local project=$1 canonical=$2 id=$3 json rows path lease_id holder
   local path_canonical matches=0 matched_lease_id= matched_holder=
   FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
   FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER=
-  command -v treehouse >/dev/null 2>&1 || {
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but Treehouse ownership inspection is unavailable."
-      return 1
-    }
-    return 2
-  }
-  [ -d "$project" ] || {
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but project $project is unavailable for ownership inspection."
-      return 1
-    }
-    return 2
-  }
-  json=$(CDPATH='' cd -- "$project" 2>/dev/null && treehouse status --json 2>/dev/null) || {
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but treehouse status could not verify it."
-      return 1
-    }
-    return 2
-  }
-  if [ -z "$json" ]; then
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but treehouse status returned no ownership data."
-      return 1
-    }
-    return 2
-  fi
-  command -v jq >/dev/null 2>&1 || {
-    fm_worktree_refuse "treehouse status returned ownership data for task $id, but jq is unavailable to inspect it."
-    return 1
-  }
+  command -v treehouse >/dev/null 2>&1 || return 2
+  command -v jq >/dev/null 2>&1 || return 2
+  [ -d "$project" ] || return 2
+  json=$(CDPATH='' cd -- "$project" 2>/dev/null && treehouse status --json 2>/dev/null) || return 2
+  [ -n "$json" ] || return 2
   rows=$(printf '%s' "$json" | jq -r '
     if type == "array" then
       .[] | [(.path // ""), (.lease_id // ""), (.lease_holder // "")] | @tsv
@@ -216,18 +207,8 @@ EOF
     fm_worktree_refuse "treehouse status returned $matches ownership records for task $id worktree $canonical."
     return 1
   fi
-  if [ "$matches" -eq 0 ]; then
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but treehouse status has no slot for $canonical."
-      return 1
-    }
-    return 2
-  fi
+  [ "$matches" -eq 1 ] || return 2
   if [ -z "$matched_holder" ] && [ -z "$matched_lease_id" ]; then
-    [ -z "$recorded_lease_id" ] || {
-      fm_worktree_refuse "task $id records Treehouse lease $recorded_lease_id, but slot $canonical is not leased."
-      return 1
-    }
     return 2
   fi
   if [ -z "$matched_holder" ] || [ -z "$matched_lease_id" ]; then
@@ -236,10 +217,6 @@ EOF
   fi
   if [ "$matched_holder" != "$id" ]; then
     fm_worktree_refuse "Treehouse slot $canonical is leased to task $matched_holder, not task $id."
-    return 1
-  fi
-  if [ -n "$recorded_lease_id" ] && [ "$recorded_lease_id" != "$matched_lease_id" ]; then
-    fm_worktree_refuse "Treehouse slot $canonical has lease $matched_lease_id, not task $id's recorded lease $recorded_lease_id."
     return 1
   fi
   FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=$matched_lease_id
@@ -273,14 +250,28 @@ fm_worktree_task_branch_proves_owner() {  # <canonical-worktree> <task-id>
   fi
 }
 
-# The proof left for an unbranched worktree: it must still be one of the
-# recorded project's registered worktrees, so a claim that now points outside
-# the task's own project refuses instead of being acted on.
+# The weakest proof an unbranched worktree can still offer: it must be one of
+# the recorded project's registered worktrees. This is the only evidence left at
+# that point, so an uninspectable project is a refusal, never a pass - the same
+# polarity as worktree_registered_for_project in bin/fm-teardown.sh.
 fm_worktree_project_worktree_binding() {  # <project> <canonical-worktree> <task-id>
   local project=$1 canonical=$2 id=$3 listed line listed_path
-  [ -n "$project" ] && [ -d "$project" ] || return 0
-  git -C "$project" rev-parse --git-dir >/dev/null 2>&1 || return 0
-  listed=$(git -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 0
+  [ -n "$project" ] || {
+    fm_worktree_refuse "worktree $canonical is detached with no task $id branch and no owner marker, and task $id records no project to attribute it to."
+    return 1
+  }
+  [ -d "$project" ] || {
+    fm_worktree_refuse "worktree $canonical is detached with no task $id branch and no owner marker, and task $id's project $project is unavailable to attribute it to."
+    return 1
+  }
+  git -C "$project" rev-parse --git-dir >/dev/null 2>&1 || {
+    fm_worktree_refuse "worktree $canonical is detached with no task $id branch and no owner marker, and task $id's project $project is not an inspectable git repository."
+    return 1
+  }
+  listed=$(git -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || {
+    fm_worktree_refuse "worktree $canonical is detached with no task $id branch and no owner marker, and task $id's project $project could not list its worktrees."
+    return 1
+  }
   while IFS= read -r line; do
     case "$line" in
       worktree\ *)
@@ -292,14 +283,37 @@ fm_worktree_project_worktree_binding() {  # <project> <canonical-worktree> <task
   done <<EOF
 $listed
 EOF
-  fm_worktree_refuse "worktree $canonical is detached with no task $id branch and is no longer a registered worktree of its project $project."
+  fm_worktree_refuse "worktree $canonical is detached with no task $id branch and no owner marker, and is no longer a registered worktree of its project $project."
   return 1
 }
 
+# The per-task ownership marker bin/fm-spawn.sh stamps into every crewmate
+# worktree once it owns the slot. 0 when it names this task, 1 when it names
+# another task or cannot be read, 2 when no marker has been stamped there yet
+# (a slot acquired before this marker existed, or one the pool just cleaned).
+fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id>
+  local canonical=$1 id=$2 marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER owner
+  [ -e "$marker" ] || [ -L "$marker" ] || return 2
+  if [ ! -f "$marker" ] || [ -L "$marker" ]; then
+    fm_worktree_refuse "worktree $canonical has a $FM_WORKTREE_TASK_OWNER_MARKER that is not a regular ownership marker, so task $id cannot be proved to own it."
+    return 1
+  fi
+  owner=$(head -n 1 -- "$marker" 2>/dev/null || true)
+  if [ -z "$owner" ]; then
+    fm_worktree_refuse "worktree $canonical has an unreadable or empty $FM_WORKTREE_TASK_OWNER_MARKER, so task $id cannot be proved to own it."
+    return 1
+  fi
+  if [ "$owner" != "$id" ]; then
+    fm_worktree_refuse "worktree $canonical is marked as task $owner's workspace, not task $id's."
+    return 1
+  fi
+  return 0
+}
+
 fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
-  local state=$1 id=$2 meta=$3 worktree canonical kind backend project recorded_lease_id
+  local state=$1 id=$2 meta=$3 worktree canonical kind backend project
   local marker worktree_id resolved resolved_canonical provider_proof= rc=0 claim_rc=0 present=0
-  local backup
+  local backup marker_rc=0
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
   FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID=
@@ -320,7 +334,6 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   backend=$(fm_worktree_meta_exact_value "$meta" backend 2>/dev/null || true)
   [ -n "$backend" ] || backend=tmux
   project=$(fm_worktree_meta_exact_value "$meta" project 2>/dev/null || true)
-  recorded_lease_id=$(fm_worktree_meta_exact_value "$meta" treehouse_lease_id 2>/dev/null || true)
 
   worktree=$(fm_worktree_meta_claim "$meta" worktree) || claim_rc=$?
   if [ "$claim_rc" -eq 1 ]; then
@@ -375,7 +388,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
       fi
     fi
   else
-    if fm_worktree_treehouse_binding "$project" "$canonical" "$id" "$recorded_lease_id"; then
+    if fm_worktree_treehouse_binding "$project" "$canonical" "$id"; then
       provider_proof=treehouse-lease
     else
       rc=$?
@@ -399,12 +412,19 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     fi
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
+    marker_rc=0
+    fm_worktree_task_owner_marker_binding "$canonical" "$id" || marker_rc=$?
+    [ "$marker_rc" -ne 1 ] || return 1
     rc=0
     fm_worktree_task_branch_proves_owner "$canonical" "$id" || rc=$?
     case "$rc" in
       0) [ -n "$provider_proof" ] || provider_proof=task-branch ;;
       2)
-        if [ -z "$provider_proof" ]; then
+        if [ -n "$provider_proof" ]; then
+          :
+        elif [ "$marker_rc" -eq 0 ]; then
+          provider_proof=task-owner-marker
+        else
           fm_worktree_project_worktree_binding "$project" "$canonical" "$id" || return 1
           provider_proof=project-worktree
         fi

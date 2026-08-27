@@ -1367,6 +1367,42 @@ test_relaunch_names_the_backup_holding_an_interrupted_claim_retirement() {
   pass "relaunch names the backup holding an interrupted claim retirement"
 }
 
+test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view() {
+  local dir out rc
+  dir=$(new_case owner-marker rl32)
+  add_ship_task "$dir" rl32 claude
+
+  out=$(run_control "$dir" rl32 relaunch --note "stopped mid-refactor"); rc=$?
+
+  expect_code 0 "$rc" "a same-harness relaunch should succeed"$'\n'"$out"
+  [ "$(cat "$dir/wt/.fm-task-owner")" = rl32 ] \
+    || fail "relaunch did not stamp the worktree with its own task identity"
+  [ -z "$(git -C "$dir/wt" status --porcelain)" ] \
+    || fail "the owner marker reads as uncommitted work: $(git -C "$dir/wt" status --porcelain)"
+  pass "fm-control relaunch: the worktree carries this task's owner marker, excluded from git"
+}
+
+test_relaunch_refuses_a_worktree_marked_for_another_task() {
+  local dir out rc
+  dir=$(new_case foreign-marker rl33)
+  add_ship_task "$dir" rl33 claude
+  printf 'zsh' > "$dir/fake/command"
+  # A pool slot that has already been handed to a live task carries that task's
+  # marker; adopting it would put two agents in one copy of the work.
+  printf '%s\n' live-task-b > "$dir/wt/.fm-task-owner"
+
+  out=$(run_control "$dir" rl33 relaunch --note "recover the dead task"); rc=$?
+
+  expect_code 1 "$rc" "a worktree marked for another task must refuse relaunch"
+  assert_contains "$out" "marked as task live-task-b's workspace" \
+    "the refusal should name the marked owner"
+  assert_no_grep "encode launch-brief" "$dir/fake/literal" \
+    "a foreign owner marker must not launch a replacement into that worktree"
+  [ "$(cat "$dir/wt/.fm-task-owner")" = live-task-b ] \
+    || fail "the refused relaunch overwrote the other task's ownership marker"
+  pass "fm-control relaunch: a worktree marked for another task is refused before any launch"
+}
+
 test_spawn_relaunch_refuses_a_live_agent() {
   local dir out rc
   dir=$(new_case live rl15)
@@ -1579,6 +1615,8 @@ test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
 test_relaunch_refuses_a_recycled_worktree_claimed_by_another_task
 test_relaunch_names_the_backup_holding_an_interrupted_claim_retirement
+test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view
+test_relaunch_refuses_a_worktree_marked_for_another_task
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_a_symlinked_task_record_before_inspection
 test_spawn_relaunch_keeps_its_early_meta_lock_continuous
