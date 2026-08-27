@@ -2656,6 +2656,10 @@ test_active_chrome_bridge_is_stopped_without_touching_second_task() {
   expect_code 0 "$rc" "active Chrome bridge cleanup should not break teardown"
   assert_grep "$session|stop" "$stop_log" \
     "teardown did not stop the task's exact named Chrome bridge"
+  [ "$(grep -cF "$session|stop" "$stop_log")" -eq 1 ] \
+    || fail "teardown stopped the same already-stopped Chrome bridge twice"
+  ! grep -q 'chrome-devtools bridge stop failed' "$case_dir/stderr" \
+    || fail "a successful teardown reported a Chrome bridge stop failure"
   assert_absent "$active_dir/$session" "the task's active Chrome bridge survived teardown"
   assert_present "$active_dir/$foreign_session" \
     "teardown stopped a second task's Chrome bridge"
@@ -2763,8 +2767,38 @@ test_unlanded_refusal_still_stops_chrome_bridge() {
   pass "an unlanded-work refusal still stops the task's Chrome bridge and retains its binding"
 }
 
+test_bridge_started_outside_the_task_launcher_is_still_stopped() {
+  local case_dir rc session active_dir stop_log
+  case_dir=$(make_case chrome-launcher-bypass)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_fake_chrome_devtools "$case_dir"
+  # No launcher marking: the worker reached the real tool directly (absolute
+  # interpreter path, npx, or a rebuilt PATH) while carrying the task session.
+  write_chrome_binding "$case_dir"
+  session=$FM_CHROME_TASK_SESSION
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an unmarked but live Chrome bridge should not break teardown"
+  assert_grep "$session|stop" "$stop_log" \
+    "a bridge started around the task launcher was left orphaned by teardown"
+  assert_absent "$active_dir/$session" \
+    "a bridge started around the task launcher survived teardown"
+  pass "a live task-scoped bridge started around the task launcher is still stopped"
+}
+
 # Mutation proof for this regression suite:
 # - deleting the cleanup call leaves the active-session test red;
+# - deciding cleanup from the recorded marker alone makes the launcher-bypass
+#   test red, and stopping unconditionally makes the unused-task test red;
+# - re-stopping a session the tool already reports inactive makes the
+#   active-session test's single-stop assertion red;
 # - removing the started marker makes the unused-task test red;
 # - dropping the exact session export makes the cross-task survival test red;
 # - trusting the recorded name without deriving ownership makes the forged-binding test red;
@@ -2772,6 +2806,7 @@ test_unlanded_refusal_still_stops_chrome_bridge() {
 # - moving cleanup below landed-work validation makes the refusal test red.
 test_active_chrome_bridge_is_stopped_without_touching_second_task
 test_unused_chrome_binding_makes_no_stop_call
+test_bridge_started_outside_the_task_launcher_is_still_stopped
 test_forged_chrome_binding_never_stops_foreign_session
 test_chrome_stop_failure_is_reported_and_nonfatal
 test_unlanded_refusal_still_stops_chrome_bridge

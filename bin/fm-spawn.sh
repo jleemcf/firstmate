@@ -2865,25 +2865,31 @@ spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Bind browser automation lazily to one non-default bridge session for this task.
 # The task-private launcher marks the binding before a browser action can start
 # the bridge, so teardown distinguishes an unused session from an unhealthy one.
+# chrome-devtools-axi is an optional universal tool, so like every other missing
+# universal tool this degrades to a diagnostic instead of blocking the launch:
+# the session binding alone still scopes and reclaims the bridge, because
+# teardown asks the tool whether that exact named session is live.
 if [ "$KIND" != secondmate ]; then
   if ! fm_chrome_binding_write "$STATE_REAL" "$ID"; then
-    echo "error: could not create the task-scoped chrome-devtools bridge binding for $ID" >&2
-    exit 1
+    echo "warning: could not create the task-scoped chrome-devtools bridge binding for $ID; this task will not isolate a browser bridge" >&2
+  else
+    CHROME_DEVTOOLS_AXI_BIN=$(command -v chrome-devtools-axi 2>/dev/null || true)
+    CHROME_DEVTOOLS_AXI_WRAPPER="$TASK_TMP/bin/chrome-devtools-axi"
+    CHROME_DEVTOOLS_AXI_EXPORTS="unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$FM_CHROME_TASK_SESSION"
+    case "$CHROME_DEVTOOLS_AXI_BIN" in
+      /*)
+        if fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_WRAPPER" "$CHROME_DEVTOOLS_AXI_BIN"; then
+          CHROME_DEVTOOLS_AXI_EXPORTS="$CHROME_DEVTOOLS_AXI_EXPORTS; export PATH=$TASK_TMP/bin:\$PATH"
+        else
+          echo "warning: could not create the task-scoped chrome-devtools bridge launcher for $ID; the session stays task-scoped and teardown still reclaims it" >&2
+        fi
+        ;;
+      *)
+        echo "warning: chrome-devtools-axi is unavailable; $ID keeps its task-scoped bridge session without a task-private launcher" >&2
+        ;;
+    esac
+    spawn_send_text_line "$T" "$CHROME_DEVTOOLS_AXI_EXPORTS"
   fi
-  CHROME_DEVTOOLS_AXI_BIN=$(command -v chrome-devtools-axi 2>/dev/null || true)
-  case "$CHROME_DEVTOOLS_AXI_BIN" in
-    /*) ;;
-    *)
-      echo "error: chrome-devtools-axi is required to create the task-scoped bridge launcher for $ID" >&2
-      exit 1
-      ;;
-  esac
-  CHROME_DEVTOOLS_AXI_WRAPPER="$TASK_TMP/bin/chrome-devtools-axi"
-  if ! fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_WRAPPER" "$CHROME_DEVTOOLS_AXI_BIN"; then
-    echo "error: could not create the task-scoped chrome-devtools bridge launcher for $ID" >&2
-    exit 1
-  fi
-  spawn_send_text_line "$T" "unset CHROME_DEVTOOLS_AXI_PORT; export CHROME_DEVTOOLS_AXI_SESSION=$FM_CHROME_TASK_SESSION; export PATH=$TASK_TMP/bin:\$PATH"
 fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped

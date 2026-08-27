@@ -137,8 +137,31 @@ run_spawn() {
     FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
-    GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
+    GROK_HOME="$home/grok-home" PATH="$fakebin:${FM_TEST_SPAWN_PATH:-$PATH}" \
     "$SPAWN" "$@" 2>&1
+}
+
+# mirror_path_without <dir> <tool> [<bindir> ...]: the whole search path
+# re-exposed by symlink except one tool, so a host that happens to install that
+# tool cannot make an absent-tool test pass vacuously.
+mirror_path_without() {
+  local dir=$1 omit=$2 search bindir entry name
+  shift 2
+  mkdir -p "$dir"
+  search=$(printf '%s\n' "$@"; printf '%s\n' "$PATH" | tr ':' '\n')
+  while IFS= read -r bindir; do
+    [ -d "$bindir" ] || continue
+    for entry in "$bindir"/*; do
+      [ -e "$entry" ] || continue
+      name=${entry##*/}
+      [ "$name" = "$omit" ] && continue
+      [ -e "$dir/$name" ] || ln -s "$entry" "$dir/$name" 2>/dev/null
+    done
+  done <<EOF
+$search
+EOF
+  ! PATH="$dir" command -v "$omit" >/dev/null 2>&1 \
+    || fail "the $omit-free search path still resolved $omit"
 }
 
 # Ship spawns carry an explicit delivery contract (AGENTS.md section 7); these
@@ -865,7 +888,37 @@ test_task_scoped_chrome_bridge_binding_is_exported_before_launch() {
   pass "spawn records and exports one non-default chrome-devtools bridge session per task"
 }
 
+test_missing_chrome_devtools_tool_does_not_block_the_launch() {
+  local rec id out status record session textlog chromeless tasktmp
+  id=profile-chrome-missing-z21
+  rec=$(make_spawn_case profile-chrome-missing claude "$id")
+  read_case_record "$rec"
+  rm -f "$FAKEBIN_DIR/chrome-devtools-axi"
+  chromeless="$CASE_DIR/path-without-chrome"
+  mirror_path_without "$chromeless" chrome-devtools-axi "$FAKEBIN_DIR"
+  textlog="$CASE_DIR/text.log"
+
+  out=$(FM_TEST_SPAWN_PATH="$chromeless" FM_TEST_TEXT_LOG="$textlog" \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "a missing chrome-devtools-axi must not block a ship launch"$'\n'"$out"
+  assert_contains "$out" "spawned $id harness=claude" "the launch did not complete without chrome-devtools-axi"
+  assert_contains "$out" "chrome-devtools-axi is unavailable" "the absent browser tool was not reported"
+  assert_contains "$(cat "$LAUNCH_LOG")" "claude --dangerously-skip-permissions" \
+    "no agent launch command was sent without chrome-devtools-axi"
+  record="$HOME_DIR/state/$id.chrome-devtools-session"
+  assert_present "$record" "spawn dropped the task-scoped Chrome binding when the tool was absent"
+  session=$(sed -n 's/^session=//p' "$record")
+  assert_grep "export CHROME_DEVTOOLS_AXI_SESSION=$session" "$textlog" \
+    "spawn stopped scoping the task's Chrome session when the tool was absent"
+  tasktmp=$(sed -n 's/^tasktmp=//p' "$HOME_DIR/state/$id.meta")
+  assert_absent "$tasktmp/bin/chrome-devtools-axi" \
+    "spawn wrote a task-private Chrome launcher with no real tool behind it"
+  pass "an absent chrome-devtools-axi degrades to a warning and still scopes the task's bridge session"
+}
+
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
+test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

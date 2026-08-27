@@ -707,7 +707,7 @@ MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 # A Windows-host bridge is outside worktree process reaping. Stop its exact
 # task-scoped session before any landed-work refusal can leave it orphaned.
-[ "$KIND" = secondmate ] || fm_chrome_bridge_cleanup "$STATE" "$ID" --preserve-started
+[ "$KIND" = secondmate ] || fm_chrome_bridge_cleanup "$STATE" "$ID"
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
 PUBLIC_FOLLOWUP_STATE=$STATE
 PUBLIC_FOLLOWUP_WORK_HOME=main
@@ -2805,7 +2805,8 @@ if [ "$BACKEND" = herdr ]; then
   fi
 fi
 # Recheck after the worker endpoint is gone. This closes the race where a live
-# worker starts its bridge after the pre-refusal cleanup but before process exit.
+# worker starts its bridge after the pre-refusal cleanup but before process exit;
+# a session this teardown already stopped reads inactive and makes no stop call.
 [ "$KIND" = secondmate ] || fm_chrome_bridge_cleanup "$STATE" "$ID"
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
