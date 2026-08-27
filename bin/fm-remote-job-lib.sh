@@ -8,22 +8,40 @@
 # runtime PATH.
 #
 # A job directory is mode 0700 and contains root, home, argv (NUL-delimited),
-# stdin, stdout, stderr, queue_deadline, timeout, deadline, exit, and state.
-# Stage writes state=queued last. The worker atomically claims a job with
-# .claim, establishes its execution deadline, changes state to running, writes
-# bounded stdout/stderr and exit, then publishes state=done last. Callers wait
-# for done, relay stdout and stderr separately, then reap only their completed
-# record. Input, argv, stdout, and stderr are each capped at 1048576 bytes.
+# stdin, seq, stdout, stderr, queue_deadline, timeout, deadline, exit, and
+# state. Stage writes state=queued last. seq is a queue-wide monotonic staging
+# sequence allocated under the .seq.lock counter; it is the worker's FIFO
+# ordering key within a home, with the job id as the deterministic tiebreak.
+# The worker atomically claims a job with .claim, establishes its execution
+# deadline, changes state to running, writes bounded stdout/stderr and exit,
+# then publishes state=done last. Callers wait for done, relay stdout and
+# stderr separately, then reap only their completed record. Input, argv,
+# stdout, and stderr are each capped at 1048576 bytes.
 #
-# The worker executes one job at a time, so a deliberately long-blocking poll
-# would serialize every short interactive command behind its wait window.
+# The worker serves one lane per staged home: jobs for the same home run
+# strictly FIFO in seq order while lanes for different homes run concurrently,
+# so one home's long job never delays another home's commands. Within a lane a
+# deliberately long-blocking poll would still serialize that home's short
+# interactive commands behind its wait window.
 # fm_remote_job_command_preemptible names the read-only long-poll class
 # (fm-remote-delta-read.sh, the reply-log delta read). The worker preempts a
-# running preemptible job as soon as a non-preemptible job is queued and
-# publishes exit 76 with emptied stdout and stderr, distinct from the poll's
-# exit 75 elapsed-window-with-no-data result. The delta read is non-destructive
-# and cursor-anchored, so the caller's normal re-arm re-reads the same data and
-# a preempted poll loses nothing.
+# running preemptible job as soon as a non-preemptible job is queued for the
+# same home and publishes exit 76 with emptied stdout and stderr, distinct from
+# the poll's exit 75 elapsed-window-with-no-data result. The delta read is
+# non-destructive and cursor-anchored, so the caller's normal re-arm re-reads
+# the same data and a preempted poll loses nothing.
+#
+# A caller that disconnects before its job completes cancels it instead of
+# abandoning it: fm_remote_job_cancel writes a cancel marker into the record,
+# the worker skips a cancelled queued job, terminates a running cancelled job's
+# process group, and reaps the finalized record itself because no caller
+# remains to reap it. fm_remote_job_wait honors an optional
+# FM_REMOTE_JOB_DISCONNECT_PROBE function name: when set, the probe runs about
+# once per second, and a probe failure cancels the job and fails the wait. The
+# staging entrypoint arms it with a parent-liveness probe so an ssh channel
+# that dies without delivering a signal still cancels the abandoned job.
+# Abandoned .stage.* staging litter older than
+# FM_REMOTE_JOB_STAGE_REAP_SECONDS is reaped by the worker's stale sweep.
 #
 # The worker accepts only a tracked, non-symlink executable named fm-*.sh below
 # its configured FM_ROOT/bin. Every child receives env -i with the composed
@@ -60,6 +78,7 @@ FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
 FM_REMOTE_JOB_WAIT_GRACE=${FM_REMOTE_JOB_WAIT_GRACE:-30}
 FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
+FM_REMOTE_JOB_STAGE_REAP_SECONDS=${FM_REMOTE_JOB_STAGE_REAP_SECONDS:-600}
 # shellcheck disable=SC2034 # Shared protocol constant consumed by the worker and sourcing callers.
 FM_REMOTE_JOB_PREEMPTED_EXIT=76
 FM_REMOTE_JOB_OPERATOR_PATH=
@@ -96,6 +115,7 @@ fm_remote_job_validate_settings() {
   case "$FM_REMOTE_JOB_WAIT_GRACE" in ''|*[!0-9]*) return 1 ;; esac
   [ "$FM_REMOTE_JOB_WAIT_GRACE" -le 300 ] || return 1
   case "$FM_REMOTE_JOB_REAP_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
+  case "$FM_REMOTE_JOB_STAGE_REAP_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
   return 0
 }
 
@@ -444,9 +464,9 @@ fm_remote_job_read_state() { # <job-dir>
   case "$value" in queued|running|'done') printf '%s\n' "$value" ;; *) return 1 ;; esac
 }
 
-fm_remote_job_read_number() { # <job-dir> queue_deadline|timeout|deadline
+fm_remote_job_read_number() { # <job-dir> queue_deadline|timeout|deadline|seq
   local job=$1 field=$2 value
-  case "$field" in queue_deadline|timeout|deadline) ;; *) return 1 ;; esac
+  case "$field" in queue_deadline|timeout|deadline|seq) ;; *) return 1 ;; esac
   fm_remote_job_regular_bounded "$job/$field" 32 || return 1
   value=$(tr -d '\n' < "$job/$field")
   case "$value" in ''|*[!0-9]*) return 1 ;; esac
@@ -454,9 +474,9 @@ fm_remote_job_read_number() { # <job-dir> queue_deadline|timeout|deadline
   printf '%s\n' "$value"
 }
 
-fm_remote_job_write_number() { # <job-dir> queue_deadline|timeout|deadline <value>
+fm_remote_job_write_number() { # <job-dir> queue_deadline|timeout|deadline|seq <value>
   local job=$1 field=$2 value=$3 tmp
-  case "$field" in queue_deadline|timeout|deadline) ;; *) return 1 ;; esac
+  case "$field" in queue_deadline|timeout|deadline|seq) ;; *) return 1 ;; esac
   case "$value" in ''|*[!0-9]*|0) return 1 ;; esac
   [ -d "$job" ] && [ ! -L "$job" ] || return 1
   tmp=$(umask 077; mktemp "$job/.$field.XXXXXX") || return 1
@@ -469,10 +489,70 @@ fm_remote_job_read_deadline() { # <job-dir>
   fm_remote_job_read_number "$1" deadline
 }
 
+# Allocate the next queue-wide staging sequence value. The critical section is
+# a read-increment-publish on one counter file, held for microseconds under a
+# mkdir lock. A holder killed inside that window would wedge every later stage,
+# so a lock older than five seconds is stolen; the worst outcome of a wrong
+# steal is one duplicated sequence value, which the deterministic job-id
+# tiebreak resolves.
+fm_remote_job_next_seq() {
+  local lock counter tmp value attempt=0 mtime now
+  [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
+  lock="$FM_REMOTE_JOB_STATE/.seq.lock"
+  counter="$FM_REMOTE_JOB_STATE/seq"
+  while ! (umask 077; mkdir "$lock") 2>/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 200 ] || return 1
+    mtime=$(fm_remote_job_path_mtime "$lock" 2>/dev/null || true)
+    now=$(date +%s)
+    case "$mtime" in
+      ''|*[!0-9]*) ;;
+      *) [ $((now - mtime)) -le 5 ] || rmdir "$lock" 2>/dev/null || true ;;
+    esac
+    sleep 0.02
+  done
+  value=$(cat "$counter" 2>/dev/null || true)
+  case "$value" in ''|*[!0-9]*) value=0 ;; esac
+  value=$((value + 1))
+  tmp=$(umask 077; mktemp "$FM_REMOTE_JOB_STATE/.seqval.XXXXXX") || { rmdir "$lock" 2>/dev/null || true; return 1; }
+  if ! printf '%s\n' "$value" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$counter"; then
+    rm -f -- "$tmp"
+    rmdir "$lock" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$lock" 2>/dev/null || true
+  printf '%s\n' "$value"
+}
+
+fm_remote_job_cancelled() { # <job-dir>
+  [ -f "$1/cancel" ] && [ ! -L "$1/cancel" ]
+}
+
+# Mark a job cancelled on behalf of a disconnected or abandoning caller. The
+# marker never rewrites state: the worker observes it, skips a cancelled queued
+# job, stops a running cancelled job's process group, and reaps the finalized
+# record itself. Cancelling a job that already completed or disappeared is a
+# harmless no-op.
+fm_remote_job_cancel() { # <account-home> <id>
+  local account_home=$1 id=$2 job state tmp
+  fm_remote_job_prepare_state "$account_home" || return 1
+  job=$(fm_remote_job_job_dir "$id" 2>/dev/null) || return 0
+  state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
+  [ "$state" != 'done' ] || return 0
+  tmp=$(umask 077; mktemp "$job/.cancel.XXXXXX") || return 1
+  printf 'cancelled: caller disconnected or abandoned the job\n' > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$job/cancel"
+}
+
 fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdin is captured
-  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline
+  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline seq
   shift 4
   fm_remote_job_prepare_state "$account_home" || return 1
+  seq=$(fm_remote_job_next_seq) || {
+    FM_REMOTE_JOB_ERROR="cannot allocate a remote job staging sequence"
+    return 1
+  }
   root=$(fm_remote_job_canonical_existing_dir "$root") || {
     FM_REMOTE_JOB_ERROR="remote job root is unavailable or unsafe"
     return 1
@@ -493,13 +573,14 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
     ! printf '%s\n' "$home" > "$stage/home" ||
     ! printf '%s\n' "$queue_deadline" > "$stage/queue_deadline" ||
     ! printf '%s\n' "$FM_REMOTE_JOB_TIMEOUT" > "$stage/timeout" ||
+    ! printf '%s\n' "$seq" > "$stage/seq" ||
     ! printf '%s\0' "$command" "$@" > "$stage/argv" ||
     ! head -c "$((FM_REMOTE_JOB_MAX_BYTES + 1))" > "$stage/stdin"; then
     rm -rf -- "$stage"
     FM_REMOTE_JOB_ERROR="cannot capture remote job input"
     return 1
   fi
-  for bytes in root home queue_deadline timeout argv stdin; do chmod 600 "$stage/$bytes" || { rm -rf -- "$stage"; return 1; }; done
+  for bytes in root home queue_deadline timeout seq argv stdin; do chmod 600 "$stage/$bytes" || { rm -rf -- "$stage"; return 1; }; done
   fm_remote_job_regular_bounded "$stage/argv" "$FM_REMOTE_JOB_MAX_BYTES" || {
     rm -rf -- "$stage"
     FM_REMOTE_JOB_ERROR="remote job argv exceeds the ${FM_REMOTE_JOB_MAX_BYTES}-byte bound"
@@ -524,8 +605,9 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   printf '%s\n' "$id"
 }
 
-fm_remote_job_wait() { # <account-home> <id>
+fm_remote_job_wait() { # <account-home> <id>; honors FM_REMOTE_JOB_DISCONNECT_PROBE
   local account_home=$1 id=$2 job state queue_deadline execution_timeout wait_deadline exit_value
+  local now next_probe=0
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id") || {
     FM_REMOTE_JOB_ERROR="remote job record disappeared or became unsafe"
@@ -568,9 +650,18 @@ fm_remote_job_wait() { # <account-home> <id>
       queued|running) ;;
       *) FM_REMOTE_JOB_ERROR="remote job state is invalid"; return 1 ;;
     esac
-    if [ "$(date +%s)" -ge "$wait_deadline" ]; then
+    now=$(date +%s)
+    if [ "$now" -ge "$wait_deadline" ]; then
       FM_REMOTE_JOB_ERROR="remote job did not complete within its bounded wait"
       return 1
+    fi
+    if [ -n "${FM_REMOTE_JOB_DISCONNECT_PROBE:-}" ] && [ "$now" -ge "$next_probe" ]; then
+      next_probe=$((now + 1))
+      if ! "$FM_REMOTE_JOB_DISCONNECT_PROBE"; then
+        fm_remote_job_cancel "$account_home" "$id" 2>/dev/null || true
+        FM_REMOTE_JOB_ERROR="remote job caller disconnected; the job was cancelled"
+        return 1
+      fi
     fi
     sleep "$FM_REMOTE_JOB_POLL_SECONDS"
   done
@@ -581,7 +672,7 @@ fm_remote_job_reap() { # <account-home> <id>; only removes an exact completed re
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id") || return 1
   [ "$(fm_remote_job_read_state "$job")" = 'done' ] || return 1
-  for file in root home queue_deadline timeout deadline argv stdin stdout stderr exit state; do
+  for file in root home queue_deadline timeout deadline seq cancel argv stdin stdout stderr exit state; do
     [ -e "$job/$file" ] || continue
     [ ! -L "$job/$file" ] || return 1
     rm -f -- "$job/$file" || return 1
@@ -601,7 +692,7 @@ fm_remote_job_path_mtime() { # <path>
 }
 
 fm_remote_job_reap_stale() { # <account-home>
-  local account_home=$1 job id state mtime now
+  local account_home=$1 job id state mtime now stage
   fm_remote_job_prepare_state "$account_home" || return 1
   now=$(date +%s)
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
@@ -614,6 +705,15 @@ fm_remote_job_reap_stale() { # <account-home>
     case "$mtime" in ''|*[!0-9]*) continue ;; esac
     [ $((now - mtime)) -ge "$FM_REMOTE_JOB_REAP_SECONDS" ] || continue
     fm_remote_job_reap "$account_home" "$id" || true
+  done
+  # Staging litter a killed caller left behind: a live stage lasts at most the
+  # bounded stdin capture, so anything older than the stage reap age is dead.
+  for stage in "$FM_REMOTE_JOB_JOBS"/.stage.*; do
+    [ -d "$stage" ] && [ ! -L "$stage" ] || continue
+    mtime=$(fm_remote_job_path_mtime "$stage" 2>/dev/null || true)
+    case "$mtime" in ''|*[!0-9]*) continue ;; esac
+    [ $((now - mtime)) -ge "$FM_REMOTE_JOB_STAGE_REAP_SECONDS" ] || continue
+    rm -rf -- "$stage"
   done
 }
 

@@ -15,6 +15,18 @@
 # have been committed. The library header owns the exact record fields and
 # lifecycle.
 #
+# The serving loop runs one lane per staged home: each queued job's home field
+# selects its lane, jobs within a lane execute strictly FIFO in staging-seq
+# order (job id as the deterministic tiebreak), and lanes execute concurrently
+# as background lane processes tracked by the serving loop, so one home's long
+# job never delays another home's commands. Each lane process claims its job,
+# records itself as the claim's supervisor, and runs it to publication;
+# shutdown stops every tracked lane and its recorded command group, leaving the
+# interrupted records for the replacement worker's orphan recovery. A job
+# carrying the library's cancel marker is skipped when still queued, has its
+# process group terminated when running, and is reaped by the worker itself
+# because its disconnected caller cannot reap it.
+#
 # The worker is abandoned when its configured FM_ROOT stops being a genuine
 # Firstmate checkout - the state a pruned no-mistakes gate worktree, a returned
 # pooled worktree, or a removed test fixture root leaves behind. It can never
@@ -50,13 +62,16 @@ FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd "$SCRIPT_DIR/.." && pwd -P)}
 # shellcheck source=bin/fm-remote-job-lib.sh
 . "$SCRIPT_DIR/fm-remote-job-lib.sh"
 
-WORKER_ACTIVE_JOB=
 WORKER_LOCK=
 WORKER_LOCK_HELD=0
 WORKER_RELEASE_OWNERSHIP=1
 WORKER_SUPERVISED_PID=
 WORKER_PREEMPTIBLE=0
 WORKER_PREEMPTED=0
+WORKER_LANE_HOME=
+WORKER_LANE_HOMES=()
+WORKER_LANE_PIDS=()
+WORKER_LANE_JOBS=()
 
 worker_error() { printf 'remote-job-worker: %s\n' "$1" >&2; }
 
@@ -276,22 +291,28 @@ worker_stop_recorded_execution() { # <job-dir>
   rm -f -- "$job/.claim/supervisor" "$job/.claim/group" "$job/.claim/armed"
 }
 
+# Stop every tracked lane process and its recorded command execution. The lane
+# is signalled first so it cannot dispatch further work, then the job's
+# recorded supervisor and group are verified stopped; a job interrupted here
+# stays running-with-a-dead-owner for the replacement worker's orphan recovery,
+# exactly as a crashed single-process worker's job did.
 worker_stop_active_execution() {
-  local job=${WORKER_ACTIVE_JOB:-} owner owner_pid state
-  if [ -n "$job" ]; then
-    worker_stop_recorded_execution "$job" || return 1
-  else
-    for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
-      [ -d "$job" ] && [ ! -L "$job" ] || continue
-      state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
-      [ "$state" = running ] || continue
-      owner="$job/.claim/owner"
-      owner_pid=$(worker_read_process_id "$owner" 2>/dev/null || true)
-      [ "$owner_pid" = "${BASHPID:-$$}" ] || continue
-      worker_stop_recorded_execution "$job" || return 1
-    done
-  fi
-  WORKER_ACTIVE_JOB=
+  local i=0 count=${#WORKER_LANE_PIDS[@]} job pid failed=0
+  while [ "$i" -lt "$count" ]; do
+    pid=${WORKER_LANE_PIDS[$i]}
+    job=${WORKER_LANE_JOBS[$i]}
+    kill -TERM "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if [ -d "$job" ] && [ ! -L "$job" ]; then
+      worker_stop_recorded_execution "$job" || failed=1
+    fi
+    i=$((i + 1))
+  done
+  WORKER_LANE_HOMES=()
+  WORKER_LANE_PIDS=()
+  WORKER_LANE_JOBS=()
+  [ "$failed" -eq 0 ]
 }
 
 # Ignore, rather than restore the default disposition for, the signals this
@@ -361,9 +382,14 @@ worker_clear_dead_claim() { # <job-dir>
   rmdir "$claim"
 }
 
-worker_recover_orphaned_job() { # <job-dir>
+# Reclaim a running job this serving loop does not own: a record left by a
+# crashed worker, whether its lane process died with it or survived it. The
+# recorded execution is stopped either way - a surviving foreign lane is not
+# supervised by any owner and a second lane for its home must never start
+# beside it - and the record publishes unknown completion, exactly as a
+# crashed single-process worker's job always has.
+worker_reclaim_running_job() { # <job-dir>
   local job=$1 file
-  worker_claim_owner_alive "$job" && return 1
   worker_stop_recorded_execution "$job" || return 1
   worker_clear_dead_claim "$job" || return 1
   for file in .stdout.pipe .stderr.pipe; do
@@ -409,12 +435,11 @@ worker_publish_result() { # <job-dir> <exit>
 
 worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   local job=$1 timeout=$2 group_file armed_file group_pid rc tmp deadline next_heartbeat attempt
-  local timed_out=0 heartbeat_failed=0
+  local timed_out=0 heartbeat_failed=0 cancelled=0
   WORKER_PREEMPTED=0
   shift 2
   group_file="$job/.claim/group"
   armed_file="$job/.claim/armed"
-  WORKER_ACTIVE_JOB=$job
   set -m
   (
     while [ ! -f "$armed_file" ] || [ -L "$armed_file" ]; do
@@ -428,28 +453,24 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   tmp=$(umask 077; mktemp "$job/.claim/.group.XXXXXX") || {
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
-    WORKER_ACTIVE_JOB=
     return 125
   }
   printf '%s\n' "$group_pid" > "$tmp" || {
     rm -f -- "$tmp"
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
-    WORKER_ACTIVE_JOB=
     return 125
   }
   if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$group_file"; then
     rm -f -- "$tmp"
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
-    WORKER_ACTIVE_JOB=
     return 125
   fi
   tmp=$(umask 077; mktemp "$job/.claim/.armed.XXXXXX") || {
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
     rm -f -- "$group_file"
-    WORKER_ACTIVE_JOB=
     return 125
   }
   if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$armed_file"; then
@@ -457,7 +478,6 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
     rm -f -- "$group_file"
-    WORKER_ACTIVE_JOB=
     return 125
   fi
   deadline=$((SECONDS + timeout))
@@ -476,7 +496,18 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
         heartbeat_failed=1
         break
       fi
-      if [ "$WORKER_PREEMPTIBLE" -eq 1 ] && worker_preempting_waiter_exists; then
+      if fm_remote_job_cancelled "$job"; then
+        worker_signal_process_or_group group TERM "$group_pid"
+        attempt=0
+        while worker_process_or_group_alive group "$group_pid" && [ "$attempt" -lt 20 ]; do
+          attempt=$((attempt + 1))
+          sleep 0.05
+        done
+        worker_signal_process_or_group group KILL "$group_pid"
+        cancelled=1
+        break
+      fi
+      if [ "$WORKER_PREEMPTIBLE" -eq 1 ] && worker_preempting_waiter_exists "$WORKER_LANE_HOME"; then
         worker_signal_process_or_group group TERM "$group_pid"
         attempt=0
         while worker_process_or_group_alive group "$group_pid" && [ "$attempt" -lt 20 ]; do
@@ -494,9 +525,9 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   wait "$group_pid" 2>/dev/null
   rc=$?
   rm -f -- "$group_file" "$armed_file"
-  WORKER_ACTIVE_JOB=
   [ "$timed_out" -eq 0 ] || return 124
   [ "$heartbeat_failed" -eq 0 ] || return 125
+  [ "$cancelled" -eq 0 ] || return 130
   [ "$WORKER_PREEMPTED" -eq 0 ] || return "$FM_REMOTE_JOB_PREEMPTED_EXIT"
   return "$rc"
 }
@@ -508,12 +539,17 @@ worker_job_command() { # <job-dir>; the first argv element of a staged record
   printf '%s\n' "$first"
 }
 
-worker_preempting_waiter_exists() {
-  local job state command
+worker_preempting_waiter_exists() { # <lane-home>
+  local lane_home=$1 job state command job_home
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
     state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
     [ "$state" = queued ] || continue
+    fm_remote_job_cancelled "$job" && continue
+    # Lanes are per home, so only a waiter for this lane's own home may
+    # preempt; another home's queue drains through its own lane.
+    job_home=$(worker_read_text "$job" home 8192 2>/dev/null || true)
+    [ "$job_home" = "$lane_home" ] || continue
     command=$(worker_job_command "$job" 2>/dev/null || true)
     fm_remote_job_command_preemptible "$command" || return 0
   done
@@ -544,6 +580,9 @@ worker_run_job() { # <account-home> <job-dir>
   home=$(worker_read_text "$job" home 8192) || { worker_publish_result "$job" 126; return; }
   root=$(fm_remote_job_canonical_existing_dir "$root") || { worker_publish_result "$job" 126; return; }
   home=$(fm_remote_job_canonical_home "$home") || { worker_publish_result "$job" 126; return; }
+  # The lane key everywhere - dispatch and the preemption scan - is the staged
+  # home field's exact text, so this comparison value is read the same way.
+  WORKER_LANE_HOME=$(worker_read_text "$job" home 8192 2>/dev/null || true)
   [ "$root" = "$FM_ROOT" ] || { worker_publish_result "$job" 126; return; }
   [ -f "$root/AGENTS.md" ] && [ ! -L "$root/AGENTS.md" ] &&
     [ -d "$root/bin" ] && [ ! -L "$root/bin" ] || { worker_publish_result "$job" 126; return; }
@@ -634,8 +673,134 @@ worker_run_job() { # <account-home> <job-dir>
   worker_publish_result "$job" "$rc" || worker_error "could not publish result for ${job##*/}"
 }
 
+# Finalize a cancelled record nobody waits on: publish the interrupt result so
+# the record is complete, then reap it because its caller is gone.
+worker_finalize_cancelled() { # <account-home> <job-dir>
+  local account_home=$1 job=$2
+  : > "$job/stdout" 2>/dev/null || true
+  printf 'remote job cancelled after its caller disconnected\n' > "$job/stderr" 2>/dev/null || true
+  worker_publish_result "$job" 130 || return 1
+  fm_remote_job_reap "$account_home" "${job##*/}" || true
+}
+
+worker_lane_busy() { # <home>
+  local home=$1 i=0 count=${#WORKER_LANE_HOMES[@]}
+  while [ "$i" -lt "$count" ]; do
+    [ "${WORKER_LANE_HOMES[$i]}" != "$home" ] || return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+worker_lane_owns_job() { # <job-dir>
+  local job=$1 i=0 count=${#WORKER_LANE_JOBS[@]}
+  while [ "$i" -lt "$count" ]; do
+    [ "${WORKER_LANE_JOBS[$i]}" != "$job" ] || return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+
+worker_reap_finished_lanes() {
+  local i=0 count=${#WORKER_LANE_PIDS[@]} pid
+  local live_homes=() live_pids=() live_jobs=()
+  while [ "$i" -lt "$count" ]; do
+    pid=${WORKER_LANE_PIDS[$i]}
+    if kill -0 "$pid" 2>/dev/null; then
+      live_homes+=("${WORKER_LANE_HOMES[$i]}")
+      live_pids+=("$pid")
+      live_jobs+=("${WORKER_LANE_JOBS[$i]}")
+    else
+      wait "$pid" 2>/dev/null || true
+    fi
+    i=$((i + 1))
+  done
+  WORKER_LANE_HOMES=()
+  WORKER_LANE_PIDS=()
+  WORKER_LANE_JOBS=()
+  i=0
+  count=${#live_pids[@]}
+  while [ "$i" -lt "$count" ]; do
+    WORKER_LANE_HOMES+=("${live_homes[$i]}")
+    WORKER_LANE_PIDS+=("${live_pids[$i]}")
+    WORKER_LANE_JOBS+=("${live_jobs[$i]}")
+    i=$((i + 1))
+  done
+}
+
+# One lane's whole execution of one job, run as a background lane process:
+# claim, record this process as the claim supervisor, honor a cancel that
+# arrived before running, establish the deadline, run to publication, and reap
+# the record when its caller cancelled and can no longer reap it.
+worker_lane_execute() { # <account-home> <job-dir>
+  local account_home=$1 job=$2 timeout deadline tmp
+  worker_claim "$job" || return 0
+  tmp=$(umask 077; mktemp "$job/.claim/.supervisor.XXXXXX") || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  if ! printf '%s\n' "${BASHPID:-$$}" > "$tmp" || ! chmod 600 "$tmp" ||
+    ! mv -f -- "$tmp" "$job/.claim/supervisor"; then
+    rm -f -- "$tmp"
+    worker_publish_result "$job" 125 || true
+    return 0
+  fi
+  if fm_remote_job_cancelled "$job"; then
+    worker_finalize_cancelled "$account_home" "$job" || true
+    return 0
+  fi
+  timeout=$(fm_remote_job_read_number "$job" timeout 2>/dev/null || true)
+  case "$timeout" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; return 0 ;; esac
+  if [ "$timeout" -gt 3600 ]; then
+    worker_publish_result "$job" 126 || true
+    return 0
+  fi
+  # The deadline is measured in whole seconds from a truncated clock read, so
+  # the +1 keeps the granted window at least the recorded timeout instead of
+  # silently shaving up to a second off it.
+  deadline=$(( $(date +%s) + timeout + 1 ))
+  fm_remote_job_write_number "$job" deadline "$deadline" || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  fm_remote_job_write_state "$job" running || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  worker_run_job "$account_home" "$job"
+  if fm_remote_job_cancelled "$job"; then
+    fm_remote_job_reap "$account_home" "${job##*/}" || true
+  fi
+}
+
+# Each lane runs as its own top-level worker process (--lane), not a
+# backgrounded subshell: a bash subshell does not reliably reap its dead
+# children, and a zombie group leader keeps its process group signalable, so a
+# subshell-hosted monitor loop can believe a finished command is still running
+# until the job deadline. A top-level shell is the context the monitor loop
+# has always run in.
+worker_start_lane() { # <job-dir> <home>
+  local job=$1 home=$2 lane_pid
+  "$SCRIPT_DIR/fm-remote-job-worker.sh" --lane "${job##*/}" &
+  lane_pid=$!
+  WORKER_LANE_HOMES+=("$home")
+  WORKER_LANE_PIDS+=("$lane_pid")
+  WORKER_LANE_JOBS+=("$job")
+}
+
+worker_lane_main() { # <job-id>
+  local account_home job
+  fm_remote_job_safe_id "$1" || { worker_error "invalid lane job id"; exit 2; }
+  account_home=$(worker_account_home) || { worker_error "cannot resolve account home"; exit 1; }
+  FM_ROOT=$(fm_remote_job_canonical_existing_dir "$FM_ROOT") || { worker_error "configured FM_ROOT is unsafe"; exit 1; }
+  fm_remote_job_prepare_state "$account_home" || { worker_error "$FM_REMOTE_JOB_ERROR"; exit 1; }
+  job=$(fm_remote_job_job_dir "$1" 2>/dev/null) || exit 0
+  worker_lane_execute "$account_home" "$job"
+}
+
 worker_process_once() { # <account-home>
-  local account_home=$1 job id state queue_deadline timeout deadline
+  local account_home=$1 job id state queue_deadline home seq candidates=''
+  worker_reap_finished_lanes
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
     id=${job##*/}
@@ -646,37 +811,40 @@ worker_process_once() { # <account-home>
     case "$state" in
       queued)
         worker_clear_dead_claim "$job" || continue
+        if fm_remote_job_cancelled "$job"; then
+          worker_finalize_cancelled "$account_home" "$job" || true
+          continue
+        fi
         queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
         case "$queue_deadline" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
         if [ "$(date +%s)" -ge "$queue_deadline" ]; then
           worker_publish_result "$job" 124 || true
           continue
         fi
+        home=$(worker_read_text "$job" home 8192 2>/dev/null || true)
+        [ -n "$home" ] || { worker_publish_result "$job" 126 || true; continue; }
+        # A record staged by an older library has no seq; order it ahead of
+        # sequenced work as the older job it is.
+        seq=$(fm_remote_job_read_number "$job" seq 2>/dev/null || true)
+        case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
+        candidates="$candidates$seq $id $home"$'\n'
         ;;
       running)
-        worker_recover_orphaned_job "$job" || true
+        worker_lane_owns_job "$job" || worker_reclaim_running_job "$job" || true
         continue
         ;;
       *) continue ;;
     esac
-    worker_claim "$job" || continue
-    timeout=$(fm_remote_job_read_number "$job" timeout 2>/dev/null || true)
-    case "$timeout" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; continue ;; esac
-    if [ "$timeout" -gt 3600 ]; then
-      worker_publish_result "$job" 126 || true
-      continue
-    fi
-    deadline=$(( $(date +%s) + timeout ))
-    fm_remote_job_write_number "$job" deadline "$deadline" || {
-      worker_publish_result "$job" 125 || true
-      continue
-    }
-    fm_remote_job_write_state "$job" running || {
-      worker_publish_result "$job" 125 || true
-      continue
-    }
-    worker_run_job "$account_home" "$job"
   done
+  [ -n "$candidates" ] || return 0
+  while IFS=' ' read -r seq id home; do
+    [ -n "$id" ] || continue
+    worker_lane_busy "$home" && continue
+    job=$(fm_remote_job_job_dir "$id" 2>/dev/null || true)
+    [ -n "$job" ] || continue
+    [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = queued ] || continue
+    worker_start_lane "$job" "$home"
+  done < <(printf '%s' "$candidates" | sort -k1,1n -k2,2)
 }
 
 main() {
@@ -794,6 +962,10 @@ case "${1:-}" in
   --serve)
     [ "$#" -eq 1 ] || { worker_error "unexpected worker arguments"; exit 2; }
     main
+    ;;
+  --lane)
+    [ "$#" -eq 2 ] || { worker_error "unexpected worker arguments"; exit 2; }
+    worker_lane_main "$2"
     ;;
   '')
     if [ "$(fm_remote_job_platform)" = linux ]; then worker_supervise_linux; else main; fi
