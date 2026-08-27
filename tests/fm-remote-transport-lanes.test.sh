@@ -233,6 +233,44 @@ done
   || fail "rapidly staged same-home jobs did not execute in stage order: $(tr '\n' ' ' < "$LOG_A")"
 pass "same-home jobs staged in the same second execute in staging-sequence order"
 
+: > "$LOG_A"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" fm-mark-job.sh publish-hold "$LOG_A" 3 < /dev/null > /dev/null
+PUBLISH_HOLD=$FM_REMOTE_JOB_ID
+wait_for_state "$PUBLISH_HOLD" running || fail "the publication-order lane holder did not begin running"
+(
+  {
+    printf 'delayed payload\n'
+    sleep 5
+  } | fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" \
+    fm-mark-job.sh delayed "$LOG_A" 0
+) > "$TMP_ROOT/delayed-stage-id" &
+DELAYED_STAGE_PID=$!
+for _ in $(seq 1 200); do
+  ls "$STATE_ROOT/jobs"/.stage.* >/dev/null 2>&1 && break
+  sleep 0.02
+done
+ls "$STATE_ROOT/jobs"/.stage.* >/dev/null 2>&1 \
+  || fail "the delayed stdin stage did not begin capturing"
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" fm-mark-job.sh fast "$LOG_A" 0 < /dev/null > /dev/null
+FAST_STAGE=$FM_REMOTE_JOB_ID
+wait "$DELAYED_STAGE_PID" || fail "the delayed stdin stage failed to publish"
+DELAYED_STAGE=$(cat "$TMP_ROOT/delayed-stage-id")
+FAST_SEQ=$(fm_remote_job_read_number "$STATE_ROOT/jobs/$FAST_STAGE" seq) \
+  || fail "the fast stage lost its sequence"
+DELAYED_SEQ=$(fm_remote_job_read_number "$STATE_ROOT/jobs/$DELAYED_STAGE" seq) \
+  || fail "the delayed stage lost its sequence"
+[ "$FAST_SEQ" -lt "$DELAYED_SEQ" ] \
+  || fail "sequence order did not follow publication order: fast=$FAST_SEQ delayed=$DELAYED_SEQ"
+fm_remote_job_wait "$ACCOUNT_HOME" "$PUBLISH_HOLD" || fail "$FM_REMOTE_JOB_ERROR"
+fm_remote_job_wait "$ACCOUNT_HOME" "$FAST_STAGE" || fail "$FM_REMOTE_JOB_ERROR"
+fm_remote_job_wait "$ACCOUNT_HOME" "$DELAYED_STAGE" || fail "$FM_REMOTE_JOB_ERROR"
+[ "$(cat "$LOG_A")" = "$(printf 'publish-hold\nfast\ndelayed')" ] \
+  || fail "execution order diverged from publication sequence: $(tr '\n' ' ' < "$LOG_A")"
+fm_remote_job_reap "$ACCOUNT_HOME" "$PUBLISH_HOLD" || true
+fm_remote_job_reap "$ACCOUNT_HOME" "$FAST_STAGE" || true
+fm_remote_job_reap "$ACCOUNT_HOME" "$DELAYED_STAGE" || true
+pass "same-home sequence order follows completed staging publication"
+
 # T3a: a caller killed while its job is still queued cancels it; the worker
 # never executes it.
 fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" fm-mark-job.sh hold2 "$LOG_A" 4 < /dev/null > /dev/null

@@ -500,7 +500,8 @@ fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
   [ "$owner" = "$2" ]
 }
 
-fm_remote_job_next_seq() {
+fm_remote_job_next_seq() { # [stage-dir destination]
+  local stage=${1:-} destination=${2:-} published=0
   local lock counter tmp value attempt=0 mtime now token stolen file
   [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
   lock="$FM_REMOTE_JOB_STATE/.seq.lock"
@@ -516,13 +517,30 @@ fm_remote_job_next_seq() {
         case "$value" in ''|*[!0-9]*) value=0 ;; esac
         value=$((value + 1))
         tmp="$lock/.seqval.$token"
-        if { printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
-          && fm_remote_job_seq_lock_owned "$lock" "$token" \
-          && mv -f -- "$tmp" "$counter"; } 2>/dev/null; then
-          if fm_remote_job_seq_lock_owned "$lock" "$token"; then
-            rm -f -- "$lock/owner"
-            rmdir "$lock" 2>/dev/null || true
+        if [ -n "$stage" ]; then
+          if fm_remote_job_write_number "$stage" seq "$value" \
+            && fm_remote_job_write_state "$stage" queued \
+            && fm_remote_job_seq_lock_owned "$lock" "$token" \
+            && mv -- "$stage" "$destination"; then
+            published=1
+            rm -f -- "$destination/.owner-pid" "$destination/.owner-start" || true
+          else
+            rm -f -- "$stage/state" "$stage/seq"
           fi
+        fi
+        if [ -z "$stage" ] || [ "$published" -eq 1 ]; then
+          if { printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
+            && fm_remote_job_seq_lock_owned "$lock" "$token" \
+            && mv -f -- "$tmp" "$counter"; } 2>/dev/null; then
+            if fm_remote_job_seq_lock_owned "$lock" "$token"; then
+              rm -f -- "$lock/owner"
+              rmdir "$lock" 2>/dev/null || true
+            fi
+            printf '%s\n' "$value"
+            return 0
+          fi
+        fi
+        if [ "$published" -eq 1 ]; then
           printf '%s\n' "$value"
           return 0
         fi
@@ -579,13 +597,9 @@ fm_remote_job_cancel() { # <account-home> <id>
 }
 
 fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdin is captured
-  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline seq owner_start
+  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline owner_start
   shift 4
   fm_remote_job_prepare_state "$account_home" || return 1
-  seq=$(fm_remote_job_next_seq) || {
-    FM_REMOTE_JOB_ERROR="cannot allocate a remote job staging sequence"
-    return 1
-  }
   root=$(fm_remote_job_canonical_existing_dir "$root") || {
     FM_REMOTE_JOB_ERROR="remote job root is unavailable or unsafe"
     return 1
@@ -613,14 +627,13 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
     ! printf '%s\n' "$home" > "$stage/home" ||
     ! printf '%s\n' "$queue_deadline" > "$stage/queue_deadline" ||
     ! printf '%s\n' "$FM_REMOTE_JOB_TIMEOUT" > "$stage/timeout" ||
-    ! printf '%s\n' "$seq" > "$stage/seq" ||
     ! printf '%s\0' "$command" "$@" > "$stage/argv" ||
     ! head -c "$((FM_REMOTE_JOB_MAX_BYTES + 1))" > "$stage/stdin"; then
     rm -rf -- "$stage"
     FM_REMOTE_JOB_ERROR="cannot capture remote job input"
     return 1
   fi
-  for bytes in root home queue_deadline timeout seq argv stdin; do chmod 600 "$stage/$bytes" || { rm -rf -- "$stage"; return 1; }; done
+  for bytes in root home queue_deadline timeout argv stdin; do chmod 600 "$stage/$bytes" || { rm -rf -- "$stage"; return 1; }; done
   fm_remote_job_regular_bounded "$stage/argv" "$FM_REMOTE_JOB_MAX_BYTES" || {
     rm -rf -- "$stage"
     FM_REMOTE_JOB_ERROR="remote job argv exceeds the ${FM_REMOTE_JOB_MAX_BYTES}-byte bound"
@@ -631,17 +644,18 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
     FM_REMOTE_JOB_ERROR="remote job stdin exceeds the ${FM_REMOTE_JOB_MAX_BYTES}-byte bound"
     return 1
   }
-  touch "$stage" || { rm -rf -- "$stage"; return 1; }
-  rm -f -- "$stage/.owner-pid" "$stage/.owner-start" || { rm -rf -- "$stage"; return 1; }
   : > "$stage/stdout"
   : > "$stage/stderr"
   chmod 600 "$stage/stdout" "$stage/stderr" || { rm -rf -- "$stage"; return 1; }
-  fm_remote_job_write_state "$stage" queued || { rm -rf -- "$stage"; return 1; }
   id="job-${stage##*/.stage.}"
   fm_remote_job_safe_id "$id" || { rm -rf -- "$stage"; return 1; }
   destination="$FM_REMOTE_JOB_JOBS/$id"
   [ ! -e "$destination" ] && [ ! -L "$destination" ] || { rm -rf -- "$stage"; return 1; }
-  mv -- "$stage" "$destination" || { rm -rf -- "$stage"; return 1; }
+  if ! fm_remote_job_next_seq "$stage" "$destination" >/dev/null; then
+    rm -rf -- "$stage"
+    FM_REMOTE_JOB_ERROR="cannot allocate and publish a remote job staging sequence"
+    return 1
+  fi
   # shellcheck disable=SC2034 # Sourceable API consumed by callers that do not use command substitution.
   FM_REMOTE_JOB_ID=$id
   printf '%s\n' "$id"
@@ -714,7 +728,7 @@ fm_remote_job_reap() { # <account-home> <id>; only removes an exact completed re
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id") || return 1
   [ "$(fm_remote_job_read_state "$job")" = 'done' ] || return 1
-  for file in root home queue_deadline timeout deadline seq cancel argv stdin stdout stderr exit state; do
+  for file in root home queue_deadline timeout deadline seq cancel argv stdin stdout stderr exit state .owner-pid .owner-start; do
     [ -e "$job/$file" ] || continue
     [ ! -L "$job/$file" ] || return 1
     rm -f -- "$job/$file" || return 1
