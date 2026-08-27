@@ -1177,6 +1177,15 @@ families_for_changed_path() {
       printf '%s\n' watcher-wake-lock
       printf '%s\n' "__script__:fm-procevent-quota.test.sh"
       ;;
+    bin/fm-worktree-ownership-lib.sh)
+      # The shared proof guards teardown across every provider, both relaunch
+      # entry points, and recursive secondmate cleanup.
+      printf '%s\n' pr-forge
+      printf '%s\n' backend-dispatch
+      printf '%s\n' orca
+      printf '%s\n' zellij
+      printf '%s\n' secondmate
+      ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
       printf '%s\n' pr-forge

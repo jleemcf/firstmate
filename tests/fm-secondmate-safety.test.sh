@@ -1895,7 +1895,7 @@ test_secondmate_force_teardown_discards_child_work() {
   childproj="$subhome/projects/alpha"
   childwt="$TMP_ROOT/force-child-worktree"
   mkdir -p "$home/state" "$home/data" "$subhome/state"
-  fm_git_worktree "$childproj" "$childwt" force-child
+  fm_git_worktree "$childproj" "$childwt" fm/child
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
@@ -1936,6 +1936,65 @@ EOF
   pass "secondmate force teardown discards child work"
 }
 
+test_secondmate_force_teardown_refuses_child_quarantine_symlink() {
+  local home subhome childproj childwt external fakebin log err rc
+  home="$TMP_ROOT/force-quarantine-home"
+  subhome="$TMP_ROOT/force-quarantine-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/force-quarantine-child-worktree"
+  external="$TMP_ROOT/force-quarantine-external"
+  err="$TMP_ROOT/force-quarantine.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$external"
+  fm_git_worktree "$childproj" "$childwt" fm/child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+EOF
+  printf 'child check\n' > "$subhome/state/child.check.sh"
+  printf 'external quarantine artifact\n' > "$external/child.check.protected"
+  chmod 0640 "$external/child.check.protected"
+  ln -s "$external" "$subhome/state/.pr-check-quarantine"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/force-quarantine-fake")
+  log="$TMP_ROOT/force-quarantine-fake/tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-quarantine-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2> "$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "force teardown accepted a child quarantine-directory symlink"
+  [ -d "$subhome" ] || fail "force teardown removed the subhome before quarantine refusal"
+  [ -d "$childwt" ] || fail "force teardown removed child work before quarantine refusal"
+  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta before quarantine refusal"
+  [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta before quarantine refusal"
+  [ "$(cat "$subhome/state/child.check.sh")" = 'child check' ] || fail "force teardown removed the child check before quarantine refusal"
+  [ "$(cat "$external/child.check.protected")" = 'external quarantine artifact' ] \
+    || fail "force teardown changed the child quarantine symlink target"
+  [ "$(file_mode "$external/child.check.protected")" = 640 ] \
+    || fail "force teardown changed the child quarantine target mode"
+  grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed a window before child quarantine validation"
+  pass "secondmate force teardown prevalidates child quarantine cleanup without following symlinks"
+}
+
 test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
   local home subhome childproj childwt fakebin log err rc lock
   home="$TMP_ROOT/force-lock-home"
@@ -1944,7 +2003,7 @@ test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
   childwt="$TMP_ROOT/force-lock-child-worktree"
   err="$TMP_ROOT/force-lock-child.err"
   mkdir -p "$home/state" "$home/data" "$subhome/state"
-  fm_git_worktree "$childproj" "$childwt" force-child-lock
+  fm_git_worktree "$childproj" "$childwt" fm/child
   printf 'domain\n' > "$subhome/.fm-secondmate-home"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain
@@ -2147,7 +2206,7 @@ SH
     grep -F -- "- $tid " "$home/data/secondmates.md" >/dev/null || fail "teardown ($row) removed the registry route after refusal"
     grep -F 'kill-window' "$log" >/dev/null && fail "teardown ($row) killed a window before validation"
   done <<'ROWS'
-unmarked|not a seeded secondmate home
+unmarked|.fm-secondmate-home ownership marker
 ancestor|ancestor of the active firstmate home
 active-descendant|inside the active firstmate home
 repo-descendant|inside the firstmate repo
@@ -2281,7 +2340,7 @@ EOF
   [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta before validation"
   [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta before validation"
   grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed windows before subhome validation"
-  grep -F 'not a seeded secondmate home' "$err" >/dev/null || fail "force teardown did not explain missing seed marker"
+  grep -F '.fm-secondmate-home ownership marker' "$err" >/dev/null || fail "force teardown did not explain missing seed marker"
   pass "force teardown validates subhome before child cleanup"
 }
 
@@ -2302,7 +2361,7 @@ seed_task_set_lock_home() {  # <tag> -> echoes "<home>|<subhome>"
   # A real worktree pair: child-removal validation runs before the task-set
   # preflight and refuses a child whose worktree is not a genuine worktree of
   # its project, which would mask the refusal under test.
-  fm_git_worktree "$childproj" "$childwt" "child-$tag"
+  fm_git_worktree "$childproj" "$childwt" fm/child
   printf '%s\n' domain > "$subhome/.fm-secondmate-home"
   cat > "$home/state/domain.meta" <<EOF
 window=firstmate:fm-domain

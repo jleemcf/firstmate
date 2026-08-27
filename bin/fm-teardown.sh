@@ -19,6 +19,11 @@
 # home with a backlog but no compatible tasks-axi refuses before cleanup.
 # None of this loosens the landed-work gates below: the transition runs only on
 # the paths that already proceed to remove the record.
+# REFUSES before any worktree-based mutation unless the shared ownership
+# resolver proves the recorded path still belongs only to this task.
+# A force-authorized discard never bypasses that independent ownership proof.
+# A provider return or removal clears worktree= before the slot can become
+# reusable and restores the claim if the provider operation fails.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
@@ -169,6 +174,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-worktree-ownership-lib.sh
+. "$SCRIPT_DIR/fm-worktree-ownership-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-lock-lib.sh
@@ -1335,13 +1342,31 @@ cleanup_stale_lock_for_safety_check() {
 
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
 # stale git index.lock left by a killed crew process. See the script header.
-teardown_treehouse_return() {
+# The wrapper proves ownership again at the provider boundary, clears the claim
+# before Treehouse can recycle the slot, and restores it on every failed return.
+TEARDOWN_TREEHOUSE_RETURN_LEASE_ID=
+TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER=
+
+treehouse_return_once() {  # <worktree> <project>
+  local dir=$1 cd_dir=$2
+  local -a args=(return --force)
+  if [ -n "$TEARDOWN_TREEHOUSE_RETURN_LEASE_ID" ]; then
+    args+=(--if-lease-id "$TEARDOWN_TREEHOUSE_RETURN_LEASE_ID")
+  fi
+  if [ -n "$TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER" ]; then
+    args+=(--if-lease-holder "$TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER")
+  fi
+  args+=("$dir")
+  (CDPATH='' cd -- "$cd_dir" && treehouse "${args[@]}")
+}
+
+teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-check]
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
   local out lock attempt=0 max_retries lock_desc
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$(treehouse_return_once "$dir" "$cd_dir" 2>&1); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
@@ -1366,7 +1391,7 @@ teardown_treehouse_return() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$(treehouse_return_once "$dir" "$cd_dir" 2>&1); then
       [ -n "$out" ] && printf '%s\n' "$out"
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
@@ -1393,7 +1418,7 @@ teardown_treehouse_return() {
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$(treehouse_return_once "$dir" "$cd_dir" 2>&1); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
         return 0
@@ -1409,6 +1434,25 @@ teardown_treehouse_return() {
 
   echo "teardown: $label return failed: git index.lock signature persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) even after the lock file disappeared" >&2
   return 1
+}
+
+teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <state> <task-id> <meta>
+  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
+  local claim_state=$5 claim_id=$6 claim_meta=$7 rc
+  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
+  TEARDOWN_TREEHOUSE_RETURN_LEASE_ID=$FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_ID
+  TEARDOWN_TREEHOUSE_RETURN_LEASE_HOLDER=$FM_WORKTREE_OWNERSHIP_TREEHOUSE_LEASE_HOLDER
+  fm_worktree_claim_retire_begin "$claim_meta" "$dir" || return 1
+  if teardown_treehouse_return_raw "$dir" "$cd_dir" "$label" "$post_cleanup_check"; then
+    fm_worktree_claim_retire_commit
+    return $?
+  else
+    rc=$?
+  fi
+  if ! fm_worktree_claim_retire_restore; then
+    return 1
+  fi
+  return "$rc"
 }
 
 validate_worktree_teardown_safety() {
@@ -1953,6 +1997,50 @@ safe_rm_rf_child_worktree() {
   rm -rf -- "$target"
 }
 
+# The caller must have run fm_worktree_ownership_prove while holding this
+# task's lifecycle and metadata locks before calling this provider wrapper.
+teardown_remove_orca_worktree_claimed() {  # <state> <task-id> <meta> <worktree-id> <worktree>
+  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree_id=$4 worktree=$5 rc
+  [ -n "$claim_state" ] && [ -n "$claim_id" ] || return 1
+  fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
+  if fm_backend_remove_worktree orca "$worktree_id"; then
+    fm_worktree_claim_retire_commit
+    return $?
+  else
+    rc=$?
+  fi
+  fm_worktree_claim_retire_restore || return 1
+  return "$rc"
+}
+
+teardown_safe_rm_child_worktree_claimed() {  # <state> <task-id> <meta> <worktree> <project>
+  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree=$4 project=$5 rc
+  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
+  fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
+  if safe_rm_rf_child_worktree "$worktree" "$project"; then
+    fm_worktree_claim_retire_commit
+    return $?
+  else
+    rc=$?
+  fi
+  fm_worktree_claim_retire_restore || return 1
+  return "$rc"
+}
+
+teardown_safe_rm_firstmate_home_claimed() {  # <state> <task-id> <meta> <home> <label>
+  local claim_state=$1 claim_id=$2 claim_meta=$3 home=$4 label=$5 rc
+  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
+  fm_worktree_claim_retire_begin "$claim_meta" "$home" || return 1
+  if safe_rm_rf "$home" "$label"; then
+    fm_worktree_claim_retire_commit
+    return $?
+  else
+    rc=$?
+  fi
+  fm_worktree_claim_retire_restore || return 1
+  return "$rc"
+}
+
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path marker_id conflict child_id child_home
   [ -n "$home" ] || return 0
@@ -2007,11 +2095,17 @@ EOF
 }
 
 remove_firstmate_home() {
-  local home=$1 label=$2 expected_id=${3:-} abs_home_path process_event_backup
+  local home=$1 label=$2 expected_id=${3:-} claim_meta=${4:-} abs_home_path process_event_backup claim_state
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
+  [ -n "$claim_meta" ] || {
+    echo "REFUSED: no task metadata was supplied to prove ownership of $label $abs_home_path" >&2
+    return 1
+  }
+  claim_state=${claim_meta%/*}
+  fm_worktree_ownership_prove "$claim_state" "$expected_id" "$claim_meta" || return 1
   process_event_backup=$(snapshot_firstmate_home_process_events "$abs_home_path" "$label") || return 1
   if ! cleanup_firstmate_home_process_events "$abs_home_path" "$label"; then
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
@@ -2023,7 +2117,8 @@ remove_firstmate_home() {
       restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
     }
-    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" || {
+    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" "" \
+      "$claim_state" "$expected_id" "$claim_meta" || {
       echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
       restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
@@ -2031,7 +2126,8 @@ remove_firstmate_home() {
     [ -z "$process_event_backup" ] || rm -rf -- "$process_event_backup"
     return 0
   fi
-  if safe_rm_rf "$abs_home_path" "$label"; then
+  if teardown_safe_rm_firstmate_home_claimed \
+      "$claim_state" "$expected_id" "$claim_meta" "$abs_home_path" "$label"; then
     [ -z "$process_event_backup" ] || rm -rf -- "$process_event_backup"
     return 0
   fi
@@ -2284,7 +2380,7 @@ preflight_descendant_task_locks() {
 }
 
 validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
+  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -2300,17 +2396,20 @@ validate_firstmate_home_children_removal() {
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
+      fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
     elif [ "$child_backend" = orca ]; then
-      child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
         child_proj=$(meta_value "$child_meta" project)
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-        require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" || return 1
       fi
+      fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
     elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
       child_proj=$(meta_value "$child_meta" project)
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+      fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
+    else
+      fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
     fi
   done
 }
@@ -2457,6 +2556,7 @@ cleanup_firstmate_home_children() {
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
+    fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
     child_kind=$(meta_value "$child_meta" kind)
@@ -2498,7 +2598,7 @@ cleanup_firstmate_home_children() {
       [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home" || return $?
-        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return $?
+        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" "$child_meta" || return $?
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
@@ -2506,24 +2606,28 @@ cleanup_firstmate_home_children() {
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" \
           "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       fi
-      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" || return 1
+      teardown_remove_orca_worktree_claimed \
+        "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || return 1
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" \
         "$child_wt/.opencode/plugins/fm-busy-state.js" \
         "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       if [ -n "$child_proj" ] && [ -d "$child_proj" ] && command -v treehouse >/dev/null 2>&1; then
-        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree"; then
+        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" "" \
+            "$sub_state" "$child_id" "$child_meta"; then
           :
         else
           child_return_rc=$?
           if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
             return "$child_return_rc"
           fi
-          safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+          teardown_safe_rm_child_worktree_claimed \
+            "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj"
         fi
       else
-        safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+        teardown_safe_rm_child_worktree_claimed \
+          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj"
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
@@ -2562,6 +2666,9 @@ remove_secondmate_registry_entry() {
 validate_pr_poll_cleanup "$STATE" "$ID" || exit 1
 
 if [ "$KIND" = secondmate ]; then
+  # A secondmate's recorded path is the root of every recursive cleanup below.
+  # Prove its ownership before any child or process-event mutation can begin.
+  fm_worktree_ownership_prove "$STATE" "$ID" "$META" || exit 1
   LOCAL_REGISTRY_LOCK=$(secondmate_registry_lock_path "$STATE")
   fm_lock_acquire_wait "$LOCAL_REGISTRY_LOCK" || exit 1
   LOCAL_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
@@ -2654,14 +2761,26 @@ if [ -n "$X_REQUEST" ]; then
   echo "warning: task $ID still carries an unreconciled Relay request link ($X_REQUEST) on its task record." >&2
 fi
 
+if [ "$KIND" != secondmate ]; then
+  # Ownership is independent of landed-work and discard authority.
+  # Prove it before path-based safety inspection, run abort, process reap, hook
+  # removal, provider return, or provider removal can touch the recorded path.
+  fm_worktree_ownership_prove "$STATE" "$ID" "$META" || exit 1
+  if [ "$BACKEND" = orca ]; then
+    ORCA_PATH_MATCH_VERIFIED=1
+  fi
+fi
+
 if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
   if ! inspectable_git_worktree "$WT"; then
     echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
     echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
     exit 1
   fi
-  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || exit 1
-  ORCA_PATH_MATCH_VERIFIED=1
+  if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
+    require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || exit 1
+    ORCA_PATH_MATCH_VERIFIED=1
+  fi
 fi
 
 if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
@@ -2736,26 +2855,19 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
     ORCA_PATH_MATCH_VERIFIED=1
   fi
+  branch=HEAD
   if [ -d "$WT" ]; then
     branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-    if [ "$branch" != "HEAD" ]; then
-      if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-      fi
-    fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
       "$WT/.opencode/plugins/fm-busy-state.js" \
       "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
+  teardown_remove_orca_worktree_claimed \
+    "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || exit 1
+  [ "$branch" = HEAD ] || git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-  if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-    fi
-  fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
     "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
@@ -2767,10 +2879,12 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
+  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" \
+    "$STATE" "$ID" "$META" || {
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   }
+  [ "$branch" = HEAD ] || git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
 fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
@@ -2851,7 +2965,7 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   handoff_wake_retire_stage \
     || { echo "error: receiver wake cleanup could not be staged; preserving the secondmate home and route" >&2; exit 1; }
-  if remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"; then
+  if remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" "$META"; then
     :
   else
     rc=$?

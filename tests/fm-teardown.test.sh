@@ -920,6 +920,122 @@ test_content_fallback_refreshes_stale_origin_ref() {
   pass "content fallback refreshes origin default before comparing trees"
 }
 
+test_recycled_worktree_claim_refuses_before_live_work_is_touched() {
+  local case_dir rc
+  case_dir=$(make_case recycled-owner-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  git -C "$case_dir/wt" branch -m fm/task-b
+  printf '%s\n' baseline > "$case_dir/wt/live.txt"
+  git -C "$case_dir/wt" add live.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "task B baseline"
+  printf '%s\n' "task B live uncommitted work" > "$case_dir/wt/live.txt"
+  fm_write_meta "$case_dir/state/task-b.meta" \
+    "window=firstmate:fm-task-b" \
+    "endpoint_task_id=task-b" \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf 'destructive return reached\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" reset --hard HEAD >/dev/null
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "recycled-owner-refusal: teardown of task A must refuse a slot now claimed by task B"
+  assert_contains "$(cat "$case_dir/stderr")" "task-b" \
+    "recycled-owner-refusal: refusal did not name task B's conflicting claim"
+  assert_absent "$case_dir/treehouse.log" \
+    "recycled-owner-refusal: teardown reached the destructive pool return"
+  [ "$(cat "$case_dir/wt/live.txt")" = "task B live uncommitted work" ] \
+    || fail "recycled-owner-refusal: task B's live edit was destroyed"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "recycled-owner-refusal: task A's record was removed despite refusal"
+  pass "recycled pooled worktree ownership conflict refuses before touching the live task"
+}
+
+test_treehouse_lease_and_task_branch_mismatches_refuse_concretely() {
+  local case_dir rc
+  case_dir=$(make_case lease-owner-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then
+  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-b","lease_holder":"task-b"}]'
+  exit 0
+fi
+printf 'return reached\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "lease-owner-refusal: another task's provider lease must refuse"
+  assert_contains "$(cat "$case_dir/stderr")" "leased to task task-b, not task task-x1" \
+    "lease-owner-refusal: refusal did not name the conflicting provider owner"
+  assert_absent "$case_dir/treehouse.log" \
+    "lease-owner-refusal: provider mismatch still reached return"
+
+  case_dir=$(make_case branch-owner-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  git -C "$case_dir/wt" branch -m fm/task-b
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'return reached\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "branch-owner-refusal: another task branch must refuse"
+  assert_contains "$(cat "$case_dir/stderr")" "branch fm/task-b, not task task-x1 branch fm/task-x1" \
+    "branch-owner-refusal: refusal did not name the conflicting branch proof"
+  assert_absent "$case_dir/treehouse.log" \
+    "branch-owner-refusal: branch mismatch still reached return"
+  pass "provider leases and task branches must positively agree with the recorded owner"
+}
+
+test_normal_return_clears_the_worktree_claim_before_pool_release() {
+  local case_dir rc
+  case_dir=$(make_case normal-return-clears-claim)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then
+  printf '%s\n' '[{"path":"$case_dir/wt","lease_id":"lease-task-x1","lease_holder":"task-x1"}]'
+  exit 0
+fi
+if grep -q '^worktree=' "$case_dir/state/task-x1.meta"; then
+  echo 'worktree claim survived until pool return' >&2
+  exit 23
+fi
+printf '%s\n' "\$*" | grep -F -- '--if-lease-id lease-task-x1' >/dev/null \
+  || { echo "conditional lease id missing from return: \$*" >&2; exit 24; }
+printf '%s\n' "\$*" | grep -F -- '--if-lease-holder task-x1' >/dev/null \
+  || { echo "conditional lease holder missing from return: \$*" >&2; exit 25; }
+printf 'claim cleared before conditional return\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "normal-return-clears-claim: teardown should clear the claim and return the slot"
+  assert_grep "claim cleared before conditional return" "$case_dir/treehouse.log" \
+    "normal-return-clears-claim: pool return did not observe the cleared claim and positive lease proof"
+  pass "normal pool return clears the owning task's worktree claim in the same operation"
+}
+
 test_dirty_worktree_refuses() {
   local case_dir rc pr_head
   case_dir=$(make_case dirty-wt)
@@ -1023,6 +1139,8 @@ test_live_index_lock_is_never_removed_and_teardown_refuses() {
   assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
     "live-index-lock: teardown removed a lock with a live holder"
   [ -e "$lock" ] || fail "live-index-lock: live-held lock file was removed"
+  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
+    "live-index-lock: failed provider return did not restore the task's worktree claim"
   pass "live-held worktree index.lock is never removed and teardown refuses"
 }
 
@@ -1446,8 +1564,8 @@ test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes() {
   closed="$case_dir/closed"
   : > "$case_dir/state/task-x1.status"
   : > "$case_dir/state/task-x1.turn-ended"
-  # Record every treehouse invocation: the contended-lock refusal must fire
-  # BEFORE the isolated copy is returned, so phase 1 may not invoke it at all.
+  # Record every treehouse invocation: the ownership proof may inspect status,
+  # but the contended-lock refusal must fire before any destructive return.
   thlog="$case_dir/treehouse.log"; : > "$thlog"
   cat > "$case_dir/fakebin/treehouse" <<SH
 #!/usr/bin/env bash
@@ -1484,7 +1602,7 @@ SH
   [ -e "$case_dir/state/task-x1.turn-ended" ] || { : > "$release"; fail "herdr-orphan-refusal: refusal erased the turn-end record"; }
   assert_grep "presentation lock is contended" "$case_dir/stderr" \
     "herdr-orphan-refusal: the pre-return refusal was not explained visibly"
-  if [ -s "$thlog" ]; then
+  if grep -q '^return ' "$thlog"; then
     : > "$release"; fail "herdr-orphan-refusal: the contended refusal still returned the isolated copy: $(cat "$thlog")"
   fi
   [ -d "$case_dir/wt" ] || { : > "$release"; fail "herdr-orphan-refusal: the contended refusal removed the isolated copy"; }
@@ -1504,7 +1622,8 @@ SH
     run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" \
     || fail "herdr-orphan-refusal: the retry after lock release failed: $(cat "$case_dir/stderr2")"
   [ -e "$closed" ] || fail "herdr-orphan-refusal: the retry never closed the pane under the lock"
-  [ -s "$thlog" ] || fail "herdr-orphan-refusal: the successful retry never returned the isolated copy"
+  assert_grep "return --force" "$thlog" \
+    "herdr-orphan-refusal: the successful retry never returned the isolated copy"
   [ ! -e "$case_dir/state/task-x1.meta" ] || fail "herdr-orphan-refusal: the successful retry left the metadata behind"
   [ ! -e "$case_dir/state/task-x1.status" ] || fail "herdr-orphan-refusal: the successful retry left the status record behind"
   grep -q "teardown task-x1 complete" "$case_dir/stdout2" \
@@ -1589,7 +1708,7 @@ SH
     || fail "herdr-preflight-$mode: refusal erased the task status record"
   [ -e "$case_dir/state/task-x1.turn-ended" ] \
     || fail "herdr-preflight-$mode: refusal erased the turn-end record"
-  [ ! -s "$thlog" ] || fail "herdr-preflight-$mode: refusal returned the isolated copy"
+  ! grep -q '^return ' "$thlog" || fail "herdr-preflight-$mode: refusal returned the isolated copy"
   [ ! -e "$closed" ] || fail "herdr-preflight-$mode: refusal attempted an unlocked pane close"
 }
 
@@ -1605,7 +1724,10 @@ configure_secondmate_with_herdr_child() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  git -C "$case_dir/wt" branch -m fm/child-herdr
   fm_write_meta "$home/state/child-herdr.meta" \
     "window=childsession:wC:p1" \
     "endpoint_task_id=child-herdr" \
@@ -1674,7 +1796,7 @@ SH
   [ -e "$home/state/child-herdr.meta" ] || fail "herdr-child-preflight: refusal erased the child record"
   [ -e "$home/state/child-herdr.status" ] || fail "herdr-child-preflight: refusal erased child status"
   [ -d "$home" ] || fail "herdr-child-preflight: refusal removed the secondmate home"
-  [ ! -s "$thlog" ] || fail "herdr-child-preflight: refusal returned work before child preflight"
+  ! grep -q '^return ' "$thlog" || fail "herdr-child-preflight: refusal returned work before child preflight"
   [ ! -e "$closed" ] || fail "herdr-child-preflight: refusal attempted a child close"
   assert_grep "nothing was changed" "$case_dir/stderr" \
     "herdr-child-preflight: refusal did not explain its non-mutating boundary"
@@ -1685,6 +1807,8 @@ configure_secondmate_with_tmux_children() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home" child child_wt
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   for child in child-a child-b; do
     child_wt="$case_dir/$child-wt"
@@ -1753,7 +1877,7 @@ SH
     || { : > "$release"; wait "$holder_pid" 2>/dev/null || true; fail "descendant-locks: refusal leaked earlier descendant locks"; }
   [ ! -s "$case_dir/kill.log" ] \
     || { : > "$release"; wait "$holder_pid" 2>/dev/null || true; fail "descendant-locks: refusal killed an endpoint"; }
-  [ ! -s "$case_dir/treehouse.log" ] \
+  ! grep -q '^return ' "$case_dir/treehouse.log" \
     || { : > "$release"; wait "$holder_pid" 2>/dev/null || true; fail "descendant-locks: refusal returned a worktree"; }
   [ -e "$case_dir/state/task-x1.meta" ] && [ -d "$home" ] \
     || { : > "$release"; wait "$holder_pid" 2>/dev/null || true; fail "descendant-locks: refusal removed parent state"; }
@@ -1801,15 +1925,18 @@ configure_nested_secondmate_with_herdr_grandchild() {  # <case-dir>
   mkdir -p "$nested_home/state" "$nested_home/data" "$nested_home/config" "$nested_home/projects"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf '%s\n' nested-sm > "$nested_home/.fm-secondmate-home"
+  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   fm_write_meta "$home/state/nested-sm.meta" \
     "window=firstmate:fm-nested-sm" \
     "endpoint_task_id=nested-sm" \
-    "worktree=$case_dir/wt" \
+    "worktree=$nested_home" \
     "project=$case_dir/project" \
     "kind=secondmate" \
     "mode=local-only" \
     "home=$nested_home"
+  git -C "$case_dir/wt" branch -m fm/grandchild-herdr
   fm_write_meta "$nested_home/state/grandchild-herdr.meta" \
     "window=grandchildsession:wG:p1" \
     "endpoint_task_id=grandchild-herdr" \
@@ -2151,7 +2278,7 @@ test_parked_own_run_refuses_when_abort_is_unconfirmed() {
 
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
-printf 'return\n' >> "$case_dir/treehouse.log"
+[ "\${1:-}" != return ] || printf 'return\n' >> "$case_dir/treehouse.log"
 EOF
   chmod +x "$case_dir/fakebin/treehouse"
 
@@ -2321,7 +2448,7 @@ exit 1
 SH
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
-printf 'return\n' >> "$case_dir/treehouse.log"
+[ "\${1:-}" != return ] || printf 'return\n' >> "$case_dir/treehouse.log"
 EOF
   chmod +x "$case_dir/fakebin/lsof" "$case_dir/fakebin/treehouse"
 
@@ -2547,7 +2674,7 @@ exec "$REAL_PS_FOR_TEST" "$@"
 SH
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
-printf 'returned\n' > "$case_dir/treehouse.log"
+[ "\${1:-}" != return ] || printf 'returned\n' > "$case_dir/treehouse.log"
 EOF
   chmod +x "$case_dir/fakebin/lsof" "$case_dir/fakebin/ps" "$case_dir/fakebin/treehouse"
 
@@ -2583,8 +2710,10 @@ test_run_abort_precedes_process_reap_precedes_worktree_removal() {
   # real observed state, not a source-text or line-number correlation.
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
-if [ -s "$abort_log" ]; then echo "abort-already-happened" >> "$case_dir/order.log"; fi
-if ! kill -0 $pid 2>/dev/null; then echo "reap-already-happened" >> "$case_dir/order.log"; fi
+if [ "\${1:-}" = return ]; then
+  if [ -s "$abort_log" ]; then echo "abort-already-happened" >> "$case_dir/order.log"; fi
+  if ! kill -0 $pid 2>/dev/null; then echo "reap-already-happened" >> "$case_dir/order.log"; fi
+fi
 exit 0
 EOF
   chmod +x "$case_dir/fakebin/treehouse"
@@ -2634,6 +2763,9 @@ test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
+test_recycled_worktree_claim_refuses_before_live_work_is_touched
+test_treehouse_lease_and_task_branch_mismatches_refuse_concretely
+test_normal_return_clears_the_worktree_claim_before_pool_release
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds
