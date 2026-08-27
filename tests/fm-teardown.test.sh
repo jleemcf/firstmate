@@ -550,6 +550,7 @@ run_teardown() {
   FM_FAKE_CHROME_ACTIVE_DIR="${FM_FAKE_CHROME_ACTIVE_DIR:-}" \
   FM_FAKE_CHROME_STOP_LOG="${FM_FAKE_CHROME_STOP_LOG:-}" \
   FM_FAKE_CHROME_STOP_FAIL="${FM_FAKE_CHROME_STOP_FAIL:-0}" \
+  CHROME_DEVTOOLS_AXI_PORT="${CHROME_DEVTOOLS_AXI_PORT:-}" \
   PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -574,6 +575,72 @@ case "${1:-}" in
     [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
     ;;
 esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+# A PATH shim that routes every browser call onto one shared bridge, discarding
+# the session it was handed - the shape the operator's own WSL-to-Windows
+# dispatcher has, and the one that makes a task teardown able to close the
+# captain's Chrome.
+install_session_blind_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=captain-shared
+case "${1:-}" in
+  '')
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'page:' '  title: the captain browsing'
+    else
+      printf '%s\n' 'browser: no active session'
+    fi
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+# The documented CHROME_DEVTOOLS_AXI_PORT override: an inherited port pins every
+# call to that one bridge whatever session name it is given.
+install_port_pinned_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+[ -z "${CHROME_DEVTOOLS_AXI_PORT:-}" ] || session="port-${CHROME_DEVTOOLS_AXI_PORT}"
+case "${1:-}" in
+  '')
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'page:' '  title: active bridge'
+    else
+      printf '%s\n' 'browser: no active session'
+    fi
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
+# A browser whose bridge stopped answering: every call blocks well past any
+# teardown the operator would wait for.
+install_hanging_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ -z "${FM_FAKE_CHROME_CALL_LOG:-}" ] || printf '%s|%s\n' "${CHROME_DEVTOOLS_AXI_SESSION:-default}" "${1:-status}" >> "$FM_FAKE_CHROME_CALL_LOG"
+exec sleep 90
 SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
 }
@@ -2793,6 +2860,86 @@ test_bridge_started_outside_the_task_launcher_is_still_stopped() {
   pass "a live task-scoped bridge started around the task launcher is still stopped"
 }
 
+test_session_blind_tool_never_stops_a_shared_bridge() {
+  local case_dir rc active_dir stop_log
+  case_dir=$(make_case chrome-session-blind)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_session_blind_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/captain-shared"
+
+  rc=0
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a session-blind browser tool must not break teardown"
+  [ ! -s "$stop_log" ] \
+    || fail "teardown issued a stop through a tool that discards the task session"
+  assert_present "$active_dir/captain-shared" \
+    "a task teardown closed the captain's shared Chrome bridge"
+  assert_grep 'does not act on the task-scoped session for task task-x1' "$case_dir/stderr" \
+    "teardown did not report that the browser tool ignores the task session"
+  pass "a browser tool that ignores the task session is reported, not obeyed"
+}
+
+test_ambient_bridge_port_cannot_retarget_cleanup() {
+  local case_dir rc active_dir stop_log
+  case_dir=$(make_case chrome-ambient-port)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  install_port_pinned_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/port-9224"
+
+  rc=0
+  CHROME_DEVTOOLS_AXI_PORT=9224 \
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an inherited bridge port must not break teardown"
+  [ ! -s "$stop_log" ] \
+    || fail "an inherited bridge port made teardown stop a bridge this task never started"
+  assert_present "$active_dir/port-9224" \
+    "an inherited bridge port let teardown close the bridge listening on it"
+  ! grep -q 'does not act on the task-scoped session' "$case_dir/stderr" \
+    || fail "the captain's ambient bridge port still reached the browser tool"
+  pass "an inherited CHROME_DEVTOOLS_AXI_PORT never reaches the task's bridge calls"
+}
+
+test_hung_bridge_tool_cannot_stall_cleanup() {
+  local case_dir rc started elapsed call_log
+  case_dir=$(make_case chrome-hung-tool)
+  install_hanging_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  call_log="$case_dir/chrome-call.log"
+
+  started=$(date +%s)
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_CHROME_BRIDGE_TIMEOUT=2
+    FM_FAKE_CHROME_CALL_LOG="$call_log"
+    export FM_FAKE_CHROME_CALL_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  expect_code 0 "$rc" "a browser tool that never answers must not fail cleanup"
+  [ "$elapsed" -lt 30 ] \
+    || fail "cleanup waited ${elapsed}s on an unresponsive browser tool instead of bounding it"
+  assert_present "$call_log" "cleanup never reached the browser tool"
+  assert_grep 'skipping the bridge stop' "$case_dir/stderr" \
+    "an unresponsive browser tool did not degrade to a reported skip"
+  pass "an unresponsive browser bridge is bounded instead of stalling teardown"
+}
+
 # Mutation proof for this regression suite:
 # - deleting the cleanup call leaves the active-session test red;
 # - deciding cleanup from the recorded marker alone makes the launcher-bypass
@@ -2803,13 +2950,21 @@ test_bridge_started_outside_the_task_launcher_is_still_stopped() {
 # - dropping the exact session export makes the cross-task survival test red;
 # - trusting the recorded name without deriving ownership makes the forged-binding test red;
 # - propagating `stop` failure makes the nonfatal-failure test red;
-# - moving cleanup below landed-work validation makes the refusal test red.
+# - moving cleanup below landed-work validation makes the refusal test red;
+# - stopping without first proving the tool acts on the session it is handed
+#   makes the session-blind test red;
+# - letting an inherited CHROME_DEVTOOLS_AXI_PORT through to the tool makes the
+#   ambient-port test red;
+# - running the browser tool unbounded makes the hung-tool test red.
 test_active_chrome_bridge_is_stopped_without_touching_second_task
 test_unused_chrome_binding_makes_no_stop_call
 test_bridge_started_outside_the_task_launcher_is_still_stopped
 test_forged_chrome_binding_never_stops_foreign_session
 test_chrome_stop_failure_is_reported_and_nonfatal
 test_unlanded_refusal_still_stops_chrome_bridge
+test_session_blind_tool_never_stops_a_shared_bridge
+test_ambient_bridge_port_cannot_retarget_cleanup
+test_hung_bridge_tool_cannot_stall_cleanup
 
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible

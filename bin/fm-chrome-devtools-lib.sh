@@ -18,10 +18,24 @@
 #   can auto-start the bridge, the launcher atomically changes started=0 to
 #   started=1. Read-only home/help/version and setup/stop commands do not mark it.
 #
+# fm_chrome_axi_run <session> [args...]
+#   The single door to the browser tool. Every call names the session, drops an
+#   ambient CHROME_DEVTOOLS_AXI_PORT (which the tool documents as overriding the
+#   port it otherwise derives from the session name, so an inherited one would
+#   silently retarget another bridge), and runs under a hard bound because the
+#   tool can be a wrapper chain onto a browser that stopped answering.
+#
 # fm_chrome_session_liveness <session>
 #   Prints active, inactive, or unknown for that exact named session by asking
-#   the tool for its status. unknown covers a missing, failing, or unrecognized
-#   answer, so callers fall back to the recorded marker rather than guessing.
+#   the tool for its status. unknown covers a missing, failing, timed-out, or
+#   unrecognized answer, so callers fall back to the recorded marker.
+#
+# fm_chrome_session_is_owned <session>
+#   Proof, not assumption, that the resolved tool acts on the session it is
+#   given: a sibling probe session this fleet never starts must read inactive.
+#   A PATH shim that rewrites every invocation onto one shared bridge, or an
+#   inherited port that pins every invocation to one bridge, answers active or
+#   unrecognized for that unused name and fails the proof.
 #
 # fm_chrome_bridge_cleanup <state-dir> <task-id>
 #   Reads only that task's validated binding and never targets the default or
@@ -29,8 +43,24 @@
 #   session active, or when the launcher recorded a start and liveness cannot be
 #   determined; an inactive session makes no stop call, so a task that never
 #   started a bridge and a bridge this teardown already stopped are both silent.
-#   Missing bindings are no-ops, missing tools and stop errors warn but remain
-#   non-fatal, and callers own record retirement.
+#   No stop is ever issued until the tool proves it honors the recorded session,
+#   so an unhonored session degrades to a diagnostic instead of stopping the
+#   captain's own bridge. Missing bindings are no-ops, missing tools, unproved
+#   ownership, timeouts, and stop errors warn but remain non-fatal, and callers
+#   own record retirement.
+
+# Directory of this library, used to locate the sibling bounded runner. Resolved
+# at source time from BASH_SOURCE so it works whether sourced by a bin/ script
+# (which sets its own SCRIPT_DIR) or directly by a test.
+_FM_CHROME_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CHROME_LIB_DIR="."
+# fm_run_timed owns bounded execution for this repo, including the hung-grandchild
+# case a vendor CLI behind a wrapper script creates. It declares `set -u` for its
+# own hygiene, which must not leak onto this library's consumers.
+case $- in *u*) _fm_chrome_nounset=on ;; *) _fm_chrome_nounset=off ;; esac
+# shellcheck source=bin/fm-timeout-lib.sh
+# shellcheck disable=SC1091
+. "$_FM_CHROME_LIB_DIR/fm-timeout-lib.sh"
+[ "$_fm_chrome_nounset" = on ] || set +u
 
 fm_chrome_task_session_name() {  # <state-dir> <task-id>
   local state=$1 id=$2 state_real digest prefix
@@ -118,9 +148,17 @@ SH
   umask "$old_umask"
 }
 
+fm_chrome_axi_run() {  # <session> [args...]
+  local session=$1 bound=${FM_CHROME_BRIDGE_TIMEOUT:-20}
+  shift
+  case "$bound" in ''|*[!0-9]*|0) bound=20 ;; esac
+  env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
+    chrome-devtools-axi "$@" < /dev/null
+}
+
 fm_chrome_session_liveness() {  # <session>
   local session=$1 status
-  status=$(CHROME_DEVTOOLS_AXI_SESSION="$session" chrome-devtools-axi 2>/dev/null) || {
+  status=$(fm_chrome_axi_run "$session" 2>/dev/null) || {
     printf 'unknown\n'
     return 0
   }
@@ -130,6 +168,18 @@ fm_chrome_session_liveness() {  # <session>
     *page:*|*pages:*|*target:*|*targets:*) printf 'active\n' ;;
     *) printf 'unknown\n' ;;
   esac
+}
+
+fm_chrome_probe_session_name() {  # <session>
+  printf 'fmprobe-%s\n' "${1#fm-}"
+}
+
+fm_chrome_session_is_owned() {  # <session>
+  local session=$1 probe
+  probe=$(fm_chrome_probe_session_name "$session") || return 1
+  [ -n "$probe" ] && [ "$probe" != "$session" ] && [ "$probe" != default ] || return 1
+  [ "$(fm_chrome_session_liveness "$probe")" = inactive ] || return 1
+  return 0
 }
 
 fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
@@ -192,7 +242,11 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
       [ "$started" = 1 ] || return 0
       ;;
   esac
-  if ! CHROME_DEVTOOLS_AXI_SESSION="$session" chrome-devtools-axi stop >/dev/null 2>&1; then
+  if ! fm_chrome_session_is_owned "$session"; then
+    echo "warning: chrome-devtools-axi does not act on the task-scoped session for task $id; skipping the bridge stop for session $session so no shared bridge is disturbed" >&2
+    return 0
+  fi
+  if ! fm_chrome_axi_run "$session" stop >/dev/null 2>&1; then
     echo "warning: chrome-devtools bridge stop failed for task $id session $session; teardown will continue" >&2
     return 0
   fi
