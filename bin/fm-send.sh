@@ -665,6 +665,15 @@ if [ "${1:-}" = "--key" ]; then
   fm_send_record_interrupt "$semantic_key" || exit 1
 else
   MESSAGE=$*
+  if [ "$TARGET_BACKEND" = remote ]; then
+    FM_SEND_REMOTE_BUDGET=${FM_SEND_REMOTE_BUDGET:-30}
+    case "$FM_SEND_REMOTE_BUDGET" in
+      ''|*[!0-9]*|0)
+        echo "error: FM_SEND_REMOTE_BUDGET must be a positive integer: $FM_SEND_REMOTE_BUDGET" >&2
+        exit 1
+        ;;
+    esac
+  fi
   # The pre-marker answer text, kept for the closing resolved note so the
   # durable ledger records the plain answer without marker or corr bytes.
   RESOLVE_ANSWER_TEXT=$MESSAGE
@@ -756,16 +765,6 @@ else
     # (default 30, overridable) so a busy remote queue cannot hold this send
     # open indefinitely; a bound hit exits through the same
     # unconfirmed-delivery contract.
-    FM_SEND_REMOTE_BUDGET=${FM_SEND_REMOTE_BUDGET:-30}
-    case "$FM_SEND_REMOTE_BUDGET" in
-      ''|*[!0-9]*|0)
-        if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
-          fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true
-        fi
-        echo "error: FM_SEND_REMOTE_BUDGET must be a positive integer: $FM_SEND_REMOTE_BUDGET" >&2
-        exit 1
-        ;;
-    esac
     REMOTE_META_LOCK=$(fm_meta_lock_path "$TARGET_META") || exit 1
     if ! fm_task_inbox_lock_acquire "$REMOTE_META_LOCK"; then
       if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then

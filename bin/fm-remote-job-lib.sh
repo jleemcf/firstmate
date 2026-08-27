@@ -546,7 +546,7 @@ fm_remote_job_cancel() { # <account-home> <id>
 }
 
 fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdin is captured
-  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline seq
+  local account_home=$1 root=$2 home=$3 command=$4 stage id destination bytes queue_deadline seq owner_start
   shift 4
   fm_remote_job_prepare_state "$account_home" || return 1
   seq=$(fm_remote_job_next_seq) || {
@@ -563,13 +563,20 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
   }
   case "$command" in fm-*.sh) ;; *) FM_REMOTE_JOB_ERROR="remote job command is outside the fm-*.sh namespace"; return 1 ;; esac
   case "$command" in */*|*..*) FM_REMOTE_JOB_ERROR="remote job command contains a path or traversal"; return 1 ;; esac
+  owner_start=$(fm_remote_job_process_start "$$") || {
+    FM_REMOTE_JOB_ERROR="cannot establish remote job staging ownership"
+    return 1
+  }
   stage=$(umask 077; mktemp -d "$FM_REMOTE_JOB_JOBS/.stage.XXXXXX") || {
     FM_REMOTE_JOB_ERROR="cannot stage remote job"
     return 1
   }
   chmod 700 "$stage" || { rm -rf -- "$stage"; return 1; }
   queue_deadline=$(( $(date +%s) + FM_REMOTE_JOB_QUEUE_TIMEOUT ))
-  if ! printf '%s\n' "$root" > "$stage/root" ||
+  if ! printf '%s\n' "$$" > "$stage/.owner-pid" ||
+    ! printf '%s\n' "$owner_start" > "$stage/.owner-start" ||
+    ! chmod 600 "$stage/.owner-pid" "$stage/.owner-start" ||
+    ! printf '%s\n' "$root" > "$stage/root" ||
     ! printf '%s\n' "$home" > "$stage/home" ||
     ! printf '%s\n' "$queue_deadline" > "$stage/queue_deadline" ||
     ! printf '%s\n' "$FM_REMOTE_JOB_TIMEOUT" > "$stage/timeout" ||
@@ -591,6 +598,8 @@ fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdi
     FM_REMOTE_JOB_ERROR="remote job stdin exceeds the ${FM_REMOTE_JOB_MAX_BYTES}-byte bound"
     return 1
   }
+  touch "$stage" || { rm -rf -- "$stage"; return 1; }
+  rm -f -- "$stage/.owner-pid" "$stage/.owner-start" || { rm -rf -- "$stage"; return 1; }
   : > "$stage/stdout"
   : > "$stage/stderr"
   chmod 600 "$stage/stdout" "$stage/stderr" || { rm -rf -- "$stage"; return 1; }
@@ -691,6 +700,16 @@ fm_remote_job_path_mtime() { # <path>
   if [ "$(uname -s 2>/dev/null || true)" = Darwin ]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi
 }
 
+fm_remote_job_stage_owner_alive() { # <stage-dir>
+  local stage=$1 pid recorded_start actual_start
+  pid=$(fm_remote_job_read_single_line "$stage/.owner-pid" 64 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 1 ] || return 1
+  recorded_start=$(fm_remote_job_read_single_line "$stage/.owner-start" 256 2>/dev/null) || return 1
+  actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || return 1
+  [ "$recorded_start" = "$actual_start" ]
+}
+
 fm_remote_job_reap_stale() { # <account-home>
   local account_home=$1 job id state mtime now stage
   fm_remote_job_prepare_state "$account_home" || return 1
@@ -706,10 +725,11 @@ fm_remote_job_reap_stale() { # <account-home>
     [ $((now - mtime)) -ge "$FM_REMOTE_JOB_REAP_SECONDS" ] || continue
     fm_remote_job_reap "$account_home" "$id" || true
   done
-  # Staging litter a killed caller left behind: a live stage lasts at most the
-  # bounded stdin capture, so anything older than the stage reap age is dead.
+  # Staging litter a killed caller left behind is reaped after its owner is no
+  # longer the process that created it and the stage has exceeded the age bound.
   for stage in "$FM_REMOTE_JOB_JOBS"/.stage.*; do
     [ -d "$stage" ] && [ ! -L "$stage" ] || continue
+    fm_remote_job_stage_owner_alive "$stage" && continue
     mtime=$(fm_remote_job_path_mtime "$stage" 2>/dev/null || true)
     case "$mtime" in ''|*[!0-9]*) continue ;; esac
     [ $((now - mtime)) -ge "$FM_REMOTE_JOB_STAGE_REAP_SECONDS" ] || continue

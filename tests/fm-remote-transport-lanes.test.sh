@@ -112,6 +112,7 @@ export FM_REMOTE_JOB_STATE_ROOT="$STATE_ROOT"
 export FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux
 export FM_REMOTE_JOB_QUEUE_TIMEOUT=60
 export FM_REMOTE_JOB_TIMEOUT=30
+export FM_REMOTE_JOB_STAGE_REAP_SECONDS=1
 # shellcheck source=bin/fm-remote-job-lib.sh
 . "$ROOT/bin/fm-remote-job-lib.sh"
 
@@ -313,6 +314,19 @@ fm_run_timed 20 env FM_HOME="$LOCAL_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
 assert_grep 'missing' "$TMP_ROOT/state-out" \
   "the control-state call did not complete through the worker: $(cat "$TMP_ROOT/state-err")"
 pass "an open caller stdin no longer wedges a non-payload remote command"
+
+# A live explicit stdin stage can exceed the litter age while waiting for EOF;
+# the stale sweep must retain it until its owning entrypoint publishes the job.
+rc=0
+{
+  printf 'slow payload one\n'
+  sleep 3
+  printf 'slow payload two\n'
+} | fm_on --stdin ios fm-stdin-probe.sh > "$TMP_ROOT/slow-payload-out" 2> "$TMP_ROOT/slow-payload-err" || rc=$?
+expect_code 0 "$rc" "a live slow stdin stage must survive stale reaping: $(cat "$TMP_ROOT/slow-payload-err")"
+assert_grep 'stdin=slow payload one' "$TMP_ROOT/slow-payload-out" "the slow stdin stage lost its first bytes"
+assert_grep 'stdin=slow payload two' "$TMP_ROOT/slow-payload-out" "the slow stdin stage was reaped before EOF"
+pass "a live explicit-stdin stage survives the staging-litter age bound"
 
 # T6: a payload caller with --stdin still delivers its bytes.
 printf 'payload byte one\npayload byte two\n' > "$TMP_ROOT/payload"

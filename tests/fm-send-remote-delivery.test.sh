@@ -610,7 +610,7 @@ test_remote_transport_loss_preserves_expectation() {
 }
 
 test_remote_send_budget_bounds_busy_lane() {
-  local dir fb ssh_log home rhome rc err began elapsed count pend delivery
+  local dir fb ssh_log home rhome rc err began elapsed count pend delivery corr ssh_before
   dir="$TMP_ROOT/remote-budget"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); ssh_log="$dir/ssh.log"; : > "$ssh_log"
   rhome=$(setup_remote_secondmate_home remote-budget)
@@ -657,6 +657,23 @@ test_remote_send_budget_bounds_busy_lane() {
   [ -n "$pend" ] || fail "a budget-bounded reply-bearing send must preserve its expectation"
   [ "$(grep '^phase=' "$pend" | tail -1 | cut -d= -f2-)" = delivery_unknown ] \
     || fail "the preserved expectation must record unknown delivery: $(cat "$pend")"
+
+  # Invalid transport configuration fails before a correlation-reusing resend
+  # mutates the preserved expectation or reaches the transport.
+  corr=$(fm_pending_reply_get "$pend" corr_id)
+  cp "$pend" "$dir/pending-before-invalid-budget"
+  ssh_before=$(cat "$ssh_log.count")
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" FM_SEND_REMOTE_BUDGET=invalid \
+    FM_PENDING_REPLY_EXISTING_CORR="$corr" \
+    "$SEND" rsm "please rename the metric" >"$dir/invalid.out" 2>"$dir/invalid.err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "an invalid remote budget must fail the resend"
+  assert_contains "$(cat "$dir/invalid.err")" "must be a positive integer" \
+    "an invalid remote budget must explain its validation failure"
+  [ "$(cat "$ssh_log.count")" = "$ssh_before" ] \
+    || fail "an invalid remote budget reached the remote transport"
+  cmp -s "$dir/pending-before-invalid-budget" "$pend" \
+    || fail "an invalid remote budget mutated the reusable pending expectation: $(cat "$pend")"
   pass "fm-send remote: the remote leg is budget-bounded and stays idempotent across the bound"
 }
 
