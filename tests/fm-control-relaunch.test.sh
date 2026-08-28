@@ -1342,6 +1342,10 @@ test_relaunch_refuses_a_recycled_worktree_claimed_by_another_task() {
     "direct replacement ownership refusal should name the conflicting live task"
   assert_no_grep "encode launch-brief" "$dir/fake/literal" \
     "direct replacement ownership refusal must not launch into the recycled worktree"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed recycled-slot relaunch refusal: %s\n' \
+      "$(printf '%s\n' "$out" | grep -m1 REFUSED)"
+  fi
   pass "relaunch paths refuse before a dead task can act on a recycled live task worktree"
 }
 
@@ -1384,6 +1388,9 @@ test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view() {
     "relaunch marker generation does not match the published task generation"
   [ -z "$(git -C "$dir/wt" status --porcelain)" ] \
     || fail "the owner marker reads as uncommitted work: $(git -C "$dir/wt" status --porcelain)"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed relaunch owner marker: %s\n' "$(tr '\n' ' ' < "$dir/wt/.fm-task-owner")"
+  fi
   pass "fm-control relaunch: the worktree carries this task's owner marker, excluded from git"
 }
 
@@ -1409,6 +1416,10 @@ test_relaunch_refuses_a_worktree_marked_for_another_task() {
     "a foreign owner marker must not launch a replacement into that worktree"
   assert_grep 'task_id=live-task-b' "$dir/wt/.fm-task-owner" \
     "the refused relaunch overwrote the other task's ownership marker"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed foreign-marker relaunch refusal: %s\n' \
+      "$(printf '%s\n' "$out" | grep -m1 "marked as task")"
+  fi
   pass "fm-control relaunch: a worktree marked for another task is refused before any launch"
 }
 

@@ -314,11 +314,12 @@ fm_worktree_retirement_receipt_clear() {  # <meta-file>
 }
 
 # The durable half of the owner-marker binding. bin/fm-spawn.sh publishes it
-# beside the state directory BEFORE it stamps .fm-task-owner into the slot and
-# before the base freshen and harness launch that follow, so a spawn killed
-# anywhere in that window leaves a marker something can still attribute to a
-# task, a spawn generation, and a path - not an orphan that refuses the slot to
-# every later spawn with no record to name as its remedy.
+# into the state directory, alongside the task records, BEFORE it stamps
+# .fm-task-owner into the slot and before the base freshen and harness launch
+# that follow, so a spawn killed anywhere in that window leaves a marker
+# something can still attribute to a task, a spawn generation, and a path - not
+# an orphan that refuses the slot to every later spawn with no record to name
+# as its remedy.
 # The file name carries the spawn generation, because recovery is told to keep
 # the same task identity: a later incarnation of the same id publishes its own
 # record beside an interrupted one rather than overwriting the only evidence of
@@ -411,7 +412,7 @@ fm_worktree_owner_pending_clear() {  # <state-dir> <task-id> <spawn-gen> [expect
   rm -f -- "$pending"
 }
 
-# Every ownership record this task id still has beside the state directory, one
+# Every ownership record this task id still has in the state directory, one
 # path per line. Discovery only: it exists so a fresh spawn can refuse to take a
 # second slot while an earlier incarnation's claim is unresolved, and nothing
 # here selects a generation to act on - a destructive step names its own.

@@ -887,13 +887,9 @@ spawn_abort_cleanup() {
 }
 trap spawn_abort_cleanup EXIT
 
-# An ownership record that outlived the spawn that published it means some pool
-# slot may still carry this task id's owner marker with no task record to
-# attribute it. Recovery is told to keep the same task identity, so the very
-# next thing that happens is a fresh spawn of this id - and handing it a second
-# slot would strand the first one behind a marker nothing can name. Refuse
-# instead, naming every unresolved generation and the path it took, so the
-# operator resolves those before this id takes another worktree.
+# Whether an ownership record left behind by an interrupted spawn is still
+# holding a pool slot; refuse_unresolved_task_owner_pending_claims below owns
+# why that matters.
 # 0 when the worktree an ownership record names still carries this exact task
 # and generation's marker, so a slot really is stranded behind it; 1 when the
 # path provably strands nothing (it is gone, carries no marker, or carries one
