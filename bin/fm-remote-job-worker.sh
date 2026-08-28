@@ -436,8 +436,7 @@ worker_clear_dead_claim() { # <job-dir>
   worker_claim_owner_alive "$job" && return 1
   [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   [ ! -e "$claim/owner" ] || [ ! -L "$claim/owner" ] || return 1
-  rm -f -- "$claim/owner" "$claim/owner_start" "$claim/supervisor" \
-    "$claim/supervisor_start" "$claim/group" "$claim/armed" || return 1
+  fm_remote_job_remove_claim_records "$claim" || return 1
   rmdir "$claim"
 }
 
@@ -792,7 +791,8 @@ worker_reap_finished_lanes() {
 # arrived before running, establish the deadline, run to publication, and reap
 # the record when its caller cancelled and can no longer reap it.
 worker_lane_execute() { # <account-home> <job-dir>
-  local account_home=$1 job=$2 timeout deadline supervisor_pid supervisor_start pid_tmp start_tmp
+  local account_home=$1 job=$2 timeout queue_deadline deadline
+  local supervisor_pid supervisor_start pid_tmp start_tmp
   worker_claim "$job" || return 0
   supervisor_pid=${BASHPID:-$$}
   supervisor_start=$(fm_remote_job_process_start "$supervisor_pid") || {
@@ -819,6 +819,12 @@ worker_lane_execute() { # <account-home> <job-dir>
   fi
   if fm_remote_job_cancelled "$job"; then
     worker_finalize_cancelled "$account_home" "$job" || true
+    return 0
+  fi
+  queue_deadline=$(fm_remote_job_read_number "$job" queue_deadline 2>/dev/null || true)
+  case "$queue_deadline" in ''|*[!0-9]*) worker_publish_result "$job" 126 || true; return 0 ;; esac
+  if [ "$(date +%s)" -ge "$queue_deadline" ]; then
+    worker_publish_result "$job" 124 || true
     return 0
   fi
   timeout=$(fm_remote_job_read_number "$job" timeout 2>/dev/null || true)

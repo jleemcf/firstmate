@@ -457,6 +457,19 @@ fm_remote_job_regular_bounded() { # <file> <max-bytes>
   [ "$bytes" -le "$max" ]
 }
 
+fm_remote_job_remove_claim_records() { # <claim-dir>
+  local claim=$1 file
+  [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
+  for file in "$claim"/owner "$claim"/owner_start "$claim"/supervisor \
+    "$claim"/supervisor_start "$claim"/group "$claim"/armed \
+    "$claim"/.owner.* "$claim"/.owner_start.* "$claim"/.supervisor.* \
+    "$claim"/.supervisor_start.* "$claim"/.group.* "$claim"/.armed.*; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    fm_remote_job_regular_bounded "$file" 256 || return 1
+    rm -f -- "$file" || return 1
+  done
+}
+
 fm_remote_job_write_state() { # <job-dir> queued|running|done
   local job=$1 value=$2 tmp
   case "$value" in queued|running|done) ;; *) return 1 ;; esac
@@ -581,7 +594,11 @@ fm_remote_job_cancel() { # <account-home> <id>
   tmp=$(umask 077; mktemp "$job/.cancel.XXXXXX") || return 1
   printf 'cancelled: caller disconnected or abandoned the job\n' > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$job/cancel"
+  mv -f -- "$tmp" "$job/cancel" || return 1
+  state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
+  if [ "$state" = done ]; then
+    fm_remote_job_reap "$account_home" "$id" 2>/dev/null || true
+  fi
 }
 
 fm_remote_job_stage() { # <account-home> <root> <home> <command> [args...]; stdin is captured
@@ -723,9 +740,7 @@ fm_remote_job_reap() { # <account-home> <id>; only removes an exact completed re
   done
   if [ -e "$job/.claim" ] || [ -L "$job/.claim" ]; then
     [ -d "$job/.claim" ] && [ ! -L "$job/.claim" ] || return 1
-    rm -f -- "$job/.claim/owner" "$job/.claim/owner_start" \
-      "$job/.claim/supervisor" "$job/.claim/supervisor_start" \
-      "$job/.claim/group" "$job/.claim/armed" || return 1
+    fm_remote_job_remove_claim_records "$job/.claim" || return 1
     rmdir "$job/.claim" || return 1
   fi
   rmdir "$job"
