@@ -3048,6 +3048,63 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
   pass "an unresponsive browser bridge is bounded instead of stalling teardown"
 }
 
+# A browser tool that never returns is a fact about the host, not about any one
+# session name. Teardown runs cleanup twice for every task (once before the
+# landed-work checks, once after the worker endpoint is gone) and once per child
+# of a forced secondmate home, and no later call can learn anything the first one
+# was already refused. So the bound is paid once per teardown process, and the
+# notice for a task whose launcher recorded no start is not repeated once the
+# tool is already known to be silent.
+test_a_hung_bridge_tool_is_waited_on_once_per_teardown() {
+  local case_dir rc started elapsed call_log calls notices
+  case_dir=$(make_case chrome-hung-once)
+  install_hanging_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  call_log="$case_dir/chrome-call.log"
+
+  started=$(date +%s)
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_CHROME_BRIDGE_TIMEOUT=3
+    FM_FAKE_CHROME_CALL_LOG="$call_log"
+    export FM_FAKE_CHROME_CALL_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  expect_code 0 "$rc" "a repeated cleanup against a hung browser tool must not fail teardown"
+  assert_present "$call_log" "cleanup never reached the browser tool"
+  calls=$(wc -l < "$call_log" | tr -d ' ')
+  [ "$calls" = 1 ] \
+    || fail "one teardown invoked a hung browser tool $calls times instead of learning once that it never answers"
+  [ "$elapsed" -lt 6 ] \
+    || fail "one teardown paid ${elapsed}s of browser-tool bounds instead of a single bound"
+  notices=$(grep -c 'no readable status' "$case_dir/stderr" || true)
+  [ "$notices" = 1 ] \
+    || fail "an unused task's unreadable-status notice was printed $notices times for an already-silent tool"
+  pass "a hung browser tool costs one bound and one notice per teardown, not one per cleanup pass"
+}
+
+# The knob exists to bound teardown-time work, so it must not become a way to
+# un-bound it: docs/configuration.md states the 1..120 range this enforces.
+test_bridge_call_bound_is_clamped_to_its_documented_range() {
+  local pair input expected actual
+  for pair in '|20' 'abc|20' '2s|20' '-5|20' '0|20' '00|20' '1|1' '5|5' '007|7' \
+    '120|120' '121|120' '99999|120' '99999999999999999999999|120'; do
+    input=${pair%%|*}
+    expected=${pair##*|}
+    actual=$(FM_CHROME_BRIDGE_TIMEOUT="$input" fm_chrome_bridge_bound)
+    [ "$actual" = "$expected" ] \
+      || fail "FM_CHROME_BRIDGE_TIMEOUT=${input:-<empty>} resolved to a ${actual}s browser-call bound, not ${expected}s"
+  done
+  actual=$(unset FM_CHROME_BRIDGE_TIMEOUT; fm_chrome_bridge_bound)
+  [ "$actual" = 20 ] \
+    || fail "an unset FM_CHROME_BRIDGE_TIMEOUT resolved to a ${actual}s browser-call bound, not the 20s default"
+  pass "the browser-call bound honors FM_CHROME_BRIDGE_TIMEOUT only inside its documented 1..120 range"
+}
+
 # Failing the ownership proof because the tool answers about a name nothing ever
 # started, and failing it because the tool answered nothing at all, are different
 # facts. Only the first is a standing property of the host, so only the first may
@@ -3265,6 +3322,9 @@ test_marker_reset_keeps_the_binding_record_private() {
 # - reporting nothing when a task that started a bridge needs no stop makes the
 #   idle-shared-bridge test red;
 # - running the browser tool unbounded makes the hung-tool test red;
+# - re-invoking a browser tool this process already waited out, or repeating the
+#   unstarted-task notice for it, makes the hung-tool-once test red;
+# - accepting FM_CHROME_BRIDGE_TIMEOUT outside 1..120 makes the clamp test red;
 # - letting a recorded start warrant a stop for an unreadable status, or reading
 #   an unreadable status as evidence of a live bridge, makes the unreadable-status
 #   test red;
@@ -3287,6 +3347,8 @@ test_unlanded_refusal_still_stops_chrome_bridge
 test_session_blind_tool_never_stops_a_shared_bridge
 test_ambient_bridge_port_cannot_retarget_cleanup
 test_hung_bridge_tool_cannot_stall_cleanup
+test_a_hung_bridge_tool_is_waited_on_once_per_teardown
+test_bridge_call_bound_is_clamped_to_its_documented_range
 
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible

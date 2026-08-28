@@ -41,23 +41,35 @@
 #   worker's commands. A directory that fails the check is refused, and the
 #   caller drops the PATH prepend instead of launching through it.
 #
+# fm_chrome_bridge_bound
+#   Prints the seconds one browser call may take: FM_CHROME_BRIDGE_TIMEOUT clamped
+#   to 1..120, with anything unset, non-numeric, or out of range falling back to
+#   the 20-second default. A knob that bounds teardown-time work cannot itself be
+#   a way to un-bound teardown.
+#
 # fm_chrome_axi_run <session> [args...]
 #   The single door to the browser tool. Every call names the session, drops an
 #   ambient CHROME_DEVTOOLS_AXI_PORT (which the tool documents as overriding the
 #   port it otherwise derives from the session name, so an inherited one would
 #   silently retarget another bridge), and runs under a hard bound because the
-#   tool can be a wrapper chain onto a browser that stopped answering.
+#   tool can be a wrapper chain onto a browser that stopped answering. Once a call
+#   in this process has hit that bound the tool is not answering at all, so later
+#   calls report the bound status without invoking it again: teardown asks about
+#   every task and runs cleanup twice per task, and none of those calls can learn
+#   anything a hung tool did not already refuse to say.
 #
 # fm_chrome_session_liveness <session>
-#   Prints inactive, present, or unreadable for that exact named session by asking
-#   the tool for its status. The tool's only statement this repo has evidence for
-#   is the negative one - it reports "no active session" for a name with no bridge
-#   behind it - so inactive is the single confident answer, and no wording for a
-#   live bridge is guessed at. The other two separate "the tool said something
-#   about this name that was not the gone answer" (present) from "the tool said
-#   nothing usable at all" - empty output, or the bound was hit (unreadable).
-#   That distinction is the difference between evidence a bridge exists under this
-#   exact name and no evidence either way, and no evidence ever warrants a stop.
+#   Prints inactive, present, unreadable, or unresponsive for that exact named
+#   session by asking the tool for its status. The tool's only statement this repo
+#   has evidence for is the negative one - it reports "no active session" for a
+#   name with no bridge behind it - so inactive is the single confident answer,
+#   and no wording for a live bridge is guessed at. The rest separate "the tool
+#   said something about this name that was not the gone answer" (present) from
+#   "the tool said nothing usable at all" - empty output (unreadable) or the bound
+#   was hit (unresponsive). The last two are the same absence of evidence about
+#   this name and neither ever warrants a stop; they are named apart only because
+#   a tool that never returns is a fact about the host that need not be
+#   rediscovered per task.
 #
 # fm_chrome_ownership_evidence <session>
 #   Proof, not assumption, that the resolved tool acts on the session it is
@@ -114,6 +126,11 @@
 # at source time from BASH_SOURCE so it works whether sourced by a bin/ script
 # (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CHROME_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CHROME_LIB_DIR="."
+# A browser tool that never returns is a property of this host, not of any one
+# session name, so one process pays that bound once. Set only by cleanup, which
+# runs in the caller's own shell; the bounded runner reads it from its command
+# substitutions, where a write would be lost with the subshell.
+_FM_CHROME_TOOL_UNRESPONSIVE=0
 # fm_run_timed owns bounded execution for this repo, including the hung-grandchild
 # case a vendor CLI behind a wrapper script creates. It declares `set -u` for its
 # own hygiene, which must not leak onto this library's consumers.
@@ -248,10 +265,31 @@ SH
   umask "$old_umask"
 }
 
+fm_chrome_bridge_bound() {
+  local bound=${FM_CHROME_BRIDGE_TIMEOUT:-20}
+  case "$bound" in
+    ''|*[!0-9]*) printf '20\n'; return 0 ;;
+  esac
+  while [ "${#bound}" -gt 1 ] && [ "${bound#0}" != "$bound" ]; do
+    bound=${bound#0}
+  done
+  # Four digits or more is already past the ceiling, and comparing it as a number
+  # first would hand the shell an overflowing literal.
+  if [ "${#bound}" -gt 3 ]; then
+    bound=120
+  elif [ "$bound" -lt 1 ]; then
+    bound=20
+  elif [ "$bound" -gt 120 ]; then
+    bound=120
+  fi
+  printf '%s\n' "$bound"
+}
+
 fm_chrome_axi_run() {  # <session> [args...]
-  local session=$1 bound=${FM_CHROME_BRIDGE_TIMEOUT:-20}
+  local session=$1 bound
   shift
-  case "$bound" in ''|*[!0-9]*|0) bound=20 ;; esac
+  [ "${_FM_CHROME_TOOL_UNRESPONSIVE:-0}" != 1 ] || return 124
+  bound=$(fm_chrome_bridge_bound)
   fm_run_timed "$bound" \
     env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
     chrome-devtools-axi ${1+"$@"} < /dev/null
@@ -267,9 +305,13 @@ fm_chrome_session_liveness() {  # <session>
     *'no active session'*) printf 'inactive\n'; return 0 ;;
   esac
   # 124 is fm_run_timed's bound-was-hit status, so a truncated answer counts as
-  # no answer. Anything else the tool actually said about this name is a readable
-  # answer that is not the gone answer.
-  if [ "$status" = 124 ] || [ -z "$answer" ]; then
+  # no answer. It is reported apart from an empty answer because a tool that never
+  # returns is a property of the host, not of this name: the caller can stop
+  # paying the bound for every later name. Anything else the tool actually said
+  # about this name is a readable answer that is not the gone answer.
+  if [ "$status" = 124 ]; then
+    printf 'unresponsive\n'
+  elif [ -z "$answer" ]; then
     printf 'unreadable\n'
   else
     printf 'present\n'
@@ -305,7 +347,7 @@ fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
 }
 
 fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
-  local state=$1 id=$2 record session started expected liveness proof
+  local state=$1 id=$2 record session started expected liveness proof tool_known_silent
   record="$state/$id.chrome-devtools-session"
   [ -e "$record" ] || [ -L "$record" ] || return 0
   if [ ! -f "$record" ] || [ -L "$record" ]; then
@@ -341,7 +383,9 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
   # still stopped, so an already-stopped session raises no false failure, and so
   # every stop rests on what the tool said about this name rather than on a
   # record of what happened earlier.
+  tool_known_silent=${_FM_CHROME_TOOL_UNRESPONSIVE:-0}
   liveness=$(fm_chrome_session_liveness "$session")
+  [ "$liveness" != unresponsive ] || _FM_CHROME_TOOL_UNRESPONSIVE=1
   if [ "$liveness" = inactive ]; then
     # A tool that pins every call to one shared bridge says exactly this, for any
     # name it is handed, whenever that shared bridge happens to be idle - the
@@ -356,19 +400,24 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
       || echo "warning: chrome-devtools bridge for task $id is already gone, but its binding could not be reset" >&2
     return 0
   fi
-  if [ "$liveness" = unreadable ]; then
-    if [ "$started" = 1 ]; then
-      echo "warning: chrome-devtools-axi returned no readable status for task $id session $session, so no stop was issued; that task's launcher did record a bridge start, so a bridge may still be running under that session and needs reclaiming by hand" >&2
-    else
-      echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
-    fi
-    return 0
-  fi
+  case "$liveness" in
+    unreadable|unresponsive)
+      if [ "$started" = 1 ]; then
+        echo "warning: chrome-devtools-axi returned no readable status for task $id session $session, so no stop was issued; that task's launcher did record a bridge start, so a bridge may still be running under that session and needs reclaiming by hand" >&2
+      elif [ "$liveness" != unresponsive ] || [ "$tool_known_silent" != 1 ]; then
+        echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
+      fi
+      return 0
+      ;;
+  esac
   proof=$(fm_chrome_ownership_evidence "$session")
-  if [ "$proof" = unreadable ]; then
-    echo "warning: chrome-devtools-axi returned no readable status for the ownership probe on task $id, so nothing was established about whether it scopes bridges by session; skipping the bridge stop for session $session" >&2
-    return 0
-  fi
+  [ "$proof" != unresponsive ] || _FM_CHROME_TOOL_UNRESPONSIVE=1
+  case "$proof" in
+    unreadable|unresponsive)
+      echo "warning: chrome-devtools-axi returned no readable status for the ownership probe on task $id, so nothing was established about whether it scopes bridges by session; skipping the bridge stop for session $session" >&2
+      return 0
+      ;;
+  esac
   if [ "$proof" != inactive ]; then
     echo "warning: chrome-devtools-axi does not act on the task-scoped session for task $id; skipping the bridge stop for session $session so no shared bridge is disturbed. Task-scoped bridge reclamation is inert on this host until chrome-devtools-axi passes CHROME_DEVTOOLS_AXI_SESSION through" >&2
     return 0
