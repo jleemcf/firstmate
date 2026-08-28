@@ -1373,6 +1373,77 @@ EOF
   pass "a teardown step failing after the pool return leaves a record a rerun can finish"
 }
 
+# A release the provider completed but the state filesystem could not record
+# leaves a copy of the record behind. That copy names a path the pool already
+# owns again, so it must never be discoverable as a restorable claim, and it
+# must still carry the rerun that finishes the record's remaining cleanup.
+test_unrecorded_release_leaves_evidence_a_rerun_can_finish() {
+  local case_dir rc real_mv
+  local -a claim_backups evidence
+  case_dir=$(make_case unrecorded-release)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  # Fail exactly the receipt's atomic install, the way a state filesystem that
+  # ran out of space would once the pool return has already succeeded. Every
+  # other rename - including the quarantine of the released record - is real.
+  real_mv=$(command -v mv)
+  cat > "$case_dir/fakebin/mv" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    *.worktree-retired)
+      echo "mv: cannot move to '\$arg': No space left on device" >&2
+      exit 1
+      ;;
+  esac
+done
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/mv"
+  # A malformed presentation manifest then stops the run before the record is
+  # removed, so the unrecorded retirement has to survive to a rerun.
+  printf 'task-x1\tfirstmate:fm-task-x1\tnot-a-number\n' \
+    > "$case_dir/state/.status-presentation-cursor"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "unrecorded-release: the fixture must stop teardown after the pool return"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "unrecorded-release: the fixture never reached the pool return it is about"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  if [ -e "${claim_backups[0]}" ]; then
+    fail "unrecorded-release: a released path stayed discoverable as a restorable claim"
+  fi
+  evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  if [ ! -e "${evidence[0]}" ]; then
+    fail "unrecorded-release: the released record was not kept as evidence of the release"
+  fi
+  assert_grep "worktree=$case_dir/wt" "${evidence[0]}" \
+    "unrecorded-release: the evidence does not name the path the provider released"
+  assert_grep "${evidence[0]}" "$case_dir/stderr" \
+    "unrecorded-release: the refusal never named where the released record was quarantined"
+
+  rm -f "$case_dir/state/.status-presentation-cursor"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "unrecorded-release: the rerun should finish the teardown"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "unrecorded-release: the rerun left the task record behind"
+  assert_absent "${evidence[0]}" \
+    "unrecorded-release: the released-record evidence outlived the record it describes"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "unrecorded-release: the rerun returned the pool slot a second time"
+  pass "an unrecorded release keeps non-restorable evidence a rerun can finish on"
+}
+
 # A copy of the claim that outlived its own removal describes a path the
 # provider has already taken back. The receipt is what says the retirement
 # completed, so it decides - the copy must not be read as an interruption and
@@ -3330,6 +3401,7 @@ test_same_task_id_with_a_different_marker_generation_refuses
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_late_teardown_failure_leaves_a_rerunnable_record
+test_unrecorded_release_leaves_evidence_a_rerun_can_finish
 test_receipt_outranks_a_leftover_claim_copy
 test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project

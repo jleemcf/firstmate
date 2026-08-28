@@ -383,14 +383,21 @@ fm_backend_endpoint_atom_valid() {  # <value>
   esac
 }
 
-# An interrupted worktree-claim retirement (bin/fm-worktree-ownership-lib.sh)
-# is the one way a live record loses its worktree identity, and its backup is
-# the only remaining copy, so name it wherever that loss surfaces. The provider
-# outcome is unknown at that point, so the copy is named as evidence and never
-# advertised as a claim to put back unexamined: a path the provider did release
-# can already belong to another task.
+# A worktree-claim retirement (bin/fm-worktree-ownership-lib.sh) is the one way
+# a live record loses its worktree identity, and its surviving copy is the only
+# remaining record of the path, so name it wherever that loss surfaces. Which
+# copy it is decides the story: a quarantined released-evidence copy means the
+# provider already took the path back, while a claim backup leaves the provider
+# outcome unknown. Neither is ever advertised as a claim to put back
+# unexamined - a released path can already belong to another task.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
-  local meta=$1 backup
+  local meta=$1 backup evidence
+  if declare -F fm_worktree_released_evidence_hint >/dev/null 2>&1 \
+    && evidence=$(fm_worktree_released_evidence_hint "$meta" 2>/dev/null) \
+    && [ -n "$evidence" ]; then
+    echo "The provider already released this record's worktree and that path may already belong to another task; only recording the retirement failed, so a copy of the released record was quarantined at $evidence. It is evidence of the release, never authority over that path, and must never be restored over the record." >&2
+    return 0
+  fi
   declare -F fm_worktree_claim_backup_hint >/dev/null 2>&1 || return 0
   backup=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || return 0
   [ -n "$backup" ] || return 0

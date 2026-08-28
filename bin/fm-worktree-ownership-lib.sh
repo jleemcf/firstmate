@@ -50,6 +50,11 @@
 # this record's provider step already ran so a rerun can skip it and finish the
 # remaining cleanup, and it never satisfies an ownership proof or supplies a
 # path any destructive helper can act on.
+# When the provider released the path but the receipt could not be written, the
+# copy of the record is renamed out of the restorable claim-backup namespace
+# into a released-evidence file. It is bound to the record the same way the
+# receipt is, so a rerun still finishes the remaining cleanup, and no consumer
+# can read it as a claim to put back over a path the provider owns again.
 # fm_worktree_claim_retire_restore is therefore reachable only while the
 # provider operation is known to have failed, and puts back both halves.
 # fm_worktree_claim_retire_abandon closes an interrupted retirement whose
@@ -144,6 +149,56 @@ fm_worktree_claim_backup_hint() {  # <meta-file>
   return 1
 }
 
+# Names the quarantined copy of a record whose provider release SUCCEEDED but
+# whose retirement receipt could not be written. It is deliberately outside
+# fm_worktree_claim_backup_hint's namespace: the path it records belongs to the
+# provider again, so it is evidence of a completed release and never a claim any
+# consumer may offer to restore.
+fm_worktree_released_evidence_hint() {  # <meta-file>
+  local meta=$1 dir base candidate
+  dir=${meta%/*}
+  base=${meta##*/}
+  for candidate in "$dir/.${base}.worktree-released."*; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Moves the retirement's copy of the record out of the restorable namespace the
+# moment the provider reports the path released. A rename inside the same
+# directory reuses the copy's existing unique suffix under a shorter name, so it
+# still completes when writing the receipt itself failed for want of space.
+fm_worktree_released_evidence_quarantine() {  # <meta-file> <claim-backup>
+  local meta=$1 backup=$2 dir base evidence
+  [ -n "$meta" ] && [ -n "$backup" ] || return 1
+  [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+  dir=${meta%/*}
+  base=${meta##*/}
+  evidence="$dir/.${base}.worktree-released.${backup##*.}"
+  mv -f -- "$backup" "$evidence" || return 1
+  printf '%s' "$evidence"
+}
+
+# 0 and prints the path the provider released, 1 otherwise. Bound to this exact
+# record incarnation the same way the receipt is: to the record's identity
+# through the metadata filename it is derived from, to its spawn generation, and
+# believed only while the record still claims no path of its own. The copy is
+# taken before the claim is stripped, so one it cannot produce is not evidence
+# of any release.
+fm_worktree_released_evidence_present() {  # <meta-file>
+  local meta=$1 evidence released claim_rc=0
+  evidence=$(fm_worktree_released_evidence_hint "$meta") || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$evidence" spawn_gen 2>/dev/null || true)" \
+    = "$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)" ] || return 1
+  fm_worktree_meta_claim "$meta" worktree >/dev/null || claim_rc=$?
+  [ "$claim_rc" -eq 2 ] || return 1
+  released=$(fm_worktree_meta_exact_value "$evidence" worktree 2>/dev/null) || return 1
+  printf '%s' "$released"
+}
+
 # The durable evidence that a provider already released this record's worktree.
 # It carries no path authority: nothing resolves a target through it, and a
 # record that has one still proves ownership of no path at all.
@@ -164,7 +219,7 @@ fm_worktree_record_identity() {  # <meta-file>
 # id and spawn generation, and it is only believed while the record still claims
 # no path. A leaked receipt therefore says nothing about a later task that
 # reuses the id, and never about a record holding a live claim.
-fm_worktree_retirement_receipt_present() {  # <meta-file>
+fm_worktree_retirement_receipt_file_present() {  # <meta-file>
   local meta=$1 receipt released claim_rc=0
   receipt=$(fm_worktree_retirement_receipt_path "$meta")
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
@@ -178,6 +233,16 @@ fm_worktree_retirement_receipt_present() {  # <meta-file>
   [ "$claim_rc" -eq 2 ] || return 1
   released=$(fm_worktree_meta_exact_value "$receipt" released_worktree 2>/dev/null || true)
   printf '%s' "$released"
+}
+
+# This record's retirement, however it ended up recorded. A release whose
+# receipt could not be written leaves the same proof in its quarantined
+# released-evidence copy, bound to the record the same way, so the one I/O
+# failure that made the receipt impossible to write cannot wedge the cleanup a
+# receipt would have let a rerun finish.
+fm_worktree_retirement_receipt_present() {  # <meta-file>
+  fm_worktree_retirement_receipt_file_present "$1" && return 0
+  fm_worktree_released_evidence_present "$1"
 }
 
 fm_worktree_retirement_receipt_write() {  # <meta-file> <released-worktree>
@@ -202,7 +267,7 @@ fm_worktree_retirement_receipt_clear() {  # <meta-file>
   rm -f -- "$receipt" || rc=1
   dir=${meta%/*}
   base=${meta##*/}
-  for candidate in "$dir/.${base}.worktree-claim-backup."*; do
+  for candidate in "$dir/.${base}.worktree-claim-backup."* "$dir/.${base}.worktree-released."*; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
     rm -f -- "$candidate" || rc=1
   done
@@ -359,7 +424,7 @@ fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spa
 fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   local state=$1 id=$2 meta=$3 worktree canonical kind backend project spawn_gen
   local marker worktree_id resolved resolved_canonical provider_proof='' rc=0 claim_rc=0 present=0
-  local backup marker_rc=0
+  local backup evidence marker_rc=0
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
   FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
@@ -391,12 +456,15 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     # path, and fm_worktree_claim_retire_begin still refuses every path-keyed
     # helper whose target the record does not claim.
     backup=$(fm_worktree_claim_backup_hint "$meta" || true)
+    evidence=$(fm_worktree_released_evidence_hint "$meta" || true)
     if fm_worktree_retirement_receipt_present "$meta" >/dev/null 2>&1; then
       # The receipt settles what the copy can only guess at: this record's
       # provider step completed, so the claim was retired rather than
       # interrupted and that copy describes a path this task no longer owns.
       [ -z "$backup" ] \
         || echo "warning: task $id's retirement is recorded, but a superseded copy of its claim remains at $backup; it names a released path and must never be restored over the record." >&2
+      [ -z "$evidence" ] \
+        || echo "warning: the provider already released the worktree task $id recorded, but that retirement could not be recorded; the quarantined copy at $evidence is evidence of the release only and must never be restored over the record." >&2
       FM_WORKTREE_OWNERSHIP_PROOF=no-worktree-claim
       return 0
     fi
@@ -513,12 +581,15 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   fi
   if [ "$claim_rc" -eq 2 ]; then
     if [ -n "$expected" ]; then
-      hint=$(fm_worktree_claim_backup_hint "$meta" || true)
+      # A retirement this record actually recorded outranks any copy left beside
+      # it: the provider owns that path again, so naming the copy as recoverable
+      # would advise the one action this library forbids.
       released=$(fm_worktree_retirement_receipt_present "$meta") && receipt_rc=0 || receipt_rc=$?
-      if [ -n "$hint" ]; then
+      hint=$(fm_worktree_claim_backup_hint "$meta" || true)
+      if [ "$receipt_rc" -eq 0 ]; then
+        fm_worktree_refuse "cannot clear worktree claim in $meta because the provider already released ${released:-its worktree} and this record must never be pointed back at that path; expected $expected."
+      elif [ -n "$hint" ]; then
         fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected; an interrupted claim retirement left its recoverable copy at $hint."
-      elif [ "$receipt_rc" -eq 0 ]; then
-        fm_worktree_refuse "cannot clear worktree claim in $meta because the provider already released ${released:-its worktree}; expected $expected."
       else
         fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected."
       fi
@@ -603,7 +674,7 @@ fm_worktree_claim_retire_release() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
   local released=$FM_WORKTREE_CLAIM_RETIRE_PATH
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
-  local recorded=0
+  local recorded=0 evidence=
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
@@ -620,8 +691,14 @@ fm_worktree_claim_retire_release() {
   if [ "$recorded" -ne 1 ]; then
     # Nothing restores this copy - the path is the provider's again - but with
     # the retirement unrecorded it is the only evidence of what was released, so
-    # it stays until the record it describes is gone.
-    fm_worktree_refuse "the provider released $released, but the retirement beside $meta could not be recorded; ${backup:-no copy of the record} is the only surviving evidence of it and must never be restored over the record."
+    # it is renamed out of the restorable claim-backup namespace and kept until
+    # the record it describes is gone.
+    evidence=$(fm_worktree_released_evidence_quarantine "$meta" "$backup") || evidence=
+    if [ -n "$evidence" ]; then
+      fm_worktree_refuse "the provider released $released and that path may already belong to another task, but the retirement beside $meta could not be recorded; the released record was quarantined at $evidence as evidence of the release only and must never be restored over the record."
+    else
+      fm_worktree_refuse "the provider released $released and that path may already belong to another task, but the retirement beside $meta could not be recorded and ${backup:-no copy of the record} could not be quarantined; nothing may restore it over the record."
+    fi
     return "$FM_WORKTREE_RETIREMENT_UNRECORDED"
   fi
   if [ -n "$backup" ] && ! rm -f -- "$backup"; then
