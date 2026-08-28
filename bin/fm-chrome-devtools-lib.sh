@@ -14,7 +14,10 @@
 #   the same mode, so the record never widens after the task's first browser call.
 #   A fresh record starts at started=0; rewriting the record for the same session
 #   (relaunch) keeps an existing started=1 so a prior incarnation's live bridge
-#   stays owned by the task.
+#   stays owned by the task. It also retires the binding's in-flight set: this is
+#   the one moment no launcher of this binding can be running, so a registration
+#   a killed browser call left behind is cleared here instead of declining every
+#   later marker reset for the task.
 #
 # fm_chrome_launcher_dir_create <parent-dir>
 #   Prints a fresh launcher directory created under an already-verified private
@@ -40,14 +43,22 @@
 #   banner. Marking on it would set the marker for every task on such a host
 #   before the worker had done anything, and the whole point of the marker is that
 #   an untouched task costs teardown nothing.
+#   The mark is written under the binding's mutex, together with registering the
+#   call in the binding's in-flight set, and the registration is retired only when
+#   the browser command returns - which is why the command is run as a child
+#   rather than exec'd. A mark on its own says a bridge exists; the registration
+#   says the bridge behind it is still coming up, so nobody may yet conclude
+#   anything about it.
 #   A delegated stop does not mark either; if the tool reports it succeeded, the
 #   launcher clears the marker back to started=0 exactly as cleanup does, so a
 #   worker that shut its own bridge down costs teardown no browser call at all. A
 #   stop the tool reports failed leaves the marker set, so that task stays
-#   cleanup-eligible. That reset carries cleanup's concurrency guard too: the
-#   record is stamped before the stop is handed over, and a record some other
-#   invocation replaced meanwhile - a worker that ran a bridge-capable command
-#   alongside its own stop - keeps its fresh started=1 rather than having it
+#   cleanup-eligible. That reset carries cleanup's concurrency guard too, and for
+#   the same reason: the record is stamped before the stop is handed over, the
+#   comparison and the write happen together under the mutex so no fresh mark can
+#   land between them, and a stamp refused because a record was replaced or
+#   because a browser call is still in flight - a worker that ran a bridge-capable
+#   command alongside its own stop - keeps its started=1 rather than having it
 #   overwritten, because the stop that just returned says nothing about the bridge
 #   that mark describes.
 #   Every delegated command is handed to the real tool with the recorded session
@@ -124,11 +135,27 @@
 #   words its unknown-session answer some other way fails the same proof for a
 #   reason the operator would fix somewhere else entirely.
 #
+# fm_chrome_binding_inflight <record>
+#   Whether some launcher invocation is between marking this binding and its
+#   browser command returning. The launcher registers one entry per such call, so
+#   a non-empty set means a bridge this task owns may be opening right now.
+#
+# fm_chrome_binding_lock <record> / fm_chrome_binding_unlock <record>
+#   The binding record's mutex, held by every writer that both reads and replaces
+#   the record. mkdir is atomic, so exactly one writer holds it; a lock still held
+#   after the bounded wait belonged to a process killed inside a critical section
+#   of a few local file operations, and is broken once rather than left to wedge
+#   every later browser call the task makes. A mutex that cannot be taken is
+#   always resolved the safe way by its callers: a reset declines, and a marking
+#   launcher refuses to start an untracked bridge.
+#
 # fm_chrome_binding_stamp <state-dir> <task-id>
-#   The binding record's identity as one string - inode, mtime, size. Every
-#   writer of that record replaces it rather than editing in place, so a changed
-#   stamp means somebody wrote it, even when the bytes are identical because the
-#   marker was already set.
+#   The binding record's identity as one string - inode, mtime, size - or nothing
+#   at all while a browser call is in flight. Every writer of that record replaces
+#   it rather than editing in place, so a changed stamp means somebody wrote it,
+#   even when the bytes are identical because the marker was already set; and a
+#   record whose task has a call in flight has no identity worth holding, because
+#   that call marked the binding already and its bridge is still coming up.
 #
 # fm_chrome_binding_clear_started <state-dir> <task-id> <stamp-before>
 #   Resets the startup marker to 0 once the task's bridge is known gone or has
@@ -137,9 +164,12 @@
 #   runs while the worker is still live and its bounded browser call takes real
 #   time; a bridge opened inside that window leaves the marker set to the same 1
 #   it already held, so the value alone cannot say whether the answer in hand is
-#   about the bridge the record now describes. A record that moved underneath, or
-#   a stamp that could not be taken, declines the reset and leaves the task
-#   eligible for the post-exit pass, which runs once nothing can open a bridge.
+#   about the bridge the record now describes. The comparison and the write happen
+#   together under the record's mutex, so a fresh mark cannot land between them
+#   either. A record that moved underneath, a stamp refused because a browser call
+#   is in flight, a stamp that could not be taken, and a mutex that could not be
+#   taken all decline the reset and leave the task eligible for the post-exit
+#   pass, which runs once nothing can open a bridge.
 #
 # fm_chrome_bridge_cleanup <state-dir> <task-id>
 #   Reads only that task's validated binding and never targets the default or
@@ -219,6 +249,11 @@ fm_chrome_binding_write() {  # <state-dir> <task-id>
     return 1
   fi
   umask "$old_umask"
+  # This is the one moment no launcher of this binding can be running - the task
+  # has not been launched yet, and a relaunch writes here only after the previous
+  # endpoint is gone - so a registration left behind by a killed browser call is
+  # retired here rather than declining every later marker reset for the task.
+  rm -rf -- "$record.inflight" 2>/dev/null || true
   # shellcheck disable=SC2034 # Output variable consumed by the sourcing caller.
   FM_CHROME_TASK_SESSION=$session
 }
@@ -286,11 +321,54 @@ case "${1:-}" in
     fi
     ;;
 esac
-# The binding record's identity - inode, mtime, size. Every writer of the record
-# replaces it rather than editing in place, so a changed stamp means somebody
-# else wrote it, even when the bytes are identical.
+lock="$record.lock"
+inflight_dir="$record.inflight"
+# The launcher's half of the binding's concurrency contract, kept identical to
+# bin/fm-chrome-devtools-lib.sh: the record is only ever replaced under this
+# mutex, and a call that has marked the binding stays registered in the in-flight
+# set until the browser command behind it returns.
+binding_lock() {
+  local tries=0 absent=0 mtime now
+  while ! mkdir -- "$lock" 2>/dev/null; do
+    if [ ! -e "$lock" ]; then
+      absent=$(( absent + 1 ))
+      [ "$absent" -lt 3 ] || return 1
+    fi
+    tries=$(( tries + 1 ))
+    if [ "$tries" -ge 40 ]; then
+      if [ "$(uname)" = Darwin ]; then
+        mtime=$(stat -f %m "$lock" 2>/dev/null) || return 1
+      else
+        mtime=$(stat -c %Y "$lock" 2>/dev/null) || return 1
+      fi
+      case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+      now=$(date +%s 2>/dev/null) || return 1
+      case "$now" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$(( now - mtime ))" -ge 30 ] || return 1
+      rmdir -- "$lock" 2>/dev/null || return 1
+      mkdir -- "$lock" 2>/dev/null || return 1
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 0
+}
+binding_unlock() {
+  rmdir -- "$lock" 2>/dev/null || true
+}
+binding_inflight() {
+  [ -d "$inflight_dir" ] || return 1
+  [ -n "$(find "$inflight_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
+}
+# The binding record's identity - inode, mtime, size - or nothing at all while
+# another call is in flight. Every writer of the record replaces it rather than
+# editing in place, so a changed stamp means somebody else wrote it, even when
+# the bytes are identical; and a record with a browser call still running has no
+# identity worth holding, because that call marked the binding already and its
+# bridge is still coming up.
 record_stamp() {
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  ! binding_inflight || return 1
   if [ "$(uname)" = Darwin ]; then
     stat -f '%i:%m:%z' "$record" 2>/dev/null || return 1
   else
@@ -303,21 +381,28 @@ if [ "${1:-}" = stop ]; then
   stop_status=$?
   if [ "$stop_status" -eq 0 ] && [ -f "$record" ] && [ ! -L "$record" ] \
     && grep -q '^started=1$' "$record" 2>/dev/null; then
-    # A started=1 that another invocation wrote while this stop was running
-    # describes a bridge this stop never covered. Retiring it would leave that
-    # bridge live and unowned - the orphan this whole binding exists to prevent -
-    # so an unstampable or replaced record declines the reset exactly as
-    # teardown's does, and the task stays cleanup-eligible.
-    stamp_after=$(record_stamp || true)
-    if [ -z "$stamp_before" ] || [ "$stamp_after" != "$stamp_before" ]; then
-      echo "chrome-devtools-axi: the task bridge binding was written by another invocation during this stop; leaving it marked so teardown re-checks that session" >&2
+    # A started=1 that another invocation wrote while this stop was running, or
+    # one whose browser command has not returned yet, describes a bridge this
+    # stop never covered. Retiring it would leave that bridge live and unowned -
+    # the orphan this whole binding exists to prevent - so the comparison and the
+    # write happen together under the record's mutex, and an unstampable or
+    # replaced record declines the reset exactly as teardown's does, leaving the
+    # task cleanup-eligible.
+    if ! binding_lock; then
+      echo "chrome-devtools-axi: the task bridge binding could not be locked after this stop; leaving it marked so teardown re-checks that session" >&2
     else
-      cleared_tmp="$record.stopped.${BASHPID:-$$}"
-      if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$cleared_tmp") \
-        || ! chmod 600 -- "$cleared_tmp" || ! mv -f -- "$cleared_tmp" "$record"; then
-        rm -f -- "$cleared_tmp" 2>/dev/null || true
-        echo "chrome-devtools-axi: the task bridge binding could not be reset after this stop; teardown will re-check that session" >&2
+      stamp_after=$(record_stamp || true)
+      if [ -z "$stamp_before" ] || [ "$stamp_after" != "$stamp_before" ]; then
+        echo "chrome-devtools-axi: the task bridge binding was written by another invocation during this stop; leaving it marked so teardown re-checks that session" >&2
+      else
+        cleared_tmp="$record.stopped.${BASHPID:-$$}"
+        if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$cleared_tmp") \
+          || ! chmod 600 -- "$cleared_tmp" || ! mv -f -- "$cleared_tmp" "$record"; then
+          rm -f -- "$cleared_tmp" 2>/dev/null || true
+          echo "chrome-devtools-axi: the task bridge binding could not be reset after this stop; teardown will re-check that session" >&2
+        fi
       fi
+      binding_unlock
     fi
   fi
   exit "$stop_status"
@@ -326,18 +411,33 @@ if [ ! -f "$record" ] || [ -L "$record" ]; then
   echo "chrome-devtools-axi: task bridge binding is unavailable; refusing to start an untracked bridge" >&2
   exit 1
 fi
+# Registering this call before marking, both under the mutex, is what keeps any
+# reset elsewhere from retiring this mark while the bridge behind it is still
+# coming up: the mark alone says a bridge exists, and the registration says
+# nobody may yet conclude anything about it. The command is therefore run as a
+# child rather than exec'd, so the registration is retired when it returns.
+if ! binding_lock; then
+  echo "chrome-devtools-axi: could not record task bridge startup; refusing to start an untracked bridge" >&2
+  exit 1
+fi
+inflight="$inflight_dir/${BASHPID:-$$}"
 marker_tmp="$record.started.${BASHPID:-$$}"
-if ! (umask 077; awk -F= '
+if ! (umask 077; mkdir -p -- "$inflight_dir") || ! (umask 077; : > "$inflight") \
+  || ! (umask 077; awk -F= '
   $1 == "started" { print "started=1"; found=1; next }
   { print }
   END { if (!found) exit 1 }
 ' "$record" > "$marker_tmp") || ! chmod 600 -- "$marker_tmp" \
   || ! mv -f -- "$marker_tmp" "$record"; then
-  rm -f -- "$marker_tmp" 2>/dev/null || true
+  rm -f -- "$marker_tmp" "$inflight" 2>/dev/null || true
+  binding_unlock
   echo "chrome-devtools-axi: could not record task bridge startup; refusing to start an untracked bridge" >&2
   exit 1
 fi
-exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+trap 'rm -f -- "$inflight" 2>/dev/null || true' EXIT
+binding_unlock
+env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+exit $?
 SH
   } > "$tmp" || ! chmod 700 "$tmp" || ! mv -f -- "$tmp" "$wrapper"; then
     rm -f -- "$tmp" 2>/dev/null || true
@@ -429,9 +529,70 @@ fm_chrome_session_scoping_proved() {  # <session>
   return 0
 }
 
+# How long a writer waits for the binding record's mutex, in 0.05s attempts, and
+# how old a lock must be before it is treated as abandoned rather than merely
+# slow. Every critical section this mutex guards is a handful of local file
+# operations, so a lock still held after the wait belonged to a process that was
+# killed inside one, and breaking it is what keeps a killed launcher from
+# wedging every later browser call the task makes.
+FM_CHROME_BINDING_LOCK_TRIES=40
+FM_CHROME_BINDING_LOCK_STALE=30
+
+fm_chrome_path_age() {  # <path>
+  local path=$1 mtime now
+  if [ "$(uname)" = Darwin ]; then
+    mtime=$(stat -f %m "$path" 2>/dev/null) || return 1
+  else
+    mtime=$(stat -c %Y "$path" 2>/dev/null) || return 1
+  fi
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s 2>/dev/null) || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( now - mtime ))"
+}
+
+fm_chrome_binding_inflight() {  # <record>
+  local dir="$1.inflight"
+  [ -d "$dir" ] || return 1
+  [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
+}
+
+fm_chrome_binding_lock() {  # <record>
+  local lock="$1.lock" tries=0 absent=0 age
+  while ! mkdir -- "$lock" 2>/dev/null; do
+    # mkdir that fails with no lock in place failed for some other reason - an
+    # unwritable state directory - and waiting out the full window would only
+    # stall the caller. A couple of retries separate that from losing the race
+    # to a holder that released in between.
+    if [ ! -e "$lock" ]; then
+      absent=$(( absent + 1 ))
+      [ "$absent" -lt 3 ] || return 1
+    fi
+    tries=$(( tries + 1 ))
+    if [ "$tries" -ge "$FM_CHROME_BINDING_LOCK_TRIES" ]; then
+      age=$(fm_chrome_path_age "$lock") || return 1
+      [ "$age" -ge "$FM_CHROME_BINDING_LOCK_STALE" ] || return 1
+      rmdir -- "$lock" 2>/dev/null || return 1
+      mkdir -- "$lock" 2>/dev/null || return 1
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 0
+}
+
+fm_chrome_binding_unlock() {  # <record>
+  rmdir -- "$1.lock" 2>/dev/null || true
+}
+
 fm_chrome_binding_stamp() {  # <state-dir> <task-id>
   local record="$1/$2.chrome-devtools-session"
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  # A record with a browser call in flight has no identity worth holding: that
+  # call has already marked the binding and its bridge is still coming up, so no
+  # answer taken now describes it. Refusing the stamp is what makes every reset
+  # that would have been justified by it decline instead.
+  ! fm_chrome_binding_inflight "$record" || return 1
   if [ "$(uname)" = Darwin ]; then
     stat -f '%i:%m:%z' "$record" 2>/dev/null || return 1
   else
@@ -440,25 +601,32 @@ fm_chrome_binding_stamp() {  # <state-dir> <task-id>
 }
 
 fm_chrome_binding_clear_started() {  # <state-dir> <task-id> <stamp-before>
-  local state=$1 id=$2 expected=${3:-} record tmp current
+  local state=$1 id=$2 expected=${3:-} record tmp current rc=0
   record="$state/$id.chrome-devtools-session"
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
+  [ -n "$expected" ] || return 0
   # The marker cannot be retired on the strength of an answer fetched before the
-  # worker's last chance to open a bridge. Every writer of this record replaces
-  # it, so a record that is not byte-for-byte the same file it was when the
-  # question was asked may already be a fresh start, and the answer in hand says
-  # nothing about that bridge. Declining leaves the task cleanup-eligible for the
-  # post-exit pass, which runs when nothing can open one any more.
-  current=$(fm_chrome_binding_stamp "$state" "$id") || return 0
-  [ -n "$expected" ] && [ "$current" = "$expected" ] || return 0
-  grep -q '^started=1$' "$record" 2>/dev/null || return 0
-  tmp="$record.cleanup.${BASHPID:-$$}"
-  if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$tmp") \
-    || ! chmod 600 -- "$tmp" || ! mv -f -- "$tmp" "$record"; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    return 1
+  # worker's last chance to open a bridge, and the record that answer was about
+  # must not be replaced between the check and the write. Every writer of this
+  # record replaces it and holds this mutex to do so, so re-reading the stamp
+  # under the lock is a real comparison rather than a guess that a fresh marker
+  # will not land in between. A record that moved underneath, one whose stamp is
+  # refused because a browser call is still in flight, and a mutex that cannot be
+  # taken all decline the reset and leave the task eligible for the post-exit
+  # pass, which runs once nothing can open a bridge any more.
+  fm_chrome_binding_lock "$record" || return 0
+  current=$(fm_chrome_binding_stamp "$state" "$id" 2>/dev/null || true)
+  if [ -n "$current" ] && [ "$current" = "$expected" ] \
+    && grep -q '^started=1$' "$record" 2>/dev/null; then
+    tmp="$record.cleanup.${BASHPID:-$$}"
+    if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$tmp") \
+      || ! chmod 600 -- "$tmp" || ! mv -f -- "$tmp" "$record"; then
+      rm -f -- "$tmp" 2>/dev/null || true
+      rc=1
+    fi
   fi
-  return 0
+  fm_chrome_binding_unlock "$record"
+  return "$rc"
 }
 
 fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>

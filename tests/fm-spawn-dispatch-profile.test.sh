@@ -1216,6 +1216,90 @@ SH
   pass "a startup marker written during a self-stop survives that stop's reset"
 }
 
+# A worker's browser command marks the binding before the tool has opened
+# anything: the mark says a bridge exists, but the bridge is still coming up
+# while the command runs. A stop issued in that window - the incident's shape,
+# with one call still connecting while another shuts a session down - covers
+# nothing that call opened, so retiring the marker on it leaves that bridge live
+# while both teardown passes read started=0 and skip it. The launcher must
+# decline the reset for as long as any of its own calls is still in flight, and
+# must resume retiring it once none is.
+# Mutation proof: dropping the launcher's in-flight registration, or letting its
+# record_stamp answer for a record that has one, makes the mid-call assertion
+# red; never retiring the registration when the call returns makes the final
+# assertion red.
+test_launcher_stop_keeps_a_marker_whose_browser_call_is_still_running() {
+  local dir id state tool bindir wrapper record waited bg
+  id=launcher-inflight-z26
+  dir="$TMP_ROOT/launcher-inflight"
+  rm -rf "$dir"
+  mkdir -p "$dir/state" "$dir/tool"
+  chmod 700 "$dir"
+  state="$dir/state"
+  tool="$dir/tool/chrome-devtools-axi"
+  # Opening a bridge takes real time. This tool spends it: navigate announces
+  # that it is connecting and stays there until the test releases it, so the
+  # stop below provably runs while that call is still in flight rather than
+  # racing it.
+  cat > "$tool" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = navigate ]; then
+  : > "$FM_FAKE_TOOL_CONNECTING"
+  waited=0
+  while [ ! -e "$FM_FAKE_TOOL_GATE" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.05
+    waited=$(( waited + 1 ))
+  done
+fi
+exit 0
+SH
+  chmod +x "$tool"
+
+  fm_chrome_binding_write "$state" "$id" \
+    || fail "could not write the task binding for the launcher in-flight test"
+  record="$state/$id.chrome-devtools-session"
+  bindir=$(fm_chrome_launcher_dir_create "$dir") \
+    || fail "could not mint a task-private Chrome launcher directory"
+  wrapper="$bindir/chrome-devtools-axi"
+  fm_chrome_wrapper_write "$state" "$id" "$wrapper" "$tool" \
+    || fail "could not write the task-private Chrome launcher"
+
+  FM_FAKE_TOOL_CONNECTING="$dir/connecting" FM_FAKE_TOOL_GATE="$dir/gate" \
+    "$wrapper" open https://example.invalid \
+    || fail "the task-private Chrome launcher did not delegate a bridge-starting call"
+  assert_grep 'started=1' "$record" \
+    "the launcher did not mark the binding for a bridge-starting call"
+
+  FM_FAKE_TOOL_CONNECTING="$dir/connecting" FM_FAKE_TOOL_GATE="$dir/gate" \
+    "$wrapper" navigate https://example.invalid &
+  bg=$!
+  waited=0
+  while [ ! -e "$dir/connecting" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.05
+    waited=$(( waited + 1 ))
+  done
+  [ -e "$dir/connecting" ] \
+    || fail "the launcher never handed the second browser call to the tool"
+
+  ( umask 022; "$wrapper" stop ) \
+    || fail "the launcher did not delegate a successful stop"
+  assert_grep 'started=1' "$record" \
+    "a stop retired the startup marker of a browser call whose bridge was still coming up, so teardown would make no stop call and orphan that bridge"
+
+  : > "$dir/gate"
+  wait "$bg" || fail "the in-flight browser call did not complete"
+
+  # The registration is the launcher's own, so it must be retired when that call
+  # returns; otherwise no self-stop would ever settle the binding again.
+  ( umask 022; "$wrapper" stop ) \
+    || fail "the launcher did not delegate a stop once no browser call was in flight"
+  assert_grep 'started=0' "$record" \
+    "a self-stop with no browser call in flight failed to retire the startup marker"
+  rm -rf "$dir"
+  pass "a startup marker whose browser call is still running survives that task's own stop"
+}
+
 # A send that comes back 2 means the backend typed the line into the composer and
 # could neither submit it nor clear it (bin/backends/zellij.sh, bin/backends/cmux.sh),
 # so whatever is left there gets prefixed onto the next send. Appending the launch
@@ -1246,6 +1330,7 @@ test_task_private_launcher_forces_the_recorded_session
 test_unsubmitted_bridge_scoping_input_refuses_the_launch
 test_launcher_stop_retires_the_marker_only_when_the_tool_agrees
 test_launcher_stop_keeps_a_marker_written_during_the_stop
+test_launcher_stop_keeps_a_marker_whose_browser_call_is_still_running
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path
 test_task_private_launcher_directory_is_unpredictable

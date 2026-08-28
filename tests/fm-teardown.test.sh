@@ -3481,6 +3481,89 @@ test_a_bridge_opened_during_the_status_read_keeps_its_marker() {
   pass "a bridge opened during the status read keeps its marker for the post-exit pass"
 }
 
+# The worker's own launcher marks the binding before the browser tool has opened
+# anything, so during the pre-refusal pass a marked task can have a bridge that is
+# still coming up. The status read for that session answers "gone" - it is not up
+# yet - and retiring the marker on that answer makes the post-exit recheck return
+# without a single browser call, orphaning the bridge that appears a moment later.
+# Cleanup must decline while any of the task's own browser calls is in flight.
+test_a_bridge_call_still_running_keeps_its_marker() {
+  local case_dir rc record stop_log tooldir bindir wrapper waited bg
+  case_dir=$(make_case chrome-inflight-race)
+  install_fake_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  record="$case_dir/state/task-x1.chrome-devtools-session"
+  stop_log="$case_dir/chrome-stop.log"
+
+  # A real task-private launcher over a tool that stays connecting, so the
+  # in-flight call below is the product's own and its timing is fixed by the
+  # test rather than raced.
+  tooldir="$case_dir/chrome-tool"
+  mkdir -p "$tooldir"
+  chmod 700 "$tooldir"
+  cat > "$tooldir/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = navigate ]; then
+  : > "$FM_FAKE_TOOL_CONNECTING"
+  waited=0
+  while [ ! -e "$FM_FAKE_TOOL_GATE" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.05
+    waited=$(( waited + 1 ))
+  done
+fi
+exit 0
+SH
+  chmod +x "$tooldir/chrome-devtools-axi"
+  bindir=$(fm_chrome_launcher_dir_create "$tooldir") \
+    || fail "could not mint a task-private Chrome launcher directory"
+  wrapper="$bindir/chrome-devtools-axi"
+  fm_chrome_wrapper_write "$case_dir/state" task-x1 "$wrapper" \
+    "$tooldir/chrome-devtools-axi" \
+    || fail "could not write the task-private Chrome launcher"
+
+  FM_FAKE_TOOL_CONNECTING="$case_dir/connecting" FM_FAKE_TOOL_GATE="$case_dir/gate" \
+    "$wrapper" navigate https://example.invalid &
+  bg=$!
+  waited=0
+  while [ ! -e "$case_dir/connecting" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.05
+    waited=$(( waited + 1 ))
+  done
+  [ -e "$case_dir/connecting" ] \
+    || fail "the launcher never handed the worker's browser call to the tool"
+  grep -q '^started=1$' "$record" \
+    || fail "the launcher did not mark the binding for the worker's browser call"
+
+  rc=0
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a binding with a browser call in flight must not fail cleanup"
+  [ ! -s "$stop_log" ] \
+    || fail "cleanup stopped a session the tool had just reported gone"
+  grep -q '^started=1$' "$record" \
+    || fail "cleanup retired the marker of a browser call whose bridge was still coming up, so the post-exit pass would make no browser call and orphan it"
+
+  : > "$case_dir/gate"
+  wait "$bg" || fail "the in-flight browser call did not complete"
+
+  # Once no call is in flight the same answer settles the binding, so declining
+  # is a wait rather than a permanent refusal.
+  rc=0
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+  expect_code 0 "$rc" "cleanup must not fail once the browser call has returned"
+  grep -q '^started=0$' "$record" \
+    || fail "cleanup never retired the marker for a session the tool reports gone once no call was in flight"
+  [ "$(chrome_record_mode "$record")" = 600 ] \
+    || fail "the binding record did not stay private across the in-flight passes"
+  pass "a bridge call still running keeps its marker for the post-exit pass"
+}
+
 # Mutation proof for this regression suite:
 # - deleting the cleanup call leaves the active-session test red;
 # - spending any browser call on a task whose launcher recorded no start makes
@@ -3501,6 +3584,11 @@ test_a_bridge_opened_during_the_status_read_keeps_its_marker() {
 #   probe-nonce and name-bounded-host tests red;
 # - retiring the startup marker without checking the binding record is still the
 #   file the liveness answer was about makes the marker-race test red;
+# - retiring the startup marker while one of the task's own browser calls is
+#   still in flight - dropping the in-flight registration the launcher writes, or
+#   letting fm_chrome_binding_stamp answer for a record that has one - makes the
+#   in-flight test red, and never retiring it again once that call returns makes
+#   that test's second pass red;
 # - letting an inherited CHROME_DEVTOOLS_AXI_PORT through to the tool makes the
 #   ambient-port test red;
 # - classifying a live bridge from a guessed list of status words makes the
@@ -3525,6 +3613,7 @@ test_an_unanswered_ownership_probe_declines_the_stop
 test_ownership_probe_is_a_fresh_task_scoped_nonce
 test_long_task_id_still_reclaims_its_bridge_on_a_name_bounded_host
 test_a_bridge_opened_during_the_status_read_keeps_its_marker
+test_a_bridge_call_still_running_keeps_its_marker
 test_marker_reset_keeps_the_binding_record_private
 test_unrecognized_live_status_is_still_reclaimed
 test_status_reported_on_stderr_is_understood_as_gone

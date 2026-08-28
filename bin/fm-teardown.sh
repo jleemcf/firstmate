@@ -2523,6 +2523,9 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session" \
       "$sub_state/$child_id.chrome-devtools-session" "$sub_state/$child_id.reconcile-nudged"
+    # The bridge binding's mutex and in-flight set are directories beside it.
+    rm -rf "$sub_state/$child_id.chrome-devtools-session.lock" \
+      "$sub_state/$child_id.chrome-devtools-session.inflight"
   done
 }
 
@@ -2846,6 +2849,9 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
+# The bridge binding's mutex and in-flight set are directories beside it.
+rm -rf "$STATE/$ID.chrome-devtools-session.lock" \
+  "$STATE/$ID.chrome-devtools-session.inflight"
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
