@@ -29,7 +29,11 @@
 #   A delegated command is treated as able to start a bridge, and the launcher
 #   atomically changes started=0 to started=1 before handing it over, unless it is
 #   one of the diagnostic and setup commands that demonstrably do not connect: the
-#   bare no-argument invocation, help, version, and setup. The bare one matters
+#   bare no-argument invocation, setup, and help or version asked as the sole
+#   argument. Sole argument is the whole exemption for the flags: -v is a common
+#   verbose switch as well as a version alias, so a flag that merely prefixes a
+#   real command marks the binding and delegates. Over-marking costs one bounded
+#   status call at teardown; under-marking loses the bridge. The bare one matters
 #   most and is not a guess - it is the status read this library itself makes to
 #   ask whether a session is live, including against a nonce nothing ever started,
 #   and it is what an agent harness runs at session start to print the tool's
@@ -268,8 +272,13 @@ fm_chrome_wrapper_write() {  # <state-dir> <task-id> <wrapper-path> <real-tool>
     printf 'session=%q\n' "$session"
     cat <<'SH'
 case "${1:-}" in
-  ''|-h|--help|-v|-V|--version|setup)
+  ''|setup)
     exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+    ;;
+  -h|--help|-v|-V|--version)
+    if [ "$#" -eq 1 ]; then
+      exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+    fi
     ;;
 esac
 if [ "${1:-}" = stop ]; then

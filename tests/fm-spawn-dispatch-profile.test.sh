@@ -1128,6 +1128,19 @@ SH
     || fail "the launcher did not delegate a bridge-capable command"
   assert_grep 'started=1' "$record" \
     "a bridge-capable command was exempted from marking the task binding"
+
+  ( umask 022; "$wrapper" stop ) \
+    || fail "the launcher did not delegate the stop that clears the marker for the flag-prefix check"
+  assert_grep 'started=0' "$record" \
+    "the launcher left the marker set before the flag-prefix check could start from a clean binding"
+  "$wrapper" -h || fail "the launcher did not delegate a lone help query"
+  assert_grep 'started=0' "$record" \
+    "a lone help query marked the task as having opened a bridge"
+  "$wrapper" -v open https://example.invalid \
+    || fail "the launcher did not delegate a bridge-capable command behind a leading flag"
+  assert_grep 'started=1' "$record" \
+    "a bridge-capable command behind a leading -v escaped marking, so teardown would make no stop call and orphan that bridge"
+
   if [ "$(uname)" = Darwin ]; then
     mode=$(stat -f %Lp "$record" 2>/dev/null)
   else
