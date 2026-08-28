@@ -1503,6 +1503,7 @@ EOF
 # must never put this task's marker over the marker of whoever holds it now.
 test_failed_return_never_overwrites_a_reissued_slots_marker() {
   local case_dir rc
+  local -a claim_backups
   case_dir=$(make_case failed-return-foreign-marker)
   write_meta "$case_dir" no-mistakes ship
   stamp_owner_marker "$case_dir/wt" task-x1
@@ -1529,8 +1530,8 @@ EOF
     "failed-return-foreign-marker: a failed return discarded the task record"
   assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
     "failed-return-foreign-marker: the record was pointed back at a slot another task now marks"
-  assert_grep "worktree=$case_dir/wt" \
-    "$(ls "$case_dir/state"/.task-x1.meta.worktree-claim-backup.* | head -n 1)" \
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
     "failed-return-foreign-marker: the refused rollback left no recoverable copy of the claim"
   pass "a failed pool return never restores this task's marker over another task's"
 }
