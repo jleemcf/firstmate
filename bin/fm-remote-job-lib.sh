@@ -461,9 +461,10 @@ fm_remote_job_remove_claim_records() { # <claim-dir>
   local claim=$1 file
   [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   for file in "$claim"/owner "$claim"/owner_start "$claim"/supervisor \
-    "$claim"/supervisor_start "$claim"/group "$claim"/armed \
+    "$claim"/supervisor_start "$claim"/group "$claim"/group_start "$claim"/armed \
     "$claim"/.owner.* "$claim"/.owner_start.* "$claim"/.supervisor.* \
-    "$claim"/.supervisor_start.* "$claim"/.group.* "$claim"/.armed.*; do
+    "$claim"/.supervisor_start.* "$claim"/.group.* "$claim"/.group_start.* \
+    "$claim"/.armed.*; do
     [ -e "$file" ] || [ -L "$file" ] || continue
     fm_remote_job_regular_bounded "$file" 256 || return 1
     rm -f -- "$file" || return 1
@@ -590,7 +591,10 @@ fm_remote_job_cancel() { # <account-home> <id>
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id" 2>/dev/null) || return 0
   state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
-  [ "$state" != 'done' ] || return 0
+  if [ "$state" = done ]; then
+    fm_remote_job_reap "$account_home" "$id" 2>/dev/null || true
+    return 0
+  fi
   tmp=$(umask 077; mktemp "$job/.cancel.XXXXXX") || return 1
   printf 'cancelled: caller disconnected or abandoned the job\n' > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }

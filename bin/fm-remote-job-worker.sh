@@ -270,6 +270,18 @@ worker_supervisor_identity_status() { # <job-dir> <pid>
   return 1
 }
 
+worker_group_identity_status() { # <job-dir> <pid>
+  local job=$1 pid=$2 recorded_start actual_start file="$1/.claim/group_start"
+  [ -e "$file" ] || [ -L "$file" ] || return 3
+  recorded_start=$(fm_remote_job_read_single_line "$file" 256 2>/dev/null) || return 2
+  actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || {
+    worker_process_or_group_alive group "$pid" && return 2
+    return 1
+  }
+  [ "$recorded_start" = "$actual_start" ] && return 0
+  return 1
+}
+
 worker_recorded_execution_alive() { # <job-dir> process|group <pid>
   local job=$1 kind=$2 pid=$3 identity_status
   if [ "$kind" = process ]; then
@@ -280,14 +292,26 @@ worker_recorded_execution_alive() { # <job-dir> process|group <pid>
       1) return 1 ;;
       2) worker_process_or_group_alive process "$pid"; return ;;
     esac
+  else
+    worker_group_identity_status "$job" "$pid"
+    identity_status=$?
+    case "$identity_status" in
+      0|3) ;;
+      1) return 1 ;;
+      2) worker_process_or_group_alive group "$pid"; return ;;
+    esac
   fi
   worker_process_or_group_alive "$kind" "$pid"
 }
 
 worker_signal_recorded_execution() { # <job-dir> process|group <signal> <pid>
-  local job=$1 kind=$2 signal=$3 pid=$4
+  local job=$1 kind=$2 signal=$3 pid=$4 identity_status
   if [ "$kind" = process ]; then
     worker_supervisor_identity_status "$job" "$pid" || return 0
+  else
+    worker_group_identity_status "$job" "$pid"
+    identity_status=$?
+    case "$identity_status" in 0|3) ;; *) return 0 ;; esac
   fi
   worker_signal_process_or_group "$kind" "$signal" "$pid"
 }
@@ -318,7 +342,7 @@ worker_stop_recorded_execution() { # <job-dir>
   done
   [ "$still_alive" -eq 0 ] || return 1
   rm -f -- "$job/.claim/supervisor" "$job/.claim/supervisor_start" \
-    "$job/.claim/group" "$job/.claim/armed"
+    "$job/.claim/group" "$job/.claim/group_start" "$job/.claim/armed"
 }
 
 # Stop every tracked lane process and its recorded command execution. The lane
@@ -495,11 +519,12 @@ worker_publish_result() { # <job-dir> <exit>
 }
 
 worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
-  local job=$1 timeout=$2 group_file armed_file group_pid rc tmp deadline next_check attempt
-  local timed_out=0 cancelled=0
+  local job=$1 timeout=$2 group_file group_start_file armed_file group_pid group_start
+  local group_tmp group_start_tmp rc tmp deadline next_check attempt timed_out=0 cancelled=0
   WORKER_PREEMPTED=0
   shift 2
   group_file="$job/.claim/group"
+  group_start_file="$job/.claim/group_start"
   armed_file="$job/.claim/armed"
   set -m
   (
@@ -511,19 +536,28 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   ) &
   group_pid=$!
   set +m
-  tmp=$(umask 077; mktemp "$job/.claim/.group.XXXXXX") || {
+  group_start=$(fm_remote_job_process_start "$group_pid") || {
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
     return 125
   }
-  printf '%s\n' "$group_pid" > "$tmp" || {
-    rm -f -- "$tmp"
+  group_tmp=$(umask 077; mktemp "$job/.claim/.group.XXXXXX") || {
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
     return 125
   }
-  if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$group_file"; then
-    rm -f -- "$tmp"
+  group_start_tmp=$(umask 077; mktemp "$job/.claim/.group_start.XXXXXX") || {
+    rm -f -- "$group_tmp"
+    worker_signal_process_or_group group KILL "$group_pid"
+    wait "$group_pid" 2>/dev/null || true
+    return 125
+  }
+  if ! printf '%s\n' "$group_pid" > "$group_tmp" \
+    || ! printf '%s\n' "$group_start" > "$group_start_tmp" \
+    || ! chmod 600 "$group_tmp" "$group_start_tmp" \
+    || ! mv -f -- "$group_start_tmp" "$group_start_file" \
+    || ! mv -f -- "$group_tmp" "$group_file"; then
+    rm -f -- "$group_tmp" "$group_start_tmp" "$group_file" "$group_start_file"
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
     return 125
@@ -531,14 +565,14 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   tmp=$(umask 077; mktemp "$job/.claim/.armed.XXXXXX") || {
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
-    rm -f -- "$group_file"
+    rm -f -- "$group_file" "$group_start_file"
     return 125
   }
   if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$armed_file"; then
     rm -f -- "$tmp"
     worker_signal_process_or_group group KILL "$group_pid"
     wait "$group_pid" 2>/dev/null || true
-    rm -f -- "$group_file"
+    rm -f -- "$group_file" "$group_start_file"
     return 125
   fi
   deadline=$((SECONDS + timeout))
@@ -579,7 +613,7 @@ worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
   done
   wait "$group_pid" 2>/dev/null
   rc=$?
-  rm -f -- "$group_file" "$armed_file"
+  rm -f -- "$group_file" "$group_start_file" "$armed_file"
   [ "$timed_out" -eq 0 ] || return 124
   [ "$cancelled" -eq 0 ] || return 130
   [ "$WORKER_PREEMPTED" -eq 0 ] || return "$FM_REMOTE_JOB_PREEMPTED_EXIT"
