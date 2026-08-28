@@ -2011,6 +2011,93 @@ EOF
   pass "a retired secondmate record's rerun never acts on a home the pool has reissued"
 }
 
+# A nested home is returned by the same claim retirement as any other slot, so
+# a forced parent teardown that stops after that return must still be able to
+# finish - and must not walk back into a child home the pool has reissued.
+test_forced_parent_rerun_never_touches_a_returned_child_home() {
+  local home subhome childhome childhome_abs fakebin log fmroot err rc returns
+  home="$TMP_ROOT/child-receipt-home"
+  subhome="$TMP_ROOT/child-receipt-subhome"
+  childhome="$TMP_ROOT/child-receipt-childhome"
+  fmroot="$TMP_ROOT/child-receipt-fmroot"
+  err="$TMP_ROOT/child-receipt.err"
+  make_firstmate_git_root "$fmroot"
+  git -C "$fmroot" worktree add --quiet --detach "$childhome" HEAD
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$childhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  printf 'nested\n' > "$childhome/.fm-secondmate-home"
+  childhome_abs=$(cd "$childhome" && pwd -P)
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  fm_write_secondmate_meta "$subhome/state/nested.meta" "$childhome"
+  printf '%s\n' 'spawn_gen=test-generation-nested' >> "$subhome/state/nested.meta"
+  cat > "$home/data/secondmates.md" <<EOF
+- domain - design domain (home: $subhome; scope: design domain; projects: alpha; added 2026-06-22)
+- nested - nested domain (home: $childhome; scope: nested domain; projects: beta; added 2026-06-22)
+EOF
+  # Fails status_retire_presentation_task for the child, the last step of the
+  # per-child loop, well after that child's home has been handed back.
+  printf 'nested\tfirstmate:fm-nested\tnot-a-number\n' > "$subhome/state/.status-presentation-cursor"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-receipt-fake")
+  log="$TMP_ROOT/child-receipt-fake/tmux.log"
+  # A returned lease goes back to the pool with the slot directory intact.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-receipt-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "the fixture never stopped forced teardown after the child home was returned"
+  grep -F "treehouse return --force $childhome_abs" "$log" >/dev/null \
+    || fail "forced teardown never returned the nested home the case is about"
+  [ -e "$subhome/state/nested.meta" ] || fail "a stopped teardown discarded the child record"
+  [ -e "$subhome/state/.nested.meta.worktree-retired" ] \
+    || fail "no retirement receipt records that the nested home was already returned"
+
+  # The pool reissues the nested slot, whose new holder is live in it.
+  printf 'other\n' > "$childhome/.fm-secondmate-home"
+  git -C "$childhome" worktree add --quiet --detach "$childhome/leafwt" HEAD
+  printf 'leaf live work\n' > "$childhome/leafwt/live.txt"
+  cat > "$childhome/state/leaf.meta" <<EOF
+window=firstmate:fm-leaf
+endpoint_task_id=leaf
+worktree=$childhome/leafwt
+project=$childhome
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+spawn_gen=test-generation-leaf
+EOF
+
+  rm -f "$subhome/state/.status-presentation-cursor"
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-receipt-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "the rerun could not finish a parent whose child home was already returned: $(cat "$err")"
+  [ ! -e "$home/state/domain.meta" ] || fail "the rerun left the parent secondmate record behind"
+  [ -e "$childhome/state/leaf.meta" ] \
+    || fail "the rerun deleted a record belonging to the nested home's new holder"
+  [ -d "$childhome/leafwt" ] && [ "$(cat "$childhome/leafwt/live.txt")" = "leaf live work" ] \
+    || fail "the rerun destroyed live work belonging to the nested home's new holder"
+  [ "$(cat "$childhome/.fm-secondmate-home")" = other ] \
+    || fail "the rerun disturbed the reissued nested home's ownership marker"
+  returns=$(grep -cF "treehouse return --force $childhome_abs" "$log")
+  [ "$returns" = 1 ] || fail "the rerun returned the reissued nested home a second time"
+  pass "a forced parent rerun finishes without ever re-entering a returned child home"
+}
+
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return() {
   local home subhome subhome_abs fakebin log
   home="$TMP_ROOT/plain-clone-teardown-home"
@@ -3275,6 +3362,7 @@ test_secondmate_force_teardown_preserves_nested_restore_status
 test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_reruns_after_a_returned_leased_home
 test_retired_secondmate_rerun_never_touches_a_reissued_home
+test_forced_parent_rerun_never_touches_a_returned_child_home
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work

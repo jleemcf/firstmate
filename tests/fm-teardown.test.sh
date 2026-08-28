@@ -1373,6 +1373,48 @@ EOF
   pass "a teardown step failing after the pool return leaves a record a rerun can finish"
 }
 
+# A copy of the claim that outlived its own removal describes a path the
+# provider has already taken back. The receipt is what says the retirement
+# completed, so it decides - the copy must not be read as an interruption and
+# must never be offered as something to restore.
+test_receipt_outranks_a_leftover_claim_copy() {
+  local case_dir rc leftover
+  case_dir=$(make_case leftover-claim-copy)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  printf 'task-x1\tfirstmate:fm-task-x1\tnot-a-number\n' \
+    > "$case_dir/state/.status-presentation-cursor"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "leftover-claim-copy: the fixture must stop teardown after the pool return"
+  assert_present "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "leftover-claim-copy: no retirement receipt records that the return already ran"
+
+  # The retirement was recorded, but its claim copy could not be unlinked.
+  leftover="$case_dir/state/.task-x1.meta.worktree-claim-backup.aB3xY9"
+  printf 'window=firstmate:fm-task-x1\nworktree=%s/wt\n' "$case_dir" > "$leftover"
+
+  rm -f "$case_dir/state/.status-presentation-cursor"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "leftover-claim-copy: a recorded retirement must outrank the leftover copy"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "leftover-claim-copy: the rerun left the task record behind"
+  assert_absent "$leftover" \
+    "leftover-claim-copy: the superseded claim copy outlived the record it describes"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "leftover-claim-copy: the rerun returned the pool slot a second time"
+  pass "a recorded retirement outranks a claim copy that outlived its own removal"
+}
+
 # The slot is the provider's again the instant the return succeeds, so no later
 # failure may hand this record authority over it - even before the task that
 # takes it has stamped its own marker.
@@ -3287,6 +3329,7 @@ test_same_task_id_with_a_different_marker_generation_refuses
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_late_teardown_failure_leaves_a_rerunnable_record
+test_receipt_outranks_a_leftover_claim_copy
 test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch

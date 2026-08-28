@@ -2292,8 +2292,20 @@ preflight_firstmate_home_process_events() {
   fi
 }
 
+# The home a child secondmate still owns, or nothing at all once its retirement
+# receipt says the provider took that path back. home= outlives claim
+# retirement, so it keeps naming a slot the pool may already have issued to
+# another secondmate; nothing may walk into that path on this record's behalf.
+teardown_child_home_to_traverse() {  # <child-meta>
+  local child_meta=$1 child_home
+  ! fm_worktree_retirement_receipt_present "$child_meta" >/dev/null 2>&1 || return 0
+  child_home=$(meta_value "$child_meta" home)
+  [ -n "$child_home" ] || child_home=$(meta_value "$child_meta" worktree)
+  printf '%s' "$child_home"
+}
+
 preflight_firstmate_home_process_event_tree() {
-  local home=$1 label=$2 sub_state child_meta child_kind child_home child_wt child_id
+  local home=$1 label=$2 sub_state child_meta child_kind child_home child_id
   sub_state="$home/state"
   if [ -d "$sub_state" ]; then
     for child_meta in "$sub_state"/*.meta; do
@@ -2301,9 +2313,8 @@ preflight_firstmate_home_process_event_tree() {
       child_kind=$(meta_value "$child_meta" kind)
       [ "$child_kind" = secondmate ] || continue
       child_id=$(basename "$child_meta" .meta)
-      child_wt=$(meta_value "$child_meta" worktree)
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+      child_home=$(teardown_child_home_to_traverse "$child_meta")
+      [ -n "$child_home" ] || continue
       preflight_firstmate_home_process_event_tree "$child_home" "child firstmate home for $child_id" || return 1
     done
   fi
@@ -2311,7 +2322,7 @@ preflight_firstmate_home_process_event_tree() {
 }
 
 collect_descendant_task_locks() {
-  local home=$1 sub_state child_meta child_id child_kind child_wt child_home task_set_lock
+  local home=$1 sub_state child_meta child_id child_kind child_home task_set_lock
   local -a child_ids
   sub_state="$home/state"
   if [ -L "$sub_state" ]; then
@@ -2357,22 +2368,20 @@ collect_descendant_task_locks() {
     [ -n "$child_kind" ] || child_kind=ship
     child_home=
     if [ "$child_kind" = secondmate ]; then
-      child_wt=$(meta_value "$child_meta" worktree)
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+      child_home=$(teardown_child_home_to_traverse "$child_meta")
     fi
     DESCENDANT_TASK_STATES+=("$sub_state")
     DESCENDANT_TASK_IDS+=("$child_id")
     DESCENDANT_TASK_KINDS+=("$child_kind")
     DESCENDANT_TASK_HOMES+=("$child_home")
-    [ "$child_kind" != secondmate ] \
+    [ "$child_kind" != secondmate ] || [ -z "$child_home" ] \
       || collect_descendant_task_locks "$child_home" \
       || return 1
   done < <(printf '%s\n' "${child_ids[@]}" | LC_ALL=C sort)
 }
 
 preflight_descendant_task_locks() {
-  local home=$1 i state task_id meta control_lock meta_lock kind child_wt child_home
+  local home=$1 i state task_id meta control_lock meta_lock kind child_home
   DESCENDANT_TASK_STATES=()
   DESCENDANT_TASK_IDS=()
   DESCENDANT_TASK_KINDS=()
@@ -2415,9 +2424,7 @@ preflight_descendant_task_locks() {
       return 1
     }
     if [ "$kind" = secondmate ]; then
-      child_wt=$(meta_value "$meta" worktree)
-      child_home=$(meta_value "$meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+      child_home=$(teardown_child_home_to_traverse "$meta")
       [ "$child_home" = "${DESCENDANT_TASK_HOMES[$i]}" ] || {
         echo "REFUSED: descendant task $task_id changed home while forced teardown acquired its locks; forced teardown changed nothing" >&2
         return 1
@@ -2440,8 +2447,11 @@ validate_firstmate_home_children_removal() {
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
     if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+      child_home=$(teardown_child_home_to_traverse "$child_meta")
+      if [ -z "$child_home" ]; then
+        fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
+        continue
+      fi
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
       fm_worktree_ownership_prove "$sub_state" "$child_id" "$child_meta" || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
@@ -2573,7 +2583,7 @@ $session	$lock_path"
 }
 
 preflight_firstmate_home_herdr_children() {  # <home>
-  local home=$1 sub_state child_meta child_id child_backend child_target child_kind child_home child_wt
+  local home=$1 sub_state child_meta child_id child_backend child_target child_kind child_home
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -2588,10 +2598,9 @@ preflight_firstmate_home_herdr_children() {  # <home>
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     if [ "$child_kind" = secondmate ]; then
-      child_wt=$(meta_value "$child_meta" worktree)
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
-      preflight_firstmate_home_herdr_children "$child_home" || return 1
+      child_home=$(teardown_child_home_to_traverse "$child_meta")
+      [ -z "$child_home" ] \
+        || preflight_firstmate_home_herdr_children "$child_home" || return 1
     fi
   done
 }
@@ -2641,8 +2650,7 @@ cleanup_firstmate_home_children() {
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+      child_home=$(teardown_child_home_to_traverse "$child_meta")
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         cleanup_firstmate_home_children "$child_home" || return $?
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id" "$child_meta" || return $?
@@ -2935,7 +2943,6 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
     ORCA_PATH_MATCH_VERIFIED=1
   fi
-  branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
   if [ -d "$WT" ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
       "$WT/.opencode/plugins/fm-busy-state.js" \

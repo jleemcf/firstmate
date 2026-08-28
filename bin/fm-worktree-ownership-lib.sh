@@ -391,6 +391,15 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     # path, and fm_worktree_claim_retire_begin still refuses every path-keyed
     # helper whose target the record does not claim.
     backup=$(fm_worktree_claim_backup_hint "$meta" || true)
+    if fm_worktree_retirement_receipt_present "$meta" >/dev/null 2>&1; then
+      # The receipt settles what the copy can only guess at: this record's
+      # provider step completed, so the claim was retired rather than
+      # interrupted and that copy describes a path this task no longer owns.
+      [ -z "$backup" ] \
+        || echo "warning: task $id's retirement is recorded, but a superseded copy of its claim remains at $backup; it names a released path and must never be restored over the record." >&2
+      FM_WORKTREE_OWNERSHIP_PROOF=no-worktree-claim
+      return 0
+    fi
     if [ -n "$backup" ]; then
       fm_worktree_refuse "task $id has no worktree claim in $meta; an interrupted claim retirement left its recoverable copy at $backup."
       return 1
