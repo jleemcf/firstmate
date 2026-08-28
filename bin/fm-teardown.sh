@@ -2936,8 +2936,6 @@ fi
 # Fix 3 (see script header): sweep remote job workers abandoned by an already
 # pruned code root. Best effort - a sweep failure never blocks this teardown.
 "$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
-
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
@@ -2959,7 +2957,6 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
       exit 1
     fi
   fi
-  teardown_drop_task_branch "$PROJ" "$ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
@@ -2983,6 +2980,9 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   fi
+fi
+# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
+if [ "$KIND" != secondmate ]; then
   teardown_drop_task_branch "$PROJ" "$ID"
 fi
 

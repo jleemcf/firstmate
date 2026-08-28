@@ -1607,6 +1607,68 @@ EOF
   pass "a failed pool return never restores this task's marker over another task's"
 }
 
+# The task branch is the record's own ref, not the slot's, so a rerun that skips
+# an already-completed pool return still has to drop it - otherwise the shared
+# project keeps a ref no surviving record can be attributed to.
+test_retired_rerun_still_drops_the_task_branch() {
+  local case_dir rc
+  case_dir=$(make_case retired-rerun-branch)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  # Fail only the task-branch delete, so the first run records the retirement and
+  # then stops with the ref still sitting in the shared project.
+  cat > "$case_dir/fakebin/git" <<EOF
+#!/usr/bin/env bash
+real=\${REAL_GIT_FOR_TEST:?}
+if [ -e "$case_dir/branch-drop-fails" ]; then
+  prev=
+  for arg in "\$@"; do
+    if [ "\$prev" = branch ] && [ "\$arg" = -D ]; then
+      echo 'fatal: simulated failure deleting the task branch' >&2
+      exit 1
+    fi
+    prev=\$arg
+  done
+fi
+exec "\$real" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/git"
+  : > "$case_dir/branch-drop-fails"
+  printf 'task-x1\tfirstmate:fm-task-x1\tnot-a-number\n' \
+    > "$case_dir/state/.status-presentation-cursor"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "retired-rerun-branch: the fixture must stop teardown after the pool return"
+  assert_grep "could not drop task branch fm/task-x1" "$case_dir/stderr" \
+    "retired-rerun-branch: an undeletable task branch was passed over silently"
+  assert_present "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "retired-rerun-branch: no retirement receipt records that the pool return already ran"
+  git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1 \
+    || fail "retired-rerun-branch: the fixture never left the task branch behind to rerun over"
+
+  rm -f "$case_dir/branch-drop-fails" "$case_dir/state/.status-presentation-cursor"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "retired-rerun-branch: the rerun should finish the teardown"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "retired-rerun-branch: the rerun left the task record behind"
+  if git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1; then
+    fail "retired-rerun-branch: the task branch outlived the record it belonged to"
+  fi
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "retired-rerun-branch: the rerun returned the pool slot a second time"
+  pass "a receipt-backed rerun still drops the task branch whose return it skipped"
+}
+
 # fm/<id> is the only ref teardown owns; whatever else the crewmate checked out
 # in the slot belongs to the crew, not to cleanup.
 test_pool_return_drops_only_this_tasks_branch() {
@@ -3406,6 +3468,7 @@ test_receipt_outranks_a_leftover_claim_copy
 test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch
+test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
 test_pool_return_drops_only_this_tasks_branch
 test_dirty_worktree_refuses
