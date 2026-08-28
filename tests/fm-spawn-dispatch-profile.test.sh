@@ -63,6 +63,13 @@ case "${1:-}" in
         esac
       done
     fi
+    if [ -n "${FM_FAKE_CHROME_SEND_STATUS:-}" ]; then
+      for a in "$@"; do
+        case "$a" in
+          *CHROME_DEVTOOLS_AXI_SESSION=*) exit "$FM_FAKE_CHROME_SEND_STATUS" ;;
+        esac
+      done
+    fi
     exit 0
     ;;
 esac
@@ -137,6 +144,7 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     CLAUDE_CONFIG_DIR="${FM_TEST_CLAUDE_CONFIG_DIR:-}" \
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_TEXT_LOG="${FM_TEST_TEXT_LOG:-}" \
+    FM_FAKE_CHROME_SEND_STATUS="${FM_TEST_CHROME_SEND_STATUS:-}" \
     FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
@@ -926,6 +934,8 @@ test_missing_chrome_devtools_tool_does_not_block_the_launch() {
   expect_code 0 "$status" "a missing chrome-devtools-axi must not block a ship launch"$'\n'"$out"
   assert_contains "$out" "spawned $id harness=claude" "the launch did not complete without chrome-devtools-axi"
   assert_contains "$out" "chrome-devtools-axi is unavailable" "the absent browser tool was not reported"
+  assert_contains "$out" "teardown will not reclaim" \
+    "spawn implied teardown would still reclaim a bridge nothing can record the start of"
   assert_contains "$(cat "$LAUNCH_LOG")" "claude --dangerously-skip-permissions" \
     "no agent launch command was sent without chrome-devtools-axi"
   record="$HOME_DIR/state/$id.chrome-devtools-session"
@@ -1109,8 +1119,15 @@ SH
     "a bridge the worker stopped itself still reads as a recorded start teardown must explain"
 
   "$wrapper" || fail "the launcher did not delegate a bare invocation"
+  assert_grep 'started=0' "$record" \
+    "a bare status invocation - what an agent harness runs at session start - marked the task as having opened a bridge"
+  "$wrapper" --version || fail "the launcher did not delegate a version query"
+  assert_grep 'started=0' "$record" \
+    "a version query marked the task as having opened a bridge"
+  "$wrapper" navigate https://example.invalid \
+    || fail "the launcher did not delegate a bridge-capable command"
   assert_grep 'started=1' "$record" \
-    "the launcher exempted a command from marking on a guess about which verbs open a bridge"
+    "a bridge-capable command was exempted from marking the task binding"
   if [ "$(uname)" = Darwin ]; then
     mode=$(stat -f %Lp "$record" 2>/dev/null)
   else
@@ -1122,8 +1139,34 @@ SH
   pass "a worker's own successful stop retires the startup marker and a failed one does not"
 }
 
+# A send that comes back 2 means the backend typed the line into the composer and
+# could neither submit it nor clear it (bin/backends/zellij.sh, bin/backends/cmux.sh),
+# so whatever is left there gets prefixed onto the next send. Appending the launch
+# command would then submit the two concatenated: the agent never starts and the
+# task is left unscoped. The TRACEPARENT send eight lines later already refuses on
+# exactly this status, and the bridge-scoping send must refuse identically.
+test_unsubmitted_bridge_scoping_input_refuses_the_launch() {
+  local rec id out status
+  id=profile-chrome-stuck-z25
+  rm -rf "/tmp/fm-$id"
+  rec=$(make_spawn_case profile-chrome-stuck claude "$id")
+  read_case_record "$rec"
+
+  out=$(FM_TEST_CHROME_SEND_STATUS=2 \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  [ "$status" -ne 0 ] \
+    || fail "spawn continued after the bridge-scoping line was left unsubmitted in the composer"
+  assert_contains "$out" "refusing to append the launch command" \
+    "spawn did not report why it refused to launch onto an uncleared composer"
+  ! grep -q 'claude --dangerously-skip-permissions' "$LAUNCH_LOG" \
+    || fail "spawn appended the launch command onto an unsubmitted bridge-scoping line"
+  pass "a bridge-scoping line left unsubmitted in the composer refuses the launch"
+}
+
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_task_private_launcher_forces_the_recorded_session
+test_unsubmitted_bridge_scoping_input_refuses_the_launch
 test_launcher_stop_retires_the_marker_only_when_the_tool_agrees
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path

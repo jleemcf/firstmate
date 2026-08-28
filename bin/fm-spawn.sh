@@ -2869,11 +2869,13 @@ spawn_record_traceparent() {
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Bind browser automation lazily to one non-default bridge session for this task.
 # The task-private launcher marks the binding before a browser action can start
-# the bridge, so teardown distinguishes an unused session from an unhealthy one.
+# the bridge, and that mark is what teardown reclaims against: a task with no
+# recorded start is never asked about, so the launcher is not an optimisation but
+# the thing that makes reclamation happen at all.
 # chrome-devtools-axi is an optional universal tool, so like every other missing
-# universal tool this degrades to a diagnostic instead of blocking the launch:
-# the session binding alone still scopes and reclaims the bridge, because
-# teardown asks the tool whether that exact named session is live.
+# universal tool this degrades to a diagnostic instead of blocking the launch -
+# but the degraded state is honest about what it costs: the session still isolates
+# this task's bridge from the captain's, and nothing will reclaim it.
 if [ "$KIND" != secondmate ]; then
   if ! fm_chrome_binding_write "$STATE_REAL" "$ID"; then
     echo "warning: could not create the task-scoped chrome-devtools bridge binding for $ID; this task will not isolate a browser bridge" >&2
@@ -2890,23 +2892,27 @@ if [ "$KIND" != secondmate ]; then
           && fm_chrome_wrapper_write "$STATE_REAL" "$ID" "$CHROME_DEVTOOLS_AXI_BINDIR/chrome-devtools-axi" "$CHROME_DEVTOOLS_AXI_BIN"; then
           CHROME_DEVTOOLS_AXI_EXPORTS="$CHROME_DEVTOOLS_AXI_EXPORTS; export PATH=$CHROME_DEVTOOLS_AXI_BINDIR:\$PATH"
         else
-          echo "warning: could not create the task-scoped chrome-devtools bridge launcher for $ID; the session stays task-scoped and teardown still reclaims it" >&2
+          echo "warning: could not create the task-scoped chrome-devtools bridge launcher for $ID; the session still keeps this task's bridge off the captain's, but nothing will record that a bridge was opened, so teardown will not reclaim one and any bridge this task leaves must be stopped by hand" >&2
         fi
         ;;
       *)
-        echo "warning: chrome-devtools-axi is unavailable; $ID keeps its task-scoped bridge session without a task-private launcher" >&2
+        echo "warning: chrome-devtools-axi is unavailable; $ID keeps its task-scoped bridge session but gets no task-private launcher, so teardown will not reclaim a bridge opened through some other copy of the tool" >&2
         ;;
     esac
-    # Same composer window as the TRACEPARENT send below, so the same rule: a
-    # status of 2 left this line typed but unsubmitted, and appending the launch
-    # command would run the two concatenated.
-    if ! spawn_send_text_line "$T" "$CHROME_DEVTOOLS_AXI_EXPORTS"; then
+    # Same composer window as the TRACEPARENT send below, so the same rule and the
+    # same shape: a status of 2 left this line typed but unsubmitted, and
+    # appending the launch command would run the two concatenated. The status has
+    # to be read from the else branch - `if ! cmd` reports the negation, which is
+    # 0 for every failure and would make the refusal below unreachable.
+    if spawn_send_text_line "$T" "$CHROME_DEVTOOLS_AXI_EXPORTS"; then
+      :
+    else
       CHROME_SEND_STATUS=$?
       if [ "$CHROME_SEND_STATUS" -eq 2 ]; then
         echo "error: chrome-devtools bridge scoping input could not be cleared for $W; refusing to append the launch command" >&2
         exit 1
       fi
-      echo "warning: the task-scoped chrome-devtools bridge session could not be delivered to $ID; this task will not isolate a browser bridge" >&2
+      echo "warning: the task-scoped chrome-devtools bridge session could not be delivered to $ID; this task will not isolate a browser bridge, and teardown will not reclaim any bridge it opens" >&2
     fi
   fi
 fi

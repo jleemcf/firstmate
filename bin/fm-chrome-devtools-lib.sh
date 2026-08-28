@@ -26,14 +26,21 @@
 # fm_chrome_wrapper_write <state-dir> <task-id> <wrapper-path> <real-tool>
 #   Writes a task-private chrome-devtools-axi launcher, the one component on the
 #   worker's execution path that can both scope a browser call and witness it.
-#   Every delegated command except stop is treated as able to start a bridge -
-#   which of the tool's verbs auto-connect is not a contract this repo owns, so
-#   nothing is exempted on a guess - and the launcher atomically changes started=0
-#   to started=1 before handing that command over. A delegated stop does not mark;
-#   if the tool reports it succeeded, the launcher clears the marker back to
-#   started=0 exactly as cleanup does, so a worker that shut its own bridge down
-#   costs teardown no browser call at all. A stop the tool reports failed leaves
-#   the marker set, so that task stays cleanup-eligible.
+#   A delegated command is treated as able to start a bridge, and the launcher
+#   atomically changes started=0 to started=1 before handing it over, unless it is
+#   one of the diagnostic and setup commands that demonstrably do not connect: the
+#   bare no-argument invocation, help, version, and setup. The bare one matters
+#   most and is not a guess - it is the status read this library itself makes to
+#   ask whether a session is live, including against a nonce nothing ever started,
+#   and it is what an agent harness runs at session start to print the tool's
+#   banner. Marking on it would set the marker for every task on such a host
+#   before the worker had done anything, and the whole point of the marker is that
+#   an untouched task costs teardown nothing.
+#   A delegated stop does not mark either; if the tool reports it succeeded, the
+#   launcher clears the marker back to started=0 exactly as cleanup does, so a
+#   worker that shut its own bridge down costs teardown no browser call at all. A
+#   stop the tool reports failed leaves the marker set, so that task stays
+#   cleanup-eligible.
 #   Every delegated command is handed to the real tool with the recorded session
 #   forced and any ambient CHROME_DEVTOOLS_AXI_PORT dropped, so the binding holds
 #   even when the pane shell's exports did not survive to the caller: a scrubbed
@@ -226,6 +233,11 @@ fm_chrome_wrapper_write() {  # <state-dir> <task-id> <wrapper-path> <real-tool>
     printf 'tool=%q\n' "$tool"
     printf 'session=%q\n' "$session"
     cat <<'SH'
+case "${1:-}" in
+  ''|-h|--help|-v|-V|--version|setup)
+    exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+    ;;
+esac
 if [ "${1:-}" = stop ]; then
   env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
   stop_status=$?
