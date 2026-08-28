@@ -65,9 +65,15 @@
 #
 # fm_worktree_owner_pending_write/_read/_clear carry the durable half of the
 # owner-marker binding across the window in which a spawn holds a slot but has
-# not published its task record yet. fm_worktree_owner_marker_attribution reads
-# that pair back, so a refusal over another task's marker can tell an operator
-# whether a teardown owns the slot, an interrupted spawn does, or nothing does.
+# not published its task record yet. Each record is keyed by task id AND spawn
+# generation, so a same-id recovery adds its own rather than overwriting the
+# evidence of the incarnation it is recovering from, and _read/_clear bind id,
+# generation, and canonical path together. fm_worktree_owner_pending_list is the
+# discovery half a fresh spawn uses to refuse a second slot while an earlier
+# claim is unresolved. fm_worktree_owner_marker_attribution reads a marker back
+# against both, so a refusal over another task's marker can tell an operator
+# whether a teardown owns the slot, an interrupted spawn does, a record that
+# moved on does, or nothing does.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
@@ -286,18 +292,32 @@ fm_worktree_retirement_receipt_clear() {  # <meta-file>
 # anywhere in that window leaves a marker something can still attribute to a
 # task, a spawn generation, and a path - not an orphan that refuses the slot to
 # every later spawn with no record to name as its remedy.
+# The file name carries the spawn generation, because recovery is told to keep
+# the same task identity: a later incarnation of the same id publishes its own
+# record beside an interrupted one rather than overwriting the only evidence of
+# the slot that one took.
 # It records an intent, never an outcome: nothing resolves a destructive target
 # through it, it satisfies no ownership proof, and it is superseded the moment
 # state/<id>.meta publishes the same generation.
-fm_worktree_owner_pending_path() {  # <state-dir> <task-id>
-  printf '%s/.%s.meta.worktree-owner-pending' "$1" "$2"
+fm_worktree_owner_pending_path() {  # <state-dir> <task-id> <spawn-gen>
+  local state=$1 id=$2 generation=$3
+  [ -n "$state" ] || return 1
+  case "$id" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  case "$generation" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  printf '%s/.%s.meta.worktree-owner-pending.%s' "$state" "$id" "$generation"
 }
 
 fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktree>
   local state=$1 id=$2 generation=$3 worktree=$4 pending tmp
-  [ -n "$state" ] && [ -n "$id" ] && [ -n "$generation" ] && [ -n "$worktree" ] || return 1
-  pending=$(fm_worktree_owner_pending_path "$state" "$id")
-  tmp="$pending.next.${BASHPID:-$$}"
+  [ -n "$worktree" ] || return 1
+  pending=$(fm_worktree_owner_pending_path "$state" "$id" "$generation") || return 1
+  # Outside the discovery namespace, so an interrupted write can never read as
+  # an unresolved claim of its own.
+  tmp="$state/.$id.meta.worktree-owner-pending-next.${BASHPID:-$$}"
   if ! (umask 077; {
       printf '%s\n' 'schema=fm-task-owner-pending.v1'
       printf 'task_id=%s\n' "$id"
@@ -310,52 +330,98 @@ fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktr
 }
 
 # 0 and prints the worktree this exact task and generation was being launched
-# into, 1 for every other state. Bound to both halves, so a record left by an
-# earlier generation never attributes a later one's marker.
-fm_worktree_owner_pending_read() {  # <state-dir> <task-id> <spawn-gen>
-  local state=$1 id=$2 generation=$3 pending
-  [ -n "$generation" ] || return 1
-  pending=$(fm_worktree_owner_pending_path "$state" "$id")
+# into, 1 for every other state. Bound on all three axes: a record left by
+# another generation never attributes this one's marker, and an expected
+# worktree, when given, must be the same canonical path the record names.
+fm_worktree_owner_pending_read() {  # <state-dir> <task-id> <spawn-gen> [expected-worktree]
+  local state=$1 id=$2 generation=$3 expected=${4:-} pending recorded expected_canonical
+  pending=$(fm_worktree_owner_pending_path "$state" "$id" "$generation") || return 1
   [ -f "$pending" ] && [ ! -L "$pending" ] || return 1
   [ "$(fm_worktree_meta_exact_value "$pending" schema 2>/dev/null || true)" \
     = fm-task-owner-pending.v1 ] || return 1
   [ "$(fm_worktree_meta_exact_value "$pending" task_id 2>/dev/null || true)" = "$id" ] || return 1
   [ "$(fm_worktree_meta_exact_value "$pending" spawn_gen 2>/dev/null || true)" \
     = "$generation" ] || return 1
-  fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || return 1
+  recorded=$(fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null) || return 1
+  if [ -n "$expected" ]; then
+    expected_canonical=$(fm_worktree_claim_comparison_path "$expected" 2>/dev/null || true)
+    [ -n "$expected_canonical" ] || return 1
+    [ "$(fm_worktree_claim_comparison_path "$recorded" 2>/dev/null || true)" \
+      = "$expected_canonical" ] || return 1
+  fi
+  printf '%s' "$recorded"
 }
 
-# Retracts only the record this exact generation published, so neither an abort
-# nor a teardown can withdraw a different incarnation's claim on the slot.
-fm_worktree_owner_pending_clear() {  # <state-dir> <task-id> <spawn-gen>
-  local state=$1 id=$2 generation=$3
-  fm_worktree_owner_pending_read "$state" "$id" "$generation" >/dev/null 2>&1 || return 0
-  rm -f -- "$(fm_worktree_owner_pending_path "$state" "$id")"
+# Retracts only the record this exact task, generation, and path published, so
+# neither an abort nor a teardown can withdraw a different incarnation's claim
+# on a slot it may still be holding.
+fm_worktree_owner_pending_clear() {  # <state-dir> <task-id> <spawn-gen> [expected-worktree]
+  local state=$1 id=$2 generation=$3 expected=${4:-} pending
+  fm_worktree_owner_pending_read "$state" "$id" "$generation" "$expected" >/dev/null 2>&1 || return 0
+  pending=$(fm_worktree_owner_pending_path "$state" "$id" "$generation") || return 0
+  rm -f -- "$pending"
+}
+
+# Every ownership record this task id still has beside the state directory, one
+# path per line. Discovery only: it exists so a fresh spawn can refuse to take a
+# second slot while an earlier incarnation's claim is unresolved, and nothing
+# here selects a generation to act on - a destructive step names its own.
+fm_worktree_owner_pending_list() {  # <state-dir> <task-id>
+  local state=$1 id=$2 candidate
+  case "$id" in
+    ''|*[!A-Za-z0-9._-]*) return 0 ;;
+  esac
+  for candidate in "$state/.$id.meta.worktree-owner-pending."*; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+  done
 }
 
 # What durable metadata, if any, still stands behind an owner marker, so a
 # refusal over a foreign one can name a remedy that exists rather than a
-# teardown for a task that was never recorded. Prints exactly one of:
-#   record  - the marked task has a task record, so its teardown owns the slot
-#   pending - no record, but the marked task's own spawn published this exact
-#             generation's ownership record before it was interrupted
+# teardown that will never touch this slot. Prints exactly one of:
+#   record  - the marked task's record binds this marker: it publishes the
+#             marker's own spawn generation, or it claims this very slot, so
+#             that task's teardown is what retires this marker
+#   pending - the marked task's own spawn published this exact generation's
+#             ownership record for this slot and was then interrupted
+#   stale   - the marked task has a record, but it names another generation and
+#             another worktree, so its teardown will never clear this marker
 #   orphan  - nothing in this home attributes the marker to any task
 # It only reads: the marker is never moved, rewritten, or removed here.
 fm_worktree_owner_marker_attribution() {  # <state-dir> <marker-path>
-  local state=$1 marker=$2 owner generation
+  local state=$1 marker=$2 owner generation meta slot recorded recorded_present=0
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
   owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
-  [ -n "$owner" ] || return 1
   case "$owner" in
     ''|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
-  if [ -f "$state/$owner.meta" ] && [ ! -L "$state/$owner.meta" ]; then
-    printf '%s' record
+  generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
+  slot=${marker%/*}
+  meta="$state/$owner.meta"
+  if [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    recorded_present=1
+    if [ -n "$generation" ] \
+      && [ "$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)" \
+        = "$generation" ]; then
+      printf '%s' record
+      return 0
+    fi
+    recorded=$(fm_worktree_meta_exact_value "$meta" worktree 2>/dev/null || true)
+    if [ -n "$recorded" ] \
+      && [ -n "$(fm_worktree_claim_comparison_path "$slot" 2>/dev/null || true)" ] \
+      && [ "$(fm_worktree_claim_comparison_path "$recorded" 2>/dev/null || true)" \
+        = "$(fm_worktree_claim_comparison_path "$slot" 2>/dev/null || true)" ]; then
+      printf '%s' record
+      return 0
+    fi
+  fi
+  if fm_worktree_owner_pending_read "$state" "$owner" "$generation" "$slot" >/dev/null 2>&1; then
+    printf '%s' pending
     return 0
   fi
-  generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
-  if fm_worktree_owner_pending_read "$state" "$owner" "$generation" >/dev/null 2>&1; then
-    printf '%s' pending
+  if [ "$recorded_present" -eq 1 ]; then
+    printf '%s' stale
     return 0
   fi
   printf '%s' orphan

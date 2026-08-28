@@ -887,6 +887,31 @@ spawn_abort_cleanup() {
 }
 trap spawn_abort_cleanup EXIT
 
+# An ownership record that outlived the spawn that published it means some pool
+# slot may still carry this task id's owner marker with no task record to
+# attribute it. Recovery is told to keep the same task identity, so the very
+# next thing that happens is a fresh spawn of this id - and handing it a second
+# slot would strand the first one behind a marker nothing can name. Refuse
+# instead, naming every unresolved generation and the path it took, so the
+# operator resolves those before this id takes another worktree.
+refuse_unresolved_task_owner_pending_claims() {  # <state-dir> <task-id>
+  local state=$1 id=$2 pending generation worktree
+  local -a claims=()
+  while IFS= read -r pending; do
+    [ -n "$pending" ] || continue
+    claims+=("$pending")
+  done < <(fm_worktree_owner_pending_list "$state" "$id")
+  [ "${#claims[@]}" -gt 0 ] || return 0
+  echo "error: task $id has ${#claims[@]} unresolved worktree ownership record(s) from an earlier spawn that never published a task record; refusing to allocate another worktree for task $id while they are unresolved" >&2
+  for pending in "${claims[@]}"; do
+    generation=$(fm_worktree_meta_exact_value "$pending" spawn_gen 2>/dev/null || true)
+    worktree=$(fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || true)
+    echo "  spawn generation ${generation:-unreadable} took ${worktree:-an unrecorded worktree}; its ownership record is $pending" >&2
+  done
+  echo "Confirm no agent is still working in each recorded worktree, remove its $FM_WORKTREE_TASK_OWNER_MARKER marker there if it still names task $id, then delete the ownership record and spawn again." >&2
+  return 1
+}
+
 # One bounded lock per live Herdr session/socket, shared across all homes.
 # <session> is required so secondmate and primary spawns serialize against the
 # same session without writing any other home's state directory.
@@ -1098,6 +1123,9 @@ if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
   exit 1
 fi
 SPAWN_TASK_LOCK_HELD=1
+if [ "$RELAUNCH" -eq 0 ]; then
+  refuse_unresolved_task_owner_pending_claims "$STATE" "$ID" || exit 1
+fi
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -2457,17 +2485,22 @@ task_worktree_owner_marker_holder() {  # <marker>
 # nothing attributes leaves only itself. Nothing here reclaims, overwrites, or
 # removes the foreign marker - the slot stays refused either way.
 report_foreign_owner_marker_remedy() {  # <marker>
-  local marker=$1 attribution owner pending
+  local marker=$1 attribution owner generation pending
   attribution=$(fm_worktree_owner_marker_attribution "$STATE" "$marker" 2>/dev/null) || attribution=
   owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
+  generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
   case "$attribution" in
     record)
       echo "Its owner marker is $marker; release that slot through task $owner's own teardown before reusing it." >&2
       ;;
     pending)
-      pending=$(fm_worktree_owner_pending_path "$STATE" "$owner")
+      pending=$(fm_worktree_owner_pending_path "$STATE" "$owner" "$generation")
       echo "Its owner marker is $marker. Task $owner has no task record: its spawn was interrupted after it took this slot, and its ownership record at $pending names this same slot and generation." >&2
       echo "No teardown exists for task $owner. Confirm no agent is still working in $WT, then remove $marker and $pending to release the slot." >&2
+      ;;
+    stale)
+      echo "Its owner marker is $marker, but task $owner's own record names a different spawn generation and a different worktree, so task $owner's teardown will never retire this marker." >&2
+      echo "Confirm no agent is still working in $WT, then remove $marker to release the slot." >&2
       ;;
     orphan)
       echo "Its owner marker is $marker, but no task record and no spawn ownership record in $STATE attributes it to any task." >&2
@@ -2546,8 +2579,8 @@ task_record_publishes_spawn_gen() {
 # slot. Its absence is success: nothing was published, or it is already gone.
 clear_task_worktree_owner_pending() {
   [ "$SPAWN_TASK_OWNER_PENDING" = 1 ] || return 0
-  fm_worktree_owner_pending_clear "$STATE" "$ID" "$SPAWN_GEN" || {
-    echo "warning: task $ID's superseded ownership record remains at $(fm_worktree_owner_pending_path "$STATE" "$ID")" >&2
+  fm_worktree_owner_pending_clear "$STATE" "$ID" "$SPAWN_GEN" "${WT:-}" || {
+    echo "warning: task $ID's superseded ownership record remains at $(fm_worktree_owner_pending_path "$STATE" "$ID" "$SPAWN_GEN")" >&2
     return 1
   }
   SPAWN_TASK_OWNER_PENDING=0

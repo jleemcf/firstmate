@@ -1486,6 +1486,17 @@ teardown_drop_task_branch() {  # <project> <task-id>
   echo "warning: could not drop task branch $branch in $project: $out" >&2
 }
 
+# The other half of the same contract: a task branch retained because this run
+# could not prove the recorded path was released is just as invisible as one
+# that failed to delete, and this record is about to stop naming it.
+teardown_report_retained_task_branch() {  # <project> <task-id> <recorded-worktree>
+  local project=$1 id=$2 worktree=$3 branch="fm/$2"
+  [ -n "$id" ] && [ -n "$project" ] && [ -d "$project" ] || return 0
+  git -C "$project" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 0
+  echo "warning: task branch $branch is retained in $project: task $id's recorded worktree ${worktree:-<missing>} is gone, so this teardown never released it and no dirty or unlanded-work gate ever inspected what that branch holds." >&2
+  echo "This record is being removed, so nothing will attribute $branch afterwards; inspect it and delete it yourself once its work is accounted for." >&2
+}
+
 validate_worktree_teardown_safety() {
   local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
   [ -d "$WT" ] || return 0
@@ -2992,9 +3003,12 @@ fi
 # did. A record whose recorded path merely no longer exists passed no such gate
 # - nothing inspected it for unpushed commits, because there was nothing to
 # inspect - so fm/<id> may still be the only place that work survives.
-if [ "$KIND" != secondmate ] \
-  && { [ "$WORKTREE_RETIRED" = 1 ] || [ "$TASK_WORKTREE_RELEASED" = 1 ]; }; then
-  teardown_drop_task_branch "$PROJ" "$ID"
+if [ "$KIND" != secondmate ]; then
+  if [ "$WORKTREE_RETIRED" = 1 ] || [ "$TASK_WORKTREE_RELEASED" = 1 ]; then
+    teardown_drop_task_branch "$PROJ" "$ID"
+  else
+    teardown_report_retained_task_branch "$PROJ" "$ID" "$WT"
+  fi
 fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
@@ -3100,7 +3114,7 @@ status_retire_presentation_task "$STATE" "$ID" || exit 1
 # leaves that record behind; the task record it was standing in for is going
 # away now, so the exact generation it named goes with it.
 fm_worktree_owner_pending_clear "$STATE" "$ID" \
-  "$(fm_worktree_meta_exact_value "$META" spawn_gen 2>/dev/null || true)" || true
+  "$(fm_worktree_meta_exact_value "$META" spawn_gen 2>/dev/null || true)" "$WT" || true
 rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

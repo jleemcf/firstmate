@@ -1695,7 +1695,11 @@ test_vanished_worktree_teardown_keeps_the_task_branch() {
     || fail "vanished-wt-branch: the surviving task branch no longer holds the crew's commit"
   assert_absent "$case_dir/state/task-x1.meta" \
     "vanished-wt-branch: the task record outlived its own teardown"
-  pass "a teardown over a vanished worktree keeps the task branch its unlanded work is on"
+  assert_grep "task branch fm/task-x1 is retained" "$case_dir/stderr" \
+    "vanished-wt-branch: the retained task branch was passed over in silence"
+  assert_grep "never released it" "$case_dir/stderr" \
+    "vanished-wt-branch: the diagnostic did not say why branch cleanup was skipped"
+  pass "a teardown over a vanished worktree keeps the task branch its unlanded work is on and says so"
 }
 
 # fm/<id> is the only ref teardown owns; whatever else the crewmate checked out
