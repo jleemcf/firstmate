@@ -871,6 +871,8 @@ worker_lane_main() { # <job-id>
 
 worker_process_once() { # <account-home>
   local account_home=$1 job id state queue_deadline home seq candidates=''
+  local reserved_index reserved_count home_reserved
+  local reserved_homes=()
   worker_reap_finished_lanes
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
     [ -d "$job" ] && [ ! -L "$job" ] || continue
@@ -882,7 +884,13 @@ worker_process_once() { # <account-home>
     case "$state" in
       queued)
         worker_lane_owns_job "$job" && continue
-        worker_clear_dead_claim "$job" || continue
+        if ! worker_clear_dead_claim "$job"; then
+          if worker_claim_owner_alive "$job"; then
+            home=$(worker_read_text "$job" home 8192 2>/dev/null || true)
+            [ -n "$home" ] && reserved_homes+=("$home")
+          fi
+          continue
+        fi
         if fm_remote_job_cancelled "$job"; then
           worker_finalize_cancelled "$account_home" "$job" || true
           continue
@@ -912,6 +920,17 @@ worker_process_once() { # <account-home>
   while IFS=$'\t' read -r seq id home; do
     [ -n "$id" ] || continue
     worker_lane_busy "$home" && continue
+    home_reserved=0
+    reserved_index=0
+    reserved_count=${#reserved_homes[@]}
+    while [ "$reserved_index" -lt "$reserved_count" ]; do
+      if [ "${reserved_homes[$reserved_index]}" = "$home" ]; then
+        home_reserved=1
+        break
+      fi
+      reserved_index=$((reserved_index + 1))
+    done
+    [ "$home_reserved" -eq 0 ] || continue
     job=$(fm_remote_job_job_dir "$id" 2>/dev/null || true)
     [ -n "$job" ] || continue
     [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = queued ] || continue
