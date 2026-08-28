@@ -1152,6 +1152,70 @@ SH
   pass "a worker's own successful stop retires the startup marker and a failed one does not"
 }
 
+# A worker can have a bridge-capable command in flight while it issues its own
+# stop - the tool call that opens a second bridge lands between the stop being
+# handed over and the launcher retiring the marker. Clearing the marker then
+# describes a bridge the stop never covered: that fresh bridge stays live while
+# both teardown passes see started=0 and skip it, which is exactly the orphan
+# this binding exists to prevent. Cleanup's reset already declines on a record
+# somebody else replaced, and the launcher's must decline the same way.
+test_launcher_stop_keeps_a_marker_written_during_the_stop() {
+  local dir id state tool bindir wrapper record
+  id=launcher-stoprace-z25
+  dir="$TMP_ROOT/launcher-stoprace"
+  rm -rf "$dir"
+  mkdir -p "$dir/state" "$dir/tool"
+  chmod 700 "$dir"
+  state="$dir/state"
+  tool="$dir/tool/chrome-devtools-axi"
+  # Stopping takes real time, and this tool spends it the way the incident did:
+  # the worker opens another bridge through its own launcher while the stop is
+  # still in flight. Driving that second bridge through the real launcher marks
+  # the binding through the real marking path, so the interleaving is the
+  # product's own and the ordering is fixed rather than raced.
+  cat > "$tool" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = stop ]; then
+  if [ -n "${FM_FAKE_TOOL_CONCURRENT_LAUNCHER:-}" ]; then
+    concurrent=$FM_FAKE_TOOL_CONCURRENT_LAUNCHER
+    FM_FAKE_TOOL_CONCURRENT_LAUNCHER= "$concurrent" navigate https://example.invalid || exit 1
+  fi
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$tool"
+
+  fm_chrome_binding_write "$state" "$id" \
+    || fail "could not write the task binding for the launcher stop-race test"
+  record="$state/$id.chrome-devtools-session"
+  bindir=$(fm_chrome_launcher_dir_create "$dir") \
+    || fail "could not mint a task-private Chrome launcher directory"
+  wrapper="$bindir/chrome-devtools-axi"
+  fm_chrome_wrapper_write "$state" "$id" "$wrapper" "$tool" \
+    || fail "could not write the task-private Chrome launcher"
+
+  "$wrapper" open https://example.invalid \
+    || fail "the task-private Chrome launcher did not delegate a bridge-starting call"
+  assert_grep 'started=1' "$record" \
+    "the launcher did not mark the binding for a bridge-starting call"
+
+  FM_FAKE_TOOL_CONCURRENT_LAUNCHER="$wrapper" "$wrapper" stop \
+    || fail "the launcher did not delegate a successful stop"
+  assert_grep 'started=1' "$record" \
+    "a stop retired a startup marker written by another invocation while it ran, so the bridge that mark describes would be skipped by teardown and orphaned"
+
+  # The declined reset is the worker's only warning that its own stop did not
+  # settle the binding, and teardown must still find a record it can read.
+  ( umask 022; "$wrapper" stop ) \
+    || fail "the launcher did not delegate a stop once no other invocation was writing the binding"
+  assert_grep 'started=0' "$record" \
+    "an uncontended self-stop failed to retire the startup marker"
+  rm -rf "$dir"
+  pass "a startup marker written during a self-stop survives that stop's reset"
+}
+
 # A send that comes back 2 means the backend typed the line into the composer and
 # could neither submit it nor clear it (bin/backends/zellij.sh, bin/backends/cmux.sh),
 # so whatever is left there gets prefixed onto the next send. Appending the launch
@@ -1181,6 +1245,7 @@ test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_task_private_launcher_forces_the_recorded_session
 test_unsubmitted_bridge_scoping_input_refuses_the_launch
 test_launcher_stop_retires_the_marker_only_when_the_tool_agrees
+test_launcher_stop_keeps_a_marker_written_during_the_stop
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path
 test_task_private_launcher_directory_is_unpredictable

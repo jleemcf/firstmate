@@ -44,7 +44,12 @@
 #   launcher clears the marker back to started=0 exactly as cleanup does, so a
 #   worker that shut its own bridge down costs teardown no browser call at all. A
 #   stop the tool reports failed leaves the marker set, so that task stays
-#   cleanup-eligible.
+#   cleanup-eligible. That reset carries cleanup's concurrency guard too: the
+#   record is stamped before the stop is handed over, and a record some other
+#   invocation replaced meanwhile - a worker that ran a bridge-capable command
+#   alongside its own stop - keeps its fresh started=1 rather than having it
+#   overwritten, because the stop that just returned says nothing about the bridge
+#   that mark describes.
 #   Every delegated command is handed to the real tool with the recorded session
 #   forced and any ambient CHROME_DEVTOOLS_AXI_PORT dropped, so the binding holds
 #   even when the pane shell's exports did not survive to the caller: a scrubbed
@@ -281,16 +286,38 @@ case "${1:-}" in
     fi
     ;;
 esac
+# The binding record's identity - inode, mtime, size. Every writer of the record
+# replaces it rather than editing in place, so a changed stamp means somebody
+# else wrote it, even when the bytes are identical.
+record_stamp() {
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%i:%m:%z' "$record" 2>/dev/null || return 1
+  else
+    stat -c '%i:%Y:%s' "$record" 2>/dev/null || return 1
+  fi
+}
 if [ "${1:-}" = stop ]; then
+  stamp_before=$(record_stamp || true)
   env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
   stop_status=$?
   if [ "$stop_status" -eq 0 ] && [ -f "$record" ] && [ ! -L "$record" ] \
     && grep -q '^started=1$' "$record" 2>/dev/null; then
-    cleared_tmp="$record.stopped.${BASHPID:-$$}"
-    if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$cleared_tmp") \
-      || ! chmod 600 -- "$cleared_tmp" || ! mv -f -- "$cleared_tmp" "$record"; then
-      rm -f -- "$cleared_tmp" 2>/dev/null || true
-      echo "chrome-devtools-axi: the task bridge binding could not be reset after this stop; teardown will re-check that session" >&2
+    # A started=1 that another invocation wrote while this stop was running
+    # describes a bridge this stop never covered. Retiring it would leave that
+    # bridge live and unowned - the orphan this whole binding exists to prevent -
+    # so an unstampable or replaced record declines the reset exactly as
+    # teardown's does, and the task stays cleanup-eligible.
+    stamp_after=$(record_stamp || true)
+    if [ -z "$stamp_before" ] || [ "$stamp_after" != "$stamp_before" ]; then
+      echo "chrome-devtools-axi: the task bridge binding was written by another invocation during this stop; leaving it marked so teardown re-checks that session" >&2
+    else
+      cleared_tmp="$record.stopped.${BASHPID:-$$}"
+      if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$cleared_tmp") \
+        || ! chmod 600 -- "$cleared_tmp" || ! mv -f -- "$cleared_tmp" "$record"; then
+        rm -f -- "$cleared_tmp" 2>/dev/null || true
+        echo "chrome-devtools-axi: the task bridge binding could not be reset after this stop; teardown will re-check that session" >&2
+      fi
     fi
   fi
   exit "$stop_status"
