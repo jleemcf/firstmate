@@ -196,6 +196,12 @@ For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved tas
 `fm-spawn.sh` also owns the base-freshness boundary for every fresh ship and scout: no worker starts until its clean task worktree matches the fetched tip of origin's resolved default branch, and any unsafe or unverifiable base stops the spawn.
 Its header owns the exact refusal mechanics, while `tests/fm-spawn-pool-base-freshen.test.sh` owns the portable regression coverage.
 
+A returned pool slot is reissued to a later task, so no cleanup, relaunch, or recovery may act on a recorded worktree it cannot still prove belongs to this task alone.
+[`bin/fm-worktree-ownership-lib.sh`](../bin/fm-worktree-ownership-lib.sh) is the single owner of that proof, and `fm-spawn.sh` writes its positive binding: a `.fm-task-owner` marker, excluded from git, naming the task id and spawn generation the worktree belongs to.
+`fm-spawn.sh --relaunch`, `fm-control.sh relaunch`, and `fm-teardown.sh` each refuse before touching the recorded path when that marker, a secondmate home's own identity marker, the Orca worktree id, the task branch, or another task's claim on the same path contradicts the record.
+`fm-teardown.sh` retires the marker together with the record's worktree claim, so a slot handed back to the pool never carries a live claim from the task that just left it.
+The library's header owns the exact bindings, the retirement ordering, and the recovery contract for an interrupted retirement.
+
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.
 The primary checkout is healthy on its default branch, and linked worktrees or secondmate homes are healthy at detached HEAD.

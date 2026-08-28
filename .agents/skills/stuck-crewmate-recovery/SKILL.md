@@ -35,7 +35,9 @@ Use `treehouse status` for treehouse-backed tmux, herdr, zellij, or cmux tasks, 
 Do not sweep another home's endpoints or infer ownership from a matching window label.
 
 Before relaunch, prove that no live agent still owns the recorded task and that the existing worktree remains available.
-`bin/fm-control.sh relaunch` and its `bin/fm-spawn.sh --relaunch` delegate enforce the shared ownership proof in `bin/fm-worktree-ownership-lib.sh`; a conflicting task claim, provider binding, task branch, or secondmate marker refuses before either path acts on the recorded worktree.
+`bin/fm-control.sh relaunch` and its `bin/fm-spawn.sh --relaunch` delegate enforce the shared ownership proof in `bin/fm-worktree-ownership-lib.sh`; a worktree whose `.fm-task-owner` marker names another task or another spawn generation, a conflicting task claim, a contradicting provider binding, a foreign task branch, or a mismatched secondmate home marker each refuse before either path acts on the recorded worktree.
+A record with no `worktree=` line has already had that claim retired, so relaunching it refuses rather than adopting a path the provider may have taken back.
+Only an interrupted retirement leaves a recoverable copy of the claim, and the refusal names it; restore that copy only after confirming with the provider that the path was never released, because a released slot may already belong to another task.
 Preserve its uncommitted changes and commits, keep the same task identity, and resume or relaunch the recorded harness in that existing worktree with the same brief plus a concise progress note.
 Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
