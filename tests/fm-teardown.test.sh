@@ -3025,14 +3025,12 @@ test_an_unstarted_task_makes_no_browser_call_at_all() {
   touch "$active_dir/$session"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    FM_FAKE_CHROME_CALL_LOG="$call_log"
-    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOP_LOG FM_FAKE_CHROME_CALL_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  FM_FAKE_CHROME_CALL_LOG="$call_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "a task with no recorded bridge start must not fail cleanup"
   assert_absent "$call_log" \
     "cleanup spent a browser call on a task whose launcher recorded no bridge start"
@@ -3106,13 +3104,11 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
 
   started=$(date +%s)
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_CHROME_BRIDGE_TIMEOUT=2
-    FM_FAKE_CHROME_CALL_LOG="$call_log"
-    export FM_FAKE_CHROME_CALL_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_CHROME_BRIDGE_TIMEOUT=2 \
+  FM_FAKE_CHROME_CALL_LOG="$call_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   elapsed=$(( $(date +%s) - started ))
 
   expect_code 0 "$rc" "a browser tool that never answers must not fail cleanup"
@@ -3160,12 +3156,10 @@ test_an_unanswered_ownership_probe_declines_the_stop() {
   stop_log="$case_dir/chrome-stop.log"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    export FM_FAKE_CHROME_STOP_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "an unanswered ownership probe must not fail cleanup"
   [ ! -s "$stop_log" ] \
     || fail "cleanup stopped a bridge without settling whether the tool scopes by session"
@@ -3218,13 +3212,11 @@ test_status_reported_on_stderr_is_understood_as_gone() {
   mkdir -p "$active_dir"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOP_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "a status reported on stderr must not fail cleanup"
   [ ! -s "$stop_log" ] \
     || fail "cleanup stopped a bridge the tool had already reported gone"
@@ -3253,13 +3245,11 @@ test_idle_shared_bridge_retires_the_marker_without_a_stop() {
   mkdir -p "$active_dir"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOP_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "an idle shared bridge must not fail cleanup"
   [ ! -s "$stop_log" ] \
     || fail "cleanup issued a stop through a tool that discards the task session"
@@ -3285,13 +3275,11 @@ test_an_unreadable_status_never_stops_a_session() {
   stop_log="$case_dir/chrome-stop.log"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_MUTE_SESSION="$session"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    export FM_FAKE_CHROME_MUTE_SESSION FM_FAKE_CHROME_STOP_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_MUTE_SESSION="$session" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "a recorded start with an unreadable status must not fail cleanup"
   [ ! -s "$stop_log" ] \
     || fail "a recorded bridge start let cleanup stop a session the tool said nothing about"
@@ -3315,10 +3303,9 @@ test_marker_reset_keeps_the_binding_record_private() {
   rc=0
   (
     umask 022
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_ACTIVE_DIR="$case_dir/chrome-active"
-    export FM_FAKE_CHROME_ACTIVE_DIR
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+    FM_FAKE_CHROME_ACTIVE_DIR="$case_dir/chrome-active" \
+    PATH="$case_dir/fakebin:$PATH" \
+      fm_chrome_bridge_cleanup "$case_dir/state" task-x1
   ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "resetting the startup marker must not fail cleanup"
   grep -q '^started=0$' "$record" || fail "cleanup did not reset the startup marker"
@@ -3404,16 +3391,13 @@ test_long_task_id_still_reclaims_its_bridge_on_a_name_bounded_host() {
   touch "$active_dir/$session"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
-    FM_FAKE_CHROME_STOPPED_DIR="$stopped_dir"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    FM_FAKE_CHROME_CALL_LOG="$call_log"
-    export FM_FAKE_CHROME_ACTIVE_DIR FM_FAKE_CHROME_STOPPED_DIR \
-      FM_FAKE_CHROME_STOP_LOG FM_FAKE_CHROME_CALL_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" "$id"
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_ACTIVE_DIR="$active_dir" \
+  FM_FAKE_CHROME_STOPPED_DIR="$stopped_dir" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  FM_FAKE_CHROME_CALL_LOG="$call_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" "$id" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "a name-bounded browser tool must not fail cleanup"
   ! grep -q 'Refusing session name' "$case_dir/stderr" \
     || fail "cleanup handed the browser tool a session name it refuses"
@@ -3443,13 +3427,11 @@ test_a_bridge_opened_during_the_status_read_keeps_its_marker() {
   stop_log="$case_dir/chrome-stop.log"
 
   rc=0
-  (
-    PATH="$case_dir/fakebin:$PATH"
-    FM_FAKE_CHROME_RACE_RECORD="$record"
-    FM_FAKE_CHROME_STOP_LOG="$stop_log"
-    export FM_FAKE_CHROME_RACE_RECORD FM_FAKE_CHROME_STOP_LOG
-    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
-  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_FAKE_CHROME_RACE_RECORD="$record" \
+  FM_FAKE_CHROME_STOP_LOG="$stop_log" \
+  PATH="$case_dir/fakebin:$PATH" \
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "a binding rewritten mid-call must not fail cleanup"
   [ ! -s "$stop_log" ] \
     || fail "cleanup stopped a session the tool had just reported gone"
