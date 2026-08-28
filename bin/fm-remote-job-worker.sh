@@ -270,6 +270,11 @@ worker_supervisor_identity_status() { # <job-dir> <pid>
   return 1
 }
 
+# A leaderless live group still belongs to the recorded execution: its PGID
+# cannot be reused while any old member survives, so it remains safe to signal.
+# A live leader whose start identity mismatches proves PID reuse and makes the
+# recorded group stale; an unreadable live leader stays indeterminate so the
+# stop loop retries rather than signaling or declaring the group dead.
 worker_group_identity_status() { # <job-dir> <pid>
   local job=$1 pid=$2 recorded_start actual_start file="$1/.claim/group_start"
   [ -e "$file" ] || [ -L "$file" ] || return 3

@@ -11,7 +11,8 @@
 # (NUL-delimited), stdin, seq, stdout, stderr, queue_deadline, timeout, and
 # state; deadline and exit are added as execution advances, cancel is an
 # optional caller-cancellation marker, and .claim may hold owner, owner_start,
-# supervisor, supervisor_start, group, and armed records while work executes.
+# supervisor, supervisor_start, group, group_start, and armed records while
+# work executes.
 # Stage writes state=queued last. seq is a queue-wide monotonic staging
 # sequence reserved atomically by its persistent .seq-claims directory; the
 # counter is only a forward-moving allocation hint. If the bounded hint walk
@@ -43,12 +44,13 @@
 #
 # A caller that disconnects before its job completes cancels it instead of
 # abandoning it: fm_remote_job_cancel writes a cancel marker into the record,
-# the worker skips a cancelled queued job, terminates a running cancelled job's
-# process group, and reaps the finalized record itself because no caller
-# remains to reap it. fm_remote_job_wait honors an optional
-# FM_REMOTE_JOB_DISCONNECT_PROBE function name: when set, the probe runs about
-# once per second, and a probe failure cancels the job and fails the wait. The
-# staging entrypoint arms it with a parent-liveness probe so an ssh channel
+# the worker skips a cancelled queued job and terminates a running cancelled
+# job's process group, and whichever side observes terminal publication reaps
+# the finalized record because no result consumer remains. fm_remote_job_wait
+# honors an optional FM_REMOTE_JOB_DISCONNECT_PROBE function name. When set,
+# the probe runs about once per second; a failure cancels the job and fails
+# the wait. The staging entrypoint arms it with a parent-liveness probe so an
+# ssh channel
 # that dies without delivering a signal still cancels the abandoned job.
 # Abandoned .stage.* staging litter older than
 # FM_REMOTE_JOB_STAGE_REAP_SECONDS is reaped by the worker's stale sweep.
@@ -586,9 +588,9 @@ fm_remote_job_cancelled() { # <job-dir>
 
 # Mark a job cancelled on behalf of a disconnected or abandoning caller. The
 # marker never rewrites state: the worker observes it, skips a cancelled queued
-# job, stops a running cancelled job's process group, and reaps the finalized
-# record itself. Cancelling a job that already completed or disappeared is a
-# harmless no-op.
+# job, and stops a running cancelled job's process group. The worker reaps after
+# terminal publication; if publication already won the race, this function
+# reaps instead. Cancelling a job that disappeared is a harmless no-op.
 fm_remote_job_cancel() { # <account-home> <id>
   local account_home=$1 id=$2 job state tmp
   fm_remote_job_prepare_state "$account_home" || return 1
