@@ -78,13 +78,21 @@
 #   nothing usable at all" - empty output, or the bound was hit (unreadable).
 #   Only inactive and present are evidence; unreadable is the absence of it.
 #
-# fm_chrome_probe_session_name <session>
-#   Mints one fresh probe name for that task's session: the task's own recorded
-#   session, which is already unique to this task and this home, plus a random
-#   nonce. It is therefore non-default, derived entirely within this task binding,
-#   never the name of a shared or default session and never able to fall back to
-#   one, and - being freshly minted - a name nothing in this fleet has ever
-#   started. It fails rather than return a name it could not make random.
+# fm_chrome_probe_session_name <task-session>
+#   Mints one fresh probe name from the task's own binding: the fmprobe- marker,
+#   half of the digest that already makes this task's session unique to this task
+#   and this home, and a random nonce. It is therefore non-default, derived
+#   entirely within this task binding, never the name of a shared or default
+#   session and never able to fall back to one, and - being freshly minted - a
+#   name nothing in this fleet has ever started. It is built from the digest
+#   rather than by extending the session because the session is already most of
+#   the name budget: session names are an argument to someone else's tool, the
+#   dispatchers this fleet meets refuse anything past
+#   FM_CHROME_SESSION_NAME_MAX, and a refused name comes back looking like an
+#   ordinary answer that is not the gone answer - which would read as a tool that
+#   fails the ownership proof rather than one that was never asked. The minted
+#   name is a fixed 41 characters whatever the task id, and the function fails
+#   rather than return a name that is too long or that it could not make random.
 #
 # fm_chrome_session_scoping_proved <session>
 #   Whether the resolved tool was shown to act on the session it is handed, by
@@ -101,11 +109,28 @@
 #   fails every time, so this reclamation is inert there. That is the deliberate
 #   trade - the only stop such a wrapper would carry out is a stop of the captain's
 #   own bridge. Task-scoped reclamation starts working on that host as soon as its
-#   wrapper passes CHROME_DEVTOOLS_AXI_SESSION through instead of pinning it.
+#   wrapper passes CHROME_DEVTOOLS_AXI_SESSION through instead of pinning it. The
+#   disclosure says what was observed - the probe was not reported gone - and
+#   offers that as the usual cause rather than asserting it, because a tool that
+#   words its unknown-session answer some other way fails the same proof for a
+#   reason the operator would fix somewhere else entirely.
 #
-# fm_chrome_binding_clear_started <state-dir> <task-id>
+# fm_chrome_binding_stamp <state-dir> <task-id>
+#   The binding record's identity as one string - inode, mtime, size. Every
+#   writer of that record replaces it rather than editing in place, so a changed
+#   stamp means somebody wrote it, even when the bytes are identical because the
+#   marker was already set.
+#
+# fm_chrome_binding_clear_started <state-dir> <task-id> <stamp-before>
 #   Resets the startup marker to 0 once the task's bridge is known gone or has
-#   been stopped, preserving the record's 0600 mode.
+#   been stopped, preserving the record's 0600 mode - but only if the record is
+#   still the same file it was when that was established. The pre-refusal cleanup
+#   runs while the worker is still live and its bounded browser call takes real
+#   time; a bridge opened inside that window leaves the marker set to the same 1
+#   it already held, so the value alone cannot say whether the answer in hand is
+#   about the bridge the record now describes. A record that moved underneath, or
+#   a stamp that could not be taken, declines the reset and leaves the task
+#   eligible for the post-exit pass, which runs once nothing can open a bridge.
 #
 # fm_chrome_bridge_cleanup <state-dir> <task-id>
 #   Reads only that task's validated binding and never targets the default or
@@ -129,6 +154,13 @@
 # at source time from BASH_SOURCE so it works whether sourced by a bin/ script
 # (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CHROME_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CHROME_LIB_DIR="."
+# The longest session name a chrome-devtools-axi may be handed. Session names are
+# an argument to someone else's tool, and the dispatchers this fleet meets refuse
+# anything longer rather than truncating - a refusal that reads as an ordinary
+# answer, which would otherwise be mistaken for the tool failing an ownership
+# proof it never got the chance to answer. Every name this library mints is kept
+# inside the budget instead.
+FM_CHROME_SESSION_NAME_MAX=64
 # fm_run_timed owns bounded execution for this repo, including the hung-grandchild
 # case a vendor CLI behind a wrapper script creates. It declares `set -u` for its
 # own hygiene, which must not leak onto this library's consumers.
@@ -139,7 +171,7 @@ case $- in *u*) _fm_chrome_nounset=on ;; *) _fm_chrome_nounset=off ;; esac
 [ "$_fm_chrome_nounset" = on ] || set +u
 
 fm_chrome_task_session_name() {  # <state-dir> <task-id>
-  local state=$1 id=$2 state_real digest prefix
+  local state=$1 id=$2 state_real digest prefix name
   state_real=$(CDPATH='' cd -- "$state" 2>/dev/null && pwd -P) || return 1
   if command -v shasum >/dev/null 2>&1; then
     digest=$(printf '%s\n%s' "$state_real" "$id" | shasum -a 256 2>/dev/null | awk '{print $1}') || return 1
@@ -152,7 +184,9 @@ fm_chrome_task_session_name() {  # <state-dir> <task-id>
     ''|*[!a-fA-F0-9]*) return 1 ;;
   esac
   prefix=${id:0:28}
-  printf 'fm-%s-%s\n' "$prefix" "${digest:0:28}"
+  name="fm-$prefix-${digest:0:28}"
+  [ "${#name}" -le "$FM_CHROME_SESSION_NAME_MAX" ] || return 1
+  printf '%s\n' "$name"
 }
 
 fm_chrome_binding_write() {  # <state-dir> <task-id>
@@ -325,18 +359,27 @@ fm_chrome_session_liveness() {  # <session>
   fi
 }
 
-fm_chrome_probe_session_name() {  # <session>
-  local session=$1 nonce
+fm_chrome_probe_session_name() {  # <task-session>
+  local session=$1 digest nonce probe
   [ -n "$session" ] && [ "$session" != default ] || return 1
-  nonce=$(od -An -N12 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+  case "$session" in fm-*-*) ;; *) return 1 ;; esac
+  digest=${session##*-}
+  case "$digest" in
+    ''|*[!a-fA-F0-9]*) return 1 ;;
+  esac
+  [ "${#digest}" -ge 16 ] || return 1
+  nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
   case "$nonce" in
-    ''|*[!a-f0-9]*) nonce=$(mktemp -u -- 'XXXXXXXXXXXXXXXX' 2>/dev/null | tr -cd 'a-zA-Z0-9' || true) ;;
+    ''|*[!a-fA-F0-9]*) nonce=$(mktemp -u -- 'XXXXXXXXXXXXXXXX' 2>/dev/null | tr -cd 'a-zA-Z0-9' || true) ;;
   esac
   case "$nonce" in
     ''|*[!a-zA-Z0-9]*) return 1 ;;
   esac
-  [ "${#nonce}" -ge 8 ] || return 1
-  printf '%s-probe-%s\n' "$session" "$nonce"
+  [ "${#nonce}" -ge 16 ] || return 1
+  probe="fmprobe-${digest:0:16}-${nonce:0:16}"
+  [ "${#probe}" -le "$FM_CHROME_SESSION_NAME_MAX" ] || return 1
+  [ "$probe" != "$session" ] && [ "$probe" != default ] || return 1
+  printf '%s\n' "$probe"
 }
 
 fm_chrome_session_scoping_proved() {  # <session>
@@ -344,15 +387,34 @@ fm_chrome_session_scoping_proved() {  # <session>
   [ -n "$session" ] && [ "$session" != default ] || return 1
   probe=$(fm_chrome_probe_session_name "$session") || return 1
   [ -n "$probe" ] && [ "$probe" != "$session" ] && [ "$probe" != default ] || return 1
-  case "$probe" in "$session"-probe-?*) ;; *) return 1 ;; esac
+  case "$probe" in fmprobe-?*-?*) ;; *) return 1 ;; esac
+  [ "${#probe}" -le "$FM_CHROME_SESSION_NAME_MAX" ] || return 1
   [ "$(fm_chrome_session_liveness "$probe")" = inactive ] || return 1
   return 0
 }
 
-fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
-  local state=$1 id=$2 record tmp
+fm_chrome_binding_stamp() {  # <state-dir> <task-id>
+  local record="$1/$2.chrome-devtools-session"
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%i:%m:%z' "$record" 2>/dev/null || return 1
+  else
+    stat -c '%i:%Y:%s' "$record" 2>/dev/null || return 1
+  fi
+}
+
+fm_chrome_binding_clear_started() {  # <state-dir> <task-id> <stamp-before>
+  local state=$1 id=$2 expected=${3:-} record tmp current
   record="$state/$id.chrome-devtools-session"
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
+  # The marker cannot be retired on the strength of an answer fetched before the
+  # worker's last chance to open a bridge. Every writer of this record replaces
+  # it, so a record that is not byte-for-byte the same file it was when the
+  # question was asked may already be a fresh start, and the answer in hand says
+  # nothing about that bridge. Declining leaves the task cleanup-eligible for the
+  # post-exit pass, which runs when nothing can open one any more.
+  current=$(fm_chrome_binding_stamp "$state" "$id") || return 0
+  [ -n "$expected" ] && [ "$current" = "$expected" ] || return 0
   grep -q '^started=1$' "$record" 2>/dev/null || return 0
   tmp="$record.cleanup.${BASHPID:-$$}"
   if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$tmp") \
@@ -364,7 +426,7 @@ fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
 }
 
 fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
-  local state=$1 id=$2 record session started expected liveness
+  local state=$1 id=$2 record session started expected liveness stamp
   record="$state/$id.chrome-devtools-session"
   [ -e "$record" ] || [ -L "$record" ] || return 0
   if [ ! -f "$record" ] || [ -L "$record" ]; then
@@ -397,9 +459,10 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
     echo "warning: chrome-devtools-axi is unavailable; task $id bridge cleanup was skipped" >&2
     return 0
   fi
+  stamp=$(fm_chrome_binding_stamp "$state" "$id" || true)
   liveness=$(fm_chrome_session_liveness "$session")
   if [ "$liveness" = inactive ]; then
-    fm_chrome_binding_clear_started "$state" "$id" \
+    fm_chrome_binding_clear_started "$state" "$id" "$stamp" \
       || echo "warning: chrome-devtools bridge for task $id is already gone, but its binding could not be reset" >&2
     return 0
   fi
@@ -408,14 +471,14 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
     return 0
   fi
   if ! fm_chrome_session_scoping_proved "$session"; then
-    echo "warning: chrome-devtools-axi did not prove it acts on the session it is handed for task $id, so no stop was issued for session $session and no shared bridge was disturbed; task-scoped bridge reclamation stays inert here until the resolved chrome-devtools-axi is shown to pass CHROME_DEVTOOLS_AXI_SESSION through" >&2
+    echo "warning: chrome-devtools-axi did not report a session name nothing has ever started as gone, so it is not established that it acts on the session it is handed; no stop was issued for task $id session $session and no shared bridge was disturbed. Task-scoped bridge reclamation stays inert until that probe answers, which usually means the resolved chrome-devtools-axi must pass CHROME_DEVTOOLS_AXI_SESSION through to the real tool" >&2
     return 0
   fi
   if ! fm_chrome_axi_run "$session" stop >/dev/null 2>&1; then
     echo "warning: chrome-devtools bridge stop failed for task $id session $session; teardown will continue" >&2
     return 0
   fi
-  fm_chrome_binding_clear_started "$state" "$id" \
+  fm_chrome_binding_clear_started "$state" "$id" "$stamp" \
     || echo "warning: chrome-devtools bridge stopped for task $id, but its binding could not be reset" >&2
   return 0
 }
