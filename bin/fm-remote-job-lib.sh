@@ -14,8 +14,11 @@
 # supervisor, supervisor_start, group, and armed records while work executes.
 # Stage writes state=queued last. seq is a queue-wide monotonic staging
 # sequence reserved atomically by its persistent .seq-claims directory; the
-# counter is only a forward-moving allocation hint. seq is the worker's FIFO
-# ordering key within a home, with the job id as the deterministic tiebreak.
+# counter is only a forward-moving allocation hint. If the bounded hint walk
+# is exhausted, allocation rescans the claims for the maximum and continues
+# above it. Expired claims are reaped by an independently hourly-rate-limited
+# sweep. seq is the worker's FIFO ordering key within a home, with the job id
+# as the deterministic tiebreak.
 # FIFO is defined over completed stagings: a stage that returns before another
 # begins executes first; concurrently overlapping stagings have no relative
 # ordering contract.

@@ -275,7 +275,8 @@ worker_group_identity_status() { # <job-dir> <pid>
   [ -e "$file" ] || [ -L "$file" ] || return 3
   recorded_start=$(fm_remote_job_read_single_line "$file" 256 2>/dev/null) || return 2
   actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || {
-    worker_process_or_group_alive group "$pid" && return 2
+    kill -0 "$pid" 2>/dev/null && return 2
+    worker_process_or_group_alive group "$pid" && return 0
     return 1
   }
   [ "$recorded_start" = "$actual_start" ] && return 0
@@ -335,7 +336,11 @@ worker_stop_recorded_execution() { # <job-dir>
       case "$kind" in process) file="$job/.claim/supervisor" ;; group) file="$job/.claim/group" ;; esac
       [ -e "$file" ] || continue
       pid=$(worker_read_process_id "$file") || return 1
-      worker_recorded_execution_alive "$job" "$kind" "$pid" && still_alive=1
+      if worker_recorded_execution_alive "$job" "$kind" "$pid"; then
+        still_alive=1
+        worker_signal_recorded_execution "$job" "$kind" TERM "$pid"
+        worker_signal_recorded_execution "$job" "$kind" KILL "$pid"
+      fi
     done
     [ "$still_alive" -eq 1 ] || break
     sleep 0.01
@@ -505,7 +510,7 @@ worker_read_text() { # <job-dir> <field> <max>
 }
 
 worker_publish_result() { # <job-dir> <exit>
-  local job=$1 exit_status=$2 tmp
+  local job=$1 exit_status=$2 tmp account_home
   case "$exit_status" in ''|*[!0-9]*) exit_status=125 ;; esac
   [ "$exit_status" -le 255 ] || exit_status=125
   for tmp in stdout stderr; do
@@ -515,7 +520,13 @@ worker_publish_result() { # <job-dir> <exit>
   printf '%s\n' "$exit_status" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv -f -- "$tmp" "$job/exit" || { rm -f -- "$tmp"; return 1; }
-  fm_remote_job_write_state "$job" 'done'
+  fm_remote_job_write_state "$job" 'done' || return 1
+  if fm_remote_job_cancelled "$job"; then
+    account_home=$(worker_account_home 2>/dev/null || true)
+    if [ -n "$account_home" ]; then
+      fm_remote_job_reap "$account_home" "${job##*/}" 2>/dev/null || true
+    fi
+  fi
 }
 
 worker_run_with_timeout() { # <job-dir> <seconds> <command> [args...]
