@@ -7,9 +7,12 @@
 # isolated tests), the bounded job record, worker installation, and the remote
 # runtime PATH.
 #
-# A job directory is mode 0700 and contains root, home, argv (NUL-delimited),
-# stdin, seq, stdout, stderr, queue_deadline, timeout, deadline, exit, and
-# state. Stage writes state=queued last. seq is a queue-wide monotonic staging
+# A published job directory is mode 0700 and contains root, home, argv
+# (NUL-delimited), stdin, seq, stdout, stderr, queue_deadline, timeout, and
+# state; deadline and exit are added as execution advances, cancel is an
+# optional caller-cancellation marker, and .claim may hold owner, owner_start,
+# supervisor, supervisor_start, group, and armed records while work executes.
+# Stage writes state=queued last. seq is a queue-wide monotonic staging
 # sequence reserved atomically by its persistent .seq-claims directory; the
 # counter is only a forward-moving allocation hint. seq is the worker's FIFO
 # ordering key within a home, with the job id as the deterministic tiebreak.

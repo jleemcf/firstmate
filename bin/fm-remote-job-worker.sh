@@ -15,17 +15,12 @@
 # have been committed. The library header owns the exact record fields and
 # lifecycle.
 #
-# The serving loop runs one lane per staged home: each queued job's home field
-# selects its lane, jobs within a lane execute strictly FIFO in staging-seq
-# order (job id as the deterministic tiebreak), and lanes execute concurrently
-# as background lane processes tracked by the serving loop, so one home's long
-# job never delays another home's commands. Each lane process claims its job,
-# records itself as the claim's supervisor, and runs it to publication;
-# shutdown stops every tracked lane and its recorded command group, leaving the
-# interrupted records for the replacement worker's orphan recovery. A job
-# carrying the library's cancel marker is skipped when still queued, has its
-# process group terminated when running, and is reaped by the worker itself
-# because its disconnected caller cannot reap it.
+# The shared library header owns lane selection, FIFO, and caller-cancellation
+# contracts. This serving loop implements each active lane as a tracked,
+# top-level --lane process that claims one job, records itself as the claim's
+# supervisor, and runs it to publication. Shutdown stops every tracked lane and
+# its recorded command group, leaving interrupted records for the replacement
+# worker's orphan recovery.
 #
 # The worker is abandoned when its configured FM_ROOT stops being a genuine
 # Firstmate checkout - the state a pruned no-mistakes gate worktree, a returned

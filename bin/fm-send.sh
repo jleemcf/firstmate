@@ -132,8 +132,9 @@
 # and makes a later remote enqueue deduplicate onto that same record. An
 # unconfirmed fire-and-forget request exits 3 and names the same delivery id to
 # retry. Every remote transport attempt is bounded by FM_SEND_REMOTE_BUDGET
-# seconds (default 30): a bound hit is completion-unknown and exits through
-# this same unconfirmed contract instead of waiting out a busy remote queue.
+# seconds (default 30, and any override must be a positive integer): a bound
+# hit is completion-unknown and exits through this same unconfirmed contract
+# instead of waiting out a busy remote queue.
 # The remote host runs no re-ring ladder of its own: a swallowed ordinary
 # doorbell surfaces through the parent's pending-reply recovery and escalation,
 # whose recovery request re-rings the remote doorbell when it is enqueued;
