@@ -71,6 +71,7 @@ WORKER_PREEMPTED=0
 WORKER_LANE_HOME=
 WORKER_LANE_HOMES=()
 WORKER_LANE_PIDS=()
+WORKER_LANE_STARTS=()
 WORKER_LANE_JOBS=()
 
 worker_error() { printf 'remote-job-worker: %s\n' "$1" >&2; }
@@ -330,13 +331,21 @@ worker_stop_recorded_execution() { # <job-dir>
 # recorded supervisor and group are verified stopped; a job interrupted here
 # stays running-with-a-dead-owner for the replacement worker's orphan recovery,
 # exactly as a crashed single-process worker's job did.
+worker_lane_identity_matches() { # <pid> <start>
+  local pid=$1 start=$2 actual_start
+  [ -n "$start" ] || return 1
+  actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || return 1
+  [ "$actual_start" = "$start" ]
+}
+
 worker_stop_active_execution() {
-  local i=0 count=${#WORKER_LANE_PIDS[@]} job pid failed=0
+  local i=0 count=${#WORKER_LANE_PIDS[@]} job pid start failed=0
   while [ "$i" -lt "$count" ]; do
     pid=${WORKER_LANE_PIDS[$i]}
+    start=${WORKER_LANE_STARTS[$i]}
     job=${WORKER_LANE_JOBS[$i]}
-    kill -TERM "$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
+    if worker_lane_identity_matches "$pid" "$start"; then kill -TERM "$pid" 2>/dev/null || true; fi
+    if worker_lane_identity_matches "$pid" "$start"; then kill -KILL "$pid" 2>/dev/null || true; fi
     wait "$pid" 2>/dev/null || true
     if [ -d "$job" ] && [ ! -L "$job" ]; then
       worker_stop_recorded_execution "$job" || failed=1
@@ -345,6 +354,7 @@ worker_stop_active_execution() {
   done
   WORKER_LANE_HOMES=()
   WORKER_LANE_PIDS=()
+  WORKER_LANE_STARTS=()
   WORKER_LANE_JOBS=()
   [ "$failed" -eq 0 ]
 }
@@ -388,21 +398,40 @@ worker_exit_cleanup() {
 }
 
 worker_claim() { # <job-dir>
-  local job=$1 claim
+  local job=$1 claim pid start pid_tmp start_tmp
   claim="$job/.claim"
   [ ! -e "$claim" ] && [ ! -L "$claim" ] || return 1
   (umask 077; mkdir "$claim") || return 1
-  printf '%s\n' "${BASHPID:-$$}" > "$claim/owner" || { rmdir "$claim" 2>/dev/null || true; return 1; }
-  chmod 600 "$claim/owner" || { rm -f -- "$claim/owner"; rmdir "$claim" 2>/dev/null || true; return 1; }
+  pid=${BASHPID:-$$}
+  start=$(fm_remote_job_process_start "$pid") || { rmdir "$claim" 2>/dev/null || true; return 1; }
+  pid_tmp=$(umask 077; mktemp "$claim/.owner.XXXXXX") || { rmdir "$claim" 2>/dev/null || true; return 1; }
+  start_tmp=$(umask 077; mktemp "$claim/.owner_start.XXXXXX") || {
+    rm -f -- "$pid_tmp"
+    rmdir "$claim" 2>/dev/null || true
+    return 1
+  }
+  if ! printf '%s\n' "$pid" > "$pid_tmp" || ! printf '%s\n' "$start" > "$start_tmp" \
+    || ! chmod 600 "$pid_tmp" "$start_tmp" || ! mv -f -- "$start_tmp" "$claim/owner_start" \
+    || ! mv -f -- "$pid_tmp" "$claim/owner"; then
+    rm -f -- "$pid_tmp" "$start_tmp" "$claim/owner" "$claim/owner_start"
+    rmdir "$claim" 2>/dev/null || true
+    return 1
+  fi
 }
 
 worker_claim_owner_alive() { # <job-dir>
-  local job=$1 claim="$1/.claim" owner pid
+  local job=$1 claim="$1/.claim" owner pid recorded_start actual_start
   [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   owner="$claim/owner"
   fm_remote_job_regular_bounded "$owner" 64 || return 1
   pid=$(tr -d '\n' < "$owner")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -e "$claim/owner_start" ] || [ -L "$claim/owner_start" ]; then
+    recorded_start=$(fm_remote_job_read_single_line "$claim/owner_start" 256 2>/dev/null) || return 1
+    actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || return 1
+    [ "$recorded_start" = "$actual_start" ]
+    return
+  fi
   kill -0 "$pid" 2>/dev/null
 }
 
@@ -412,8 +441,8 @@ worker_clear_dead_claim() { # <job-dir>
   worker_claim_owner_alive "$job" && return 1
   [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   [ ! -e "$claim/owner" ] || [ ! -L "$claim/owner" ] || return 1
-  rm -f -- "$claim/owner" "$claim/supervisor" "$claim/supervisor_start" \
-    "$claim/group" "$claim/armed" || return 1
+  rm -f -- "$claim/owner" "$claim/owner_start" "$claim/supervisor" \
+    "$claim/supervisor_start" "$claim/group" "$claim/armed" || return 1
   rmdir "$claim"
 }
 
@@ -730,13 +759,15 @@ worker_lane_owns_job() { # <job-dir>
 }
 
 worker_reap_finished_lanes() {
-  local i=0 count=${#WORKER_LANE_PIDS[@]} pid
-  local live_homes=() live_pids=() live_jobs=()
+  local i=0 count=${#WORKER_LANE_PIDS[@]} pid start
+  local live_homes=() live_pids=() live_starts=() live_jobs=()
   while [ "$i" -lt "$count" ]; do
     pid=${WORKER_LANE_PIDS[$i]}
-    if kill -0 "$pid" 2>/dev/null; then
+    start=${WORKER_LANE_STARTS[$i]}
+    if worker_lane_identity_matches "$pid" "$start"; then
       live_homes+=("${WORKER_LANE_HOMES[$i]}")
       live_pids+=("$pid")
+      live_starts+=("$start")
       live_jobs+=("${WORKER_LANE_JOBS[$i]}")
     else
       wait "$pid" 2>/dev/null || true
@@ -745,12 +776,14 @@ worker_reap_finished_lanes() {
   done
   WORKER_LANE_HOMES=()
   WORKER_LANE_PIDS=()
+  WORKER_LANE_STARTS=()
   WORKER_LANE_JOBS=()
   i=0
   count=${#live_pids[@]}
   while [ "$i" -lt "$count" ]; do
     WORKER_LANE_HOMES+=("${live_homes[$i]}")
     WORKER_LANE_PIDS+=("${live_pids[$i]}")
+    WORKER_LANE_STARTS+=("${live_starts[$i]}")
     WORKER_LANE_JOBS+=("${live_jobs[$i]}")
     i=$((i + 1))
   done
@@ -821,11 +854,13 @@ worker_lane_execute() { # <account-home> <job-dir>
 # until the job deadline. A top-level shell is the context the monitor loop
 # has always run in.
 worker_start_lane() { # <job-dir> <home>
-  local job=$1 home=$2 lane_pid
+  local job=$1 home=$2 lane_pid lane_start
   "$SCRIPT_DIR/fm-remote-job-worker.sh" --lane "${job##*/}" &
   lane_pid=$!
+  lane_start=$(fm_remote_job_process_start "$lane_pid" 2>/dev/null || true)
   WORKER_LANE_HOMES+=("$home")
   WORKER_LANE_PIDS+=("$lane_pid")
+  WORKER_LANE_STARTS+=("$lane_start")
   WORKER_LANE_JOBS+=("$job")
 }
 
