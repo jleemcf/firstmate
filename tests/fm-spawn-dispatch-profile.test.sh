@@ -1107,6 +1107,10 @@ SH
   ( umask 022; "$wrapper" stop ) || fail "the launcher did not delegate a successful stop"
   assert_grep 'started=0' "$record" \
     "a bridge the worker stopped itself still reads as a recorded start teardown must explain"
+
+  "$wrapper" || fail "the launcher did not delegate a bare invocation"
+  assert_grep 'started=1' "$record" \
+    "the launcher exempted a command from marking on a guess about which verbs open a bridge"
   if [ "$(uname)" = Darwin ]; then
     mode=$(stat -f %Lp "$record" 2>/dev/null)
   else

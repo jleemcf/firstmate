@@ -95,16 +95,17 @@
 #
 # Task-scoped external cleanup runs immediately after endpoint authorization:
 # the named chrome-devtools-axi bridge may live on a browser host outside the
-# worktree process tree, so teardown reads state/<id>.chrome-devtools-session,
-# confirms the exact task-derived name, and asks the tool to stop only that active
-# named session - and only once that tool has proved on this host that it acts on
-# the session it is handed, so a wrapper or inherited port that redirects every
-# invocation onto one shared bridge is reported instead of obeyed. Each browser
-# call is bounded, so an unresponsive bridge cannot stall teardown. This
+# worktree process tree, so teardown reads state/<id>.chrome-devtools-session and
+# confirms the exact task-derived name. Only a task whose own launcher recorded
+# opening a bridge is asked about at all - an unused task costs no browser call -
+# and a stop is issued only for a session the tool reports as something other
+# than gone, and only once that same tool has answered "gone" for a freshly
+# minted name nothing ever started, so a wrapper or inherited port that redirects
+# every invocation onto one shared bridge is reported instead of obeyed. Each
+# browser call is bounded, so an unresponsive bridge cannot stall teardown. This
 # best-effort cleanup precedes landed-work checks so a refusal cannot strand the
-# bridge; an inactive session causes no stop call. Teardown checks again after
-# worker exit to close the last-start race, while the captain's browser is never
-# closed.
+# bridge. Teardown checks again after worker exit to close the last-start race,
+# while the captain's browser is never closed.
 #
 # The remaining pre-teardown cleanup sequence runs once every landed/discard-work
 # safety refusal above has already passed, and BEFORE any worktree return, branch

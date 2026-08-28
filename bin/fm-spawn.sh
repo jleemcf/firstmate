@@ -2897,7 +2897,17 @@ if [ "$KIND" != secondmate ]; then
         echo "warning: chrome-devtools-axi is unavailable; $ID keeps its task-scoped bridge session without a task-private launcher" >&2
         ;;
     esac
-    spawn_send_text_line "$T" "$CHROME_DEVTOOLS_AXI_EXPORTS"
+    # Same composer window as the TRACEPARENT send below, so the same rule: a
+    # status of 2 left this line typed but unsubmitted, and appending the launch
+    # command would run the two concatenated.
+    if ! spawn_send_text_line "$T" "$CHROME_DEVTOOLS_AXI_EXPORTS"; then
+      CHROME_SEND_STATUS=$?
+      if [ "$CHROME_SEND_STATUS" -eq 2 ]; then
+        echo "error: chrome-devtools bridge scoping input could not be cleared for $W; refusing to append the launch command" >&2
+        exit 1
+      fi
+      echo "warning: the task-scoped chrome-devtools bridge session could not be delivered to $ID; this task will not isolate a browser bridge" >&2
+    fi
   fi
 fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
