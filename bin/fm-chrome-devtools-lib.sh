@@ -27,6 +27,13 @@
 #   Writes a task-private chrome-devtools-axi launcher. Before any browser action
 #   can auto-start the bridge, the launcher atomically changes started=0 to
 #   started=1. Read-only home/help/version and setup/stop commands do not mark it.
+#   Every delegated command - marking or not - is then handed to the real tool
+#   with the recorded session forced and any ambient CHROME_DEVTOOLS_AXI_PORT
+#   dropped, so the binding holds even when the pane shell's exports did not
+#   survive to the caller: a scrubbed environment, a nested shell, or an rc file
+#   that re-exports the port can no longer put a marked task's bridge on the
+#   captain's shared session. The launcher refuses to be written at all unless the
+#   session it would force is the one already recorded for the task.
 #   The launcher becomes the first entry on the worker's PATH, so it is written
 #   only into a directory this user owns that no one else can write, and both the
 #   directory and its parent are checked: the task temp root is a predictable
@@ -50,15 +57,18 @@
 #   about this name that was not the gone answer" (present) from "the tool said
 #   nothing usable at all" - empty output, or the bound was hit (unreadable).
 #   That distinction is the difference between evidence a bridge exists under this
-#   exact name and no evidence either way, which is what decides whether the
-#   recorded startup marker is needed to justify a stop.
+#   exact name and no evidence either way, and no evidence ever warrants a stop.
 #
-# fm_chrome_session_is_owned <session>
+# fm_chrome_ownership_evidence <session>
 #   Proof, not assumption, that the resolved tool acts on the session it is
-#   given: a sibling probe session this fleet never starts must read inactive.
-#   A PATH shim that rewrites every invocation onto one shared bridge, or an
-#   inherited port that pins every invocation to one bridge, answers active or
-#   unrecognized for that unused name and fails the proof.
+#   given: a sibling probe session this fleet never starts must read inactive,
+#   and only that answer clears a stop. A PATH shim that rewrites every
+#   invocation onto one shared bridge, or an inherited port that pins every
+#   invocation to one bridge, answers active or unrecognized for that unused name
+#   and fails the proof. This prints the probe's own liveness rather than a
+#   verdict so callers can tell that failure - a tool that demonstrably pins every
+#   call to one bridge - apart from a probe that answered nothing readable at all,
+#   which establishes neither and must not be reported as a property of the host.
 #   Consequence worth stating plainly: on a host whose resolved chrome-devtools-axi
 #   is such a wrapper - one that hardcodes a single shared session name for every
 #   call - the proof fails every time, so this reclamation is inert there. That is
@@ -84,18 +94,21 @@
 #   own derived name - which a task that never started one cannot have - so it
 #   reaches the stop whether or not the launcher marked the start; that is what
 #   reclaims a bridge the worker opened around the launcher. An unreadable answer
-#   is no evidence at all, so it reaches the stop only when the task-private
-#   launcher recorded a start: the marker is the sole warrant for stopping a
-#   session the tool will not talk about, and without it no stop call is made.
+#   is no evidence at all, so it never reaches a stop, marker or no marker: a
+#   recorded start says a bridge was opened under this name, not that one is
+#   running now, and a bounded-out or silent tool could equally be a session-blind
+#   dispatcher answering for the captain's own bridge. The marker still decides
+#   what is said - an unreclaimed bridge may be left behind, and that is reported.
 #   Every stop still passes the ownership proof, which itself needs a confident
 #   inactive on a never-used probe name. That pairing is the whole warrant for
 #   acting: the same tool answers "gone" for a name nobody started and something
 #   else for this task's name. A tool that cannot produce that pair - one that
 #   pins every call to one bridge, or whose answers cannot be read at all - never
 #   reaches a stop, so the captain's own bridge is never the thing that gets
-#   stopped. Missing bindings are no-ops, missing tools, unproved ownership,
-#   unreadable answers, and stop errors warn but remain non-fatal, and callers own
-#   record retirement.
+#   stopped, and the two are reported apart because only the first is a standing
+#   property of the host. Missing bindings are no-ops, missing tools, unproved
+#   ownership, unreadable answers, and stop errors warn but remain non-fatal, and
+#   callers own record retirement.
 
 # Directory of this library, used to locate the sibling bounded runner. Resolved
 # at source time from BASH_SOURCE so it works whether sourced by a bin/ script
@@ -183,9 +196,13 @@ fm_chrome_launcher_dir_create() {  # <parent-dir>
 }
 
 fm_chrome_wrapper_write() {  # <state-dir> <task-id> <wrapper-path> <real-tool>
-  local state=$1 id=$2 wrapper=$3 tool=$4 record tmp old_umask wrapper_dir
+  local state=$1 id=$2 wrapper=$3 tool=$4 record tmp old_umask wrapper_dir session recorded
   record="$state/$id.chrome-devtools-session"
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  session=$(fm_chrome_task_session_name "$state" "$id") || return 1
+  [ -n "$session" ] && [ "$session" != default ] || return 1
+  recorded=$(sed -n 's/^session=//p' "$record" 2>/dev/null || true)
+  [ "$recorded" = "$session" ] || return 1
   case "$tool" in /*) ;; *) return 1 ;; esac
   [ -x "$tool" ] || return 1
   wrapper_dir=$(dirname -- "$wrapper") || return 1
@@ -199,6 +216,7 @@ fm_chrome_wrapper_write() {  # <state-dir> <task-id> <wrapper-path> <real-tool>
     printf '%s\n' '#!/usr/bin/env bash' 'set -u'
     printf 'record=%q\n' "$record"
     printf 'tool=%q\n' "$tool"
+    printf 'session=%q\n' "$session"
     cat <<'SH'
 case "${1:-}" in
   ''|-h|--help|-v|-V|--version|setup|stop) ;;
@@ -220,7 +238,7 @@ case "${1:-}" in
     fi
     ;;
 esac
-exec "$tool" ${1+"$@"}
+exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
 SH
   } > "$tmp" || ! chmod 700 "$tmp" || ! mv -f -- "$tmp" "$wrapper"; then
     rm -f -- "$tmp" 2>/dev/null || true
@@ -262,12 +280,14 @@ fm_chrome_probe_session_name() {  # <session>
   printf 'fmprobe-%s\n' "${1#fm-}"
 }
 
-fm_chrome_session_is_owned() {  # <session>
+fm_chrome_ownership_evidence() {  # <session>
   local session=$1 probe
-  probe=$(fm_chrome_probe_session_name "$session") || return 1
-  [ -n "$probe" ] && [ "$probe" != "$session" ] && [ "$probe" != default ] || return 1
-  [ "$(fm_chrome_session_liveness "$probe")" = inactive ] || return 1
-  return 0
+  probe=$(fm_chrome_probe_session_name "$session" 2>/dev/null || true)
+  if [ -z "$probe" ] || [ "$probe" = "$session" ] || [ "$probe" = default ]; then
+    printf 'unreadable\n'
+    return 0
+  fi
+  fm_chrome_session_liveness "$probe"
 }
 
 fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
@@ -285,7 +305,7 @@ fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
 }
 
 fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
-  local state=$1 id=$2 record session started expected liveness
+  local state=$1 id=$2 record session started expected liveness proof
   record="$state/$id.chrome-devtools-session"
   [ -e "$record" ] || [ -L "$record" ] || return 0
   if [ ! -f "$record" ] || [ -L "$record" ]; then
@@ -319,7 +339,8 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
   # The marker only covers bridges opened through the task-private launcher. Ask
   # the tool about this exact session so a bridge started around the launcher is
   # still stopped, so an already-stopped session raises no false failure, and so
-  # the marker is consulted only where the tool itself says nothing usable.
+  # every stop rests on what the tool said about this name rather than on a
+  # record of what happened earlier.
   liveness=$(fm_chrome_session_liveness "$session")
   if [ "$liveness" = inactive ]; then
     # A tool that pins every call to one shared bridge says exactly this, for any
@@ -335,11 +356,20 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
       || echo "warning: chrome-devtools bridge for task $id is already gone, but its binding could not be reset" >&2
     return 0
   fi
-  if [ "$liveness" = unreadable ] && [ "$started" != 1 ]; then
-    echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
+  if [ "$liveness" = unreadable ]; then
+    if [ "$started" = 1 ]; then
+      echo "warning: chrome-devtools-axi returned no readable status for task $id session $session, so no stop was issued; that task's launcher did record a bridge start, so a bridge may still be running under that session and needs reclaiming by hand" >&2
+    else
+      echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
+    fi
     return 0
   fi
-  if ! fm_chrome_session_is_owned "$session"; then
+  proof=$(fm_chrome_ownership_evidence "$session")
+  if [ "$proof" = unreadable ]; then
+    echo "warning: chrome-devtools-axi returned no readable status for the ownership probe on task $id, so nothing was established about whether it scopes bridges by session; skipping the bridge stop for session $session" >&2
+    return 0
+  fi
+  if [ "$proof" != inactive ]; then
     echo "warning: chrome-devtools-axi does not act on the task-scoped session for task $id; skipping the bridge stop for session $session so no shared bridge is disturbed. Task-scoped bridge reclamation is inert on this host until chrome-devtools-axi passes CHROME_DEVTOOLS_AXI_SESSION through" >&2
     return 0
   fi

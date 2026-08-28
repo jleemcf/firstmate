@@ -1002,7 +1002,68 @@ test_task_private_launcher_directory_is_unpredictable() {
   pass "the task-private Chrome launcher directory is minted unpredictably inside a verified private root"
 }
 
+# The pane-shell exports that scope a worker's browser calls are sent once, at
+# spawn. Anything the worker runs whose environment did not survive - a nested
+# shell, an rc file that re-exports CHROME_DEVTOOLS_AXI_PORT, a subprocess
+# launched with a scrubbed env - would otherwise mark this task's binding started
+# and then open the bridge on the captain's default session, orphaning it exactly
+# as the incident did. The launcher is on that execution path whatever the
+# environment, so it must carry the binding itself rather than merely record it.
+test_task_private_launcher_forces_the_recorded_session() {
+  local dir id state tool envlog bindir wrapper session record
+  id=launcher-binding-z23
+  dir="$TMP_ROOT/launcher-binding"
+  rm -rf "$dir"
+  mkdir -p "$dir/state" "$dir/tool"
+  chmod 700 "$dir"
+  state="$dir/state"
+  envlog="$dir/tool-env.log"
+  tool="$dir/tool/chrome-devtools-axi"
+  cat > "$tool" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'session=%s port=%s args=%s\n' \
+  "${CHROME_DEVTOOLS_AXI_SESSION:-unset}" "${CHROME_DEVTOOLS_AXI_PORT:-unset}" "$*" \
+  >> "$FM_FAKE_TOOL_ENV_LOG"
+SH
+  chmod +x "$tool"
+
+  fm_chrome_binding_write "$state" "$id" \
+    || fail "could not write the task binding for the launcher test"
+  session=$FM_CHROME_TASK_SESSION
+  record="$state/$id.chrome-devtools-session"
+  bindir=$(fm_chrome_launcher_dir_create "$dir") \
+    || fail "could not mint a task-private Chrome launcher directory"
+  wrapper="$bindir/chrome-devtools-axi"
+  fm_chrome_wrapper_write "$state" "$id" "$wrapper" "$tool" \
+    || fail "could not write the task-private Chrome launcher"
+
+  env -i "PATH=$PATH" "FM_FAKE_TOOL_ENV_LOG=$envlog" \
+    CHROME_DEVTOOLS_AXI_SESSION=default CHROME_DEVTOOLS_AXI_PORT=9333 \
+    "$wrapper" pages \
+    || fail "the task-private Chrome launcher did not delegate to the real tool"
+  assert_grep "session=$session port=unset args=pages" "$envlog" \
+    "a bridge-starting call escaped the recorded task session or kept an inherited bridge port"
+  assert_grep 'started=1' "$record" \
+    "the launcher did not mark the binding for a bridge-starting call"
+
+  env -i "PATH=$PATH" "FM_FAKE_TOOL_ENV_LOG=$envlog" \
+    CHROME_DEVTOOLS_AXI_SESSION=default CHROME_DEVTOOLS_AXI_PORT=9333 \
+    "$wrapper" stop \
+    || fail "the task-private Chrome launcher did not delegate a stop to the real tool"
+  assert_grep "session=$session port=unset args=stop" "$envlog" \
+    "a worker stop escaped the recorded task session and could close the captain's bridge"
+
+  sed 's/^session=.*/session=captain-shared/' "$record" > "$record.forged"
+  mv "$record.forged" "$record"
+  ! fm_chrome_wrapper_write "$state" "$id" "$wrapper" "$tool" >/dev/null 2>&1 \
+    || fail "the launcher was written to force a session the task binding does not record"
+  rm -rf "$dir"
+  pass "the task-private Chrome launcher forces the recorded session and drops an inherited bridge port"
+}
+
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
+test_task_private_launcher_forces_the_recorded_session
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path
 test_task_private_launcher_directory_is_unpredictable

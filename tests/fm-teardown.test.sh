@@ -706,6 +706,30 @@ SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
 }
 
+# A tool that reports plainly about the task's own session but says nothing at
+# all about the never-started probe name. The ownership proof cannot be settled
+# either way: this is not evidence the tool pins every call to one shared bridge.
+install_probe_mute_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+case "${1:-}" in
+  '')
+    case "$session" in
+      fmprobe-*) exit 1 ;;
+    esac
+    printf '%s\n' 'page:' '  title: active bridge'
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
 # A browser whose bridge stopped answering: every call blocks well past any
 # teardown the operator would wait for.
 install_hanging_chrome_devtools() {  # <case-dir>
@@ -3017,9 +3041,40 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
   [ "$elapsed" -lt 30 ] \
     || fail "cleanup waited ${elapsed}s on an unresponsive browser tool instead of bounding it"
   assert_present "$call_log" "cleanup never reached the browser tool"
-  assert_grep 'skipping the bridge stop' "$case_dir/stderr" \
+  assert_grep 'no readable status' "$case_dir/stderr" \
     "an unresponsive browser tool did not degrade to a reported skip"
+  ! grep -q 'reclamation is inert on this host' "$case_dir/stderr" \
+    || fail "a tool that merely never answered was reported as a session-blind host"
   pass "an unresponsive browser bridge is bounded instead of stalling teardown"
+}
+
+# Failing the ownership proof because the tool answers about a name nothing ever
+# started, and failing it because the tool answered nothing at all, are different
+# facts. Only the first is a standing property of the host, so only the first may
+# send the operator to fix their shim; the second must not be reported as one.
+test_unreadable_ownership_probe_is_not_reported_as_a_session_blind_host() {
+  local case_dir rc stop_log
+  case_dir=$(make_case chrome-probe-mute)
+  install_probe_mute_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  stop_log="$case_dir/chrome-stop.log"
+
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    export FM_FAKE_CHROME_STOP_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an unreadable ownership probe must not fail cleanup"
+  [ ! -s "$stop_log" ] \
+    || fail "cleanup stopped a bridge without settling whether the tool scopes by session"
+  assert_grep 'ownership probe' "$case_dir/stderr" \
+    "cleanup skipped an unsettled ownership proof without saying so"
+  ! grep -q 'reclamation is inert on this host' "$case_dir/stderr" \
+    || fail "an unanswered ownership probe was reported as a proven session-blind host"
+  pass "an unreadable ownership probe is reported as unsettled, not as a session-blind host"
 }
 
 # The status wording for a live bridge is unverified, so an unrecognized answer
@@ -3114,13 +3169,14 @@ test_idle_shared_bridge_still_reports_inert_reclamation() {
   pass "a task that started a bridge and needed no stop is told plainly what that answer does not establish"
 }
 
-# The task-private launcher's startup marker is what separates "the tool will not
-# talk about this name" from "this task never opened a bridge". The tool here is
-# readable everywhere except the task's own session, so the ownership proof passes
-# and only the marker decides: without a recorded start there is no evidence any
-# bridge exists under that name and no stop may be issued; with one, the stop is
-# warranted precisely because the launcher saw the task open a bridge.
-test_the_startup_marker_decides_a_stop_the_tool_will_not_talk_about() {
+# An answer that cannot be read is no evidence a bridge exists under this name,
+# and a recorded start is evidence a bridge was once opened, not that one is
+# running now. A session-blind dispatcher that bounds out on the task's session
+# while answering "gone" for the probe would otherwise let a marked task's stop
+# land on the captain's shared bridge, so no stop may be issued either way. The
+# marker still decides what the operator is told: only a marked task may have
+# left a bridge behind.
+test_an_unreadable_status_never_stops_a_session() {
   local case_dir rc session stop_log
   case_dir=$(make_case chrome-unreadable-marker)
   install_selectively_mute_chrome_devtools "$case_dir"
@@ -3152,9 +3208,11 @@ test_the_startup_marker_decides_a_stop_the_tool_will_not_talk_about() {
     fm_chrome_bridge_cleanup "$case_dir/state" task-x1
   ) > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
   expect_code 0 "$rc" "a recorded start with an unreadable status must not fail cleanup"
-  assert_grep "$session|stop" "$stop_log" \
-    "a recorded bridge start did not warrant stopping a session the tool would not report on"
-  pass "the launcher's startup marker alone decides whether a session the tool will not report on is stopped"
+  [ ! -s "$stop_log" ] \
+    || fail "a recorded bridge start let cleanup stop a session the tool said nothing about"
+  assert_grep 'needs reclaiming by hand' "$case_dir/stderr2" \
+    "a marked task whose session the tool would not report on was not flagged as possibly unreclaimed"
+  pass "a session the tool will not report on is never stopped, with or without a recorded start"
 }
 
 # The binding record is a 0600 task-private file. Cleanup's marker reset rewrites
@@ -3207,12 +3265,15 @@ test_marker_reset_keeps_the_binding_record_private() {
 # - reporting nothing when a task that started a bridge needs no stop makes the
 #   idle-shared-bridge test red;
 # - running the browser tool unbounded makes the hung-tool test red;
-# - dropping the recorded-start requirement for an unreadable status, or reading
-#   an unreadable status as evidence of a live bridge, makes the startup-marker
+# - letting a recorded start warrant a stop for an unreadable status, or reading
+#   an unreadable status as evidence of a live bridge, makes the unreadable-status
 #   test red;
+# - reporting an unanswered ownership probe as a proven session-blind host makes
+#   the probe-mute test red;
 # - rewriting the binding record under the ambient umask makes the record-mode
 #   test red.
-test_the_startup_marker_decides_a_stop_the_tool_will_not_talk_about
+test_an_unreadable_status_never_stops_a_session
+test_unreadable_ownership_probe_is_not_reported_as_a_session_blind_host
 test_marker_reset_keeps_the_binding_record_private
 test_unrecognized_live_status_is_still_reclaimed
 test_status_reported_on_stderr_is_understood_as_gone
