@@ -596,7 +596,7 @@ fm_remote_job_cancel() { # <account-home> <id>
   fm_remote_job_prepare_state "$account_home" || return 1
   job=$(fm_remote_job_job_dir "$id" 2>/dev/null) || return 0
   state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
-  if [ "$state" = done ]; then
+  if [ "$state" = 'done' ]; then
     fm_remote_job_reap "$account_home" "$id" 2>/dev/null || true
     return 0
   fi
@@ -605,7 +605,7 @@ fm_remote_job_cancel() { # <account-home> <id>
   chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv -f -- "$tmp" "$job/cancel" || return 1
   state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
-  if [ "$state" = done ]; then
+  if [ "$state" = 'done' ]; then
     fm_remote_job_reap "$account_home" "$id" 2>/dev/null || true
   fi
 }
