@@ -492,8 +492,11 @@ fm_remote_job_read_deadline() { # <job-dir>
 # Allocate the next queue-wide staging sequence value. The critical section is
 # a read-increment-publish on one counter file, held for microseconds under a
 # mkdir lock. A holder killed inside that window would wedge every later stage,
-# so a lock older than five seconds is stolen. Each holder publishes through a
-# token-specific file inside its lock and retries if the lock was displaced.
+# so a lock older than five seconds is stolen. Each allocation reconciles the
+# counter with already-published records before incrementing: if a displaced
+# holder published its job just before losing the lock, its sequence cannot be
+# reused. Each holder publishes through a token-specific file inside its lock
+# and retries if the lock was displaced.
 fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
   local owner
   owner=$(fm_remote_job_read_single_line "$1/owner" 128 2>/dev/null) || return 1
@@ -502,7 +505,7 @@ fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
 
 fm_remote_job_next_seq() { # [stage-dir destination]
   local stage=${1:-} destination=${2:-} published=0
-  local lock counter tmp value attempt=0 mtime now token stolen file retry_deadline
+  local lock counter tmp value observed job attempt=0 mtime now token stolen file retry_deadline
   [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
   lock="$FM_REMOTE_JOB_STATE/.seq.lock"
   counter="$FM_REMOTE_JOB_STATE/seq"
@@ -516,6 +519,16 @@ fm_remote_job_next_seq() { # [stage-dir destination]
         && fm_remote_job_seq_lock_owned "$lock" "$token"; then
         value=$(cat "$counter" 2>/dev/null || true)
         case "$value" in ''|*[!0-9]*) value=0 ;; esac
+        # A stale holder can be displaced after publishing its queued record
+        # but before committing the counter. Recover that published allocation
+        # before choosing the next value, preserving publication FIFO instead
+        # of reusing its sequence and falling back to random-id ordering.
+        for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
+          [ -d "$job" ] && [ ! -L "$job" ] || continue
+          observed=$(fm_remote_job_read_number "$job" seq 2>/dev/null || true)
+          case "$observed" in ''|*[!0-9]*) continue ;; esac
+          [ "$observed" -le "$value" ] || value=$observed
+        done
         value=$((value + 1))
         tmp="$lock/.seqval.$token"
         if [ -n "$stage" ]; then
