@@ -197,9 +197,16 @@ fm_worktree_retirement_receipt_write() {  # <meta-file> <released-worktree>
 }
 
 fm_worktree_retirement_receipt_clear() {  # <meta-file>
-  local receipt
-  receipt=$(fm_worktree_retirement_receipt_path "$1")
-  rm -f -- "$receipt"
+  local meta=$1 receipt candidate dir base rc=0
+  receipt=$(fm_worktree_retirement_receipt_path "$meta")
+  rm -f -- "$receipt" || rc=1
+  dir=${meta%/*}
+  base=${meta##*/}
+  for candidate in "$dir/.${base}.worktree-claim-backup."*; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    rm -f -- "$candidate" || rc=1
+  done
+  return "$rc"
 }
 
 fm_worktree_refuse() {  # <message>
@@ -601,16 +608,16 @@ fm_worktree_claim_retire_release() {
   if [ -z "$released" ] || [ -z "$meta" ] || fm_worktree_retirement_receipt_write "$meta" "$released"; then
     recorded=1
   fi
-  # The path is the provider's again either way, so its claim copy goes even
-  # when the retirement could not be recorded: nothing may put this record back
-  # in charge of a slot that can already be someone else's.
+  if [ "$recorded" -ne 1 ]; then
+    # Nothing restores this copy - the path is the provider's again - but with
+    # the retirement unrecorded it is the only evidence of what was released, so
+    # it stays until the record it describes is gone.
+    fm_worktree_refuse "the provider released $released, but the retirement beside $meta could not be recorded; ${backup:-no copy of the record} is the only surviving evidence of it and must never be restored over the record."
+    return "$FM_WORKTREE_RETIREMENT_UNRECORDED"
+  fi
   if [ -n "$backup" ] && ! rm -f -- "$backup"; then
     echo "warning: the retired worktree claim's copy at $backup could not be removed; $released is released and that copy must never be restored over the record." >&2
   fi
-  [ "$recorded" -eq 1 ] || {
-    fm_worktree_refuse "the provider released $released, but the retirement beside $meta could not be recorded; the record now identifies no worktree and cleanup cannot resume on its own."
-    return "$FM_WORKTREE_RETIREMENT_UNRECORDED"
-  }
 }
 
 fm_worktree_claim_retire_commit() {
@@ -661,19 +668,21 @@ fm_worktree_claim_retire_restore() {
   local marker=$FM_WORKTREE_CLAIM_RETIRE_MARKER
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
+  # Eligibility is settled before either half moves, so a path that has moved on
+  # leaves the retirement whole and open rather than half put back.
+  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] \
+    && ! fm_worktree_marker_still_ours "$marker" "$marker_backup"; then
+    fm_worktree_refuse "provider return failed, but $marker now belongs to another task, so this record was left retired rather than pointed back at that path."
+    return 1
+  fi
   if [ -n "$backup" ] && ! mv -f -- "$backup" "$meta"; then
     fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
     return 1
   fi
-  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ]; then
-    if ! fm_worktree_marker_still_ours "$marker" "$marker_backup"; then
-      fm_worktree_refuse "provider return failed, but $marker now belongs to another task, so task ownership was not restored there; the superseded marker is at $marker_backup."
-      return 1
-    fi
-    if ! mv -f -- "$marker_backup" "$marker"; then
-      fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
-      return 1
-    fi
+  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] \
+    && ! mv -f -- "$marker_backup" "$marker"; then
+    fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
+    return 1
   fi
   [ -z "$marker_backup" ] || rm -f -- "$marker_backup"
   FM_WORKTREE_CLAIM_RETIRE_META=

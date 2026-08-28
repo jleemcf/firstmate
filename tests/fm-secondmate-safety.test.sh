@@ -1930,6 +1930,87 @@ SH
   pass "secondmate teardown reruns cleanly after its leased home was already returned"
 }
 
+# The retirement receipt says only that this record's provider step already
+# ran. It must never license a rerun to walk the old home path again: by then
+# the pool can have issued that slot to another secondmate whose own children
+# are live in it.
+test_retired_secondmate_rerun_never_touches_a_reissued_home() {
+  local home subhome fakebin log fmroot err rc
+  home="$TMP_ROOT/reissued-home-home"
+  subhome="$TMP_ROOT/reissued-home-subhome"
+  fmroot="$TMP_ROOT/reissued-home-fmroot"
+  err="$TMP_ROOT/reissued-home.err"
+  make_firstmate_git_root "$fmroot"
+  git -C "$fmroot" worktree add --quiet --detach "$subhome" HEAD
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+spawn_gen=test-generation-domain
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  printf 'domain\tfirstmate:fm-domain\tnot-a-number\n' > "$home/state/.status-presentation-cursor"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/reissued-home-fake")
+  log="$TMP_ROOT/reissued-home-fake/tmux.log"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/reissued-home-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "the fixture never stopped teardown after the leased home was returned"
+  [ -e "$home/state/.domain.meta.worktree-retired" ] \
+    || fail "no retirement receipt records that the leased home was already returned"
+
+  # The pool reissues the slot to secondmate other, whose own child is live in it.
+  printf 'other\n' > "$subhome/.fm-secondmate-home"
+  cat > "$subhome/state/leaf.meta" <<EOF
+window=firstmate:fm-leaf
+worktree=$subhome/leafwt
+project=$subhome
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+spawn_gen=test-generation-leaf
+EOF
+  git -C "$subhome" worktree add --quiet --detach "$subhome/leafwt" HEAD
+  printf 'leaf live work\n' > "$subhome/leafwt/live.txt"
+
+  rm -f "$home/state/.status-presentation-cursor"
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/reissued-home-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "the rerun could not finish a record whose home was already returned: $(cat "$err")"
+  [ ! -e "$home/state/domain.meta" ] || fail "the rerun left its own secondmate record behind"
+  [ -e "$subhome/state/leaf.meta" ] \
+    || fail "the rerun deleted the record of a child belonging to the home's new holder"
+  [ -d "$subhome/leafwt" ] && [ "$(cat "$subhome/leafwt/live.txt")" = "leaf live work" ] \
+    || fail "the rerun destroyed live work belonging to the home's new holder"
+  [ "$(cat "$subhome/.fm-secondmate-home")" = other ] \
+    || fail "the rerun disturbed the reissued home's own ownership marker"
+  pass "a retired secondmate record's rerun never acts on a home the pool has reissued"
+}
+
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return() {
   local home subhome subhome_abs fakebin log
   home="$TMP_ROOT/plain-clone-teardown-home"
@@ -3193,6 +3274,7 @@ test_secondmate_force_teardown_sweeps_nested_homes
 test_secondmate_force_teardown_preserves_nested_restore_status
 test_secondmate_teardown_refuses_failed_leased_home_return
 test_secondmate_teardown_reruns_after_a_returned_leased_home
+test_retired_secondmate_rerun_never_touches_a_reissued_home
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work

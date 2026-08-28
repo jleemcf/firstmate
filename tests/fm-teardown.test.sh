@@ -1485,7 +1485,39 @@ EOF
     "failed-return-foreign-marker: the rollback overwrote the marker of the task now holding the slot"
   assert_present "$case_dir/state/task-x1.meta" \
     "failed-return-foreign-marker: a failed return discarded the task record"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "failed-return-foreign-marker: the record was pointed back at a slot another task now marks"
+  assert_grep "worktree=$case_dir/wt" \
+    "$(ls "$case_dir/state"/.task-x1.meta.worktree-claim-backup.* | head -n 1)" \
+    "failed-return-foreign-marker: the refused rollback left no recoverable copy of the claim"
   pass "a failed pool return never restores this task's marker over another task's"
+}
+
+# fm/<id> is the only ref teardown owns; whatever else the crewmate checked out
+# in the slot belongs to the crew, not to cleanup.
+test_pool_return_drops_only_this_tasks_branch() {
+  local case_dir rc
+  case_dir=$(make_case return-keeps-other-branches)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  git -C "$case_dir/wt" checkout -q -b spike/foo
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "return-keeps-other-branches: teardown should return the slot"$'\n'"$(cat "$case_dir/stderr")"
+  git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/spike/foo >/dev/null 2>&1 \
+    || fail "return-keeps-other-branches: teardown deleted a branch that was never this task's"
+  if git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1; then
+    fail "return-keeps-other-branches: the task branch survived the pool return"
+  fi
+  pass "a pool return drops only fm/<task-id>, never another branch the slot was on"
 }
 
 test_pool_return_drops_the_task_branch_from_the_project() {
@@ -3259,6 +3291,7 @@ test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
+test_pool_return_drops_only_this_tasks_branch
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds

@@ -1471,15 +1471,16 @@ teardown_task_branch_of() {  # <worktree> <project> <task-id>
   printf '%s' "$branch"
 }
 
-# Best effort by contract, but never silent: an undeletable task branch means
-# the shared repo keeps accumulating refs, and the only place that is visible
-# is here.
-teardown_drop_task_branch() {  # <project> <branch>
-  local project=$1 branch=$2 out
-  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 0
-  [ -n "$project" ] && [ -d "$project" ] || return 0
-  out=$(git -C "$project" branch -D "$branch" 2>&1) && return 0
+# fm/<task-id> is the only ref this task owns, so it is the only one teardown
+# may drop - whatever else the crewmate happened to check out in the slot is not
+# teardown's to delete. Best effort by contract, but never silent: an
+# undeletable task branch means the shared repo keeps accumulating refs, and the
+# only place that is visible is here.
+teardown_drop_task_branch() {  # <project> <task-id>
+  local project=$1 id=$2 branch="fm/$2" out
+  [ -n "$id" ] && [ -n "$project" ] && [ -d "$project" ] || return 0
   git -C "$project" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 0
+  out=$(git -C "$project" branch -D "$branch" 2>&1) && return 0
   echo "warning: could not drop task branch $branch in $project: $out" >&2
 }
 
@@ -2153,22 +2154,27 @@ remove_firstmate_home() {
       restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
     }
+    return_rc=0
     teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" "" \
-      "$claim_state" "$expected_id" "$claim_meta" || {
-      return_rc=$?
-      if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-        echo "error: $label $abs_home_path was returned, but its retirement could not be recorded" >&2
-      else
-        echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
-        restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
-      fi
+      "$claim_state" "$expected_id" "$claim_meta" || return_rc=$?
+    if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+      echo "warning: $label $abs_home_path was returned, but its retirement could not be recorded" >&2
+    elif [ "$return_rc" -ne 0 ]; then
+      echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
+      restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
       return 1
-    }
+    fi
     [ -z "$process_event_backup" ] || rm -rf -- "$process_event_backup"
     return 0
   fi
-  if teardown_safe_rm_firstmate_home_claimed \
-      "$claim_state" "$expected_id" "$claim_meta" "$abs_home_path" "$label"; then
+  return_rc=0
+  teardown_safe_rm_firstmate_home_claimed \
+    "$claim_state" "$expected_id" "$claim_meta" "$abs_home_path" "$label" || return_rc=$?
+  if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+    echo "warning: $label $abs_home_path was removed, but its retirement could not be recorded" >&2
+    return_rc=0
+  fi
+  if [ "$return_rc" -eq 0 ]; then
     [ -z "$process_event_backup" ] || rm -rf -- "$process_event_backup"
     return 0
   fi
@@ -2648,8 +2654,14 @@ cleanup_firstmate_home_children() {
           "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       fi
       if ! fm_worktree_retirement_receipt_present "$child_meta" >/dev/null 2>&1; then
+        child_return_rc=0
         teardown_remove_orca_worktree_claimed \
-          "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || return 1
+          "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || child_return_rc=$?
+        if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+          echo "warning: child $child_id's Orca worktree was removed, but its retirement could not be recorded" >&2
+        elif [ "$child_return_rc" -ne 0 ]; then
+          return 1
+        fi
       fi
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -2662,16 +2674,25 @@ cleanup_firstmate_home_children() {
           :
         else
           child_return_rc=$?
-          if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ] \
-            || [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+          if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
             return "$child_return_rc"
           fi
-          teardown_safe_rm_child_worktree_claimed \
-            "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
+          if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+            echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
+          else
+            teardown_safe_rm_child_worktree_claimed \
+              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
+          fi
         fi
       else
+        child_return_rc=0
         teardown_safe_rm_child_worktree_claimed \
-          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
+          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || child_return_rc=$?
+        if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+          echo "warning: child worktree $child_wt was removed, but its retirement could not be recorded" >&2
+        elif [ "$child_return_rc" -ne 0 ]; then
+          return 1
+        fi
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
@@ -2725,21 +2746,28 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   handoff_wake_retire_stage_recover "$HOME_PATH" || exit 1
   handoff_wake_retire_validate || exit 1
+  # A retired record no longer owns the recorded home: the provider took that
+  # path back and may already have issued it to another secondmate. Every step
+  # below is keyed to that path and this run's predecessor completed all of them
+  # before the return, so a rerun inspects, recurses into, and removes nothing
+  # there - only the durable records this task still owns remain to clean up.
   if [ "$WORKTREE_RETIRED" != 1 ]; then
     validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
-  fi
-  if [ "$FORCE" = "--force" ]; then
-    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
-    preflight_descendant_task_locks "$HOME_PATH" || exit 1
-    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
-    if [ "$BACKEND" = herdr ]; then
-      teardown_herdr_preflight_target "$T" "$ID" || exit 1
+    if [ "$FORCE" = "--force" ]; then
+      validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+      preflight_descendant_task_locks "$HOME_PATH" || exit 1
+      validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+      if [ "$BACKEND" = herdr ]; then
+        teardown_herdr_preflight_target "$T" "$ID" || exit 1
+      fi
+      preflight_firstmate_home_herdr_children "$HOME_PATH" || exit 1
     fi
-    preflight_firstmate_home_herdr_children "$HOME_PATH" || exit 1
+  elif [ "$FORCE" = "--force" ] && [ "$BACKEND" = herdr ]; then
+    teardown_herdr_preflight_target "$T" "$ID" || exit 1
   fi
 fi
 
-if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
+if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ] && [ "$WORKTREE_RETIRED" != 1 ]; then
   SUB_STATE="$HOME_PATH/state"
   if [ -d "$SUB_STATE" ]; then
     for child_meta in "$SUB_STATE"/*.meta; do
@@ -2751,11 +2779,11 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-if [ "$KIND" = secondmate ]; then
+if [ "$KIND" = secondmate ] && [ "$WORKTREE_RETIRED" != 1 ]; then
   preflight_firstmate_home_process_event_tree "$HOME_PATH" "secondmate home" || exit 1
 fi
 
-if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
+if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ] && [ "$WORKTREE_RETIRED" != 1 ]; then
   cleanup_firstmate_home_children "$HOME_PATH" || exit $?
 fi
 
@@ -2915,10 +2943,16 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   if [ "$WORKTREE_RETIRED" != 1 ]; then
+    return_rc=0
     teardown_remove_orca_worktree_claimed \
-      "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || exit 1
+      "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || return_rc=$?
+    if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+      WORKTREE_RETIRED=1
+    elif [ "$return_rc" -ne 0 ]; then
+      exit 1
+    fi
   fi
-  teardown_drop_task_branch "$PROJ" "$branch"
+  teardown_drop_task_branch "$PROJ" "$ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
@@ -2932,17 +2966,17 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
+  return_rc=0
   teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" \
-    "$STATE" "$ID" "$META" "$branch" || {
-    return_rc=$?
-    if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-      echo "error: worktree $WT was returned to the pool, but its retirement could not be recorded; teardown aborted" >&2
-    else
-      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-    fi
+    "$STATE" "$ID" "$META" "$branch" || return_rc=$?
+  if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+    echo "warning: worktree $WT was returned to the pool, but its retirement could not be recorded; finishing this teardown so the record does not outlive the slot" >&2
+    WORKTREE_RETIRED=1
+  elif [ "$return_rc" -ne 0 ]; then
+    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
-  }
-  teardown_drop_task_branch "$PROJ" "$branch"
+  fi
+  teardown_drop_task_branch "$PROJ" "$ID"
 fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
