@@ -448,9 +448,12 @@ worker_clear_dead_claim() { # <job-dir>
 # beside it - and the record publishes unknown completion, exactly as a
 # crashed single-process worker's job always has.
 worker_reclaim_running_job() { # <job-dir>
-  local job=$1 file
+  local job=$1 file state
   worker_stop_recorded_execution "$job" || return 1
+  state=$(fm_remote_job_read_state "$job" 2>/dev/null) || return 1
   worker_clear_dead_claim "$job" || return 1
+  [ "$state" = done ] && return 0
+  [ "$state" = running ] || return 1
   for file in .stdout.pipe .stderr.pipe; do
     [ ! -e "$job/$file" ] && [ ! -L "$job/$file" ] || {
       [ ! -L "$job/$file" ] || return 1
