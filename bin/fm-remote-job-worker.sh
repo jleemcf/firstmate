@@ -150,7 +150,7 @@ worker_quarantined_execution_stopped() { # <account-home>
       [ ! -e "$file" ] && [ ! -L "$file" ] && continue
       [ ! -L "$file" ] || return 1
       pid=$(worker_read_process_id "$file") || return 1
-      worker_process_or_group_alive "$kind" "$pid" && return 1
+      worker_recorded_execution_alive "$job" "$kind" "$pid" && return 1
     done
   done
 }
@@ -263,6 +263,39 @@ worker_signal_process_or_group() { # process|group <signal> <pid>
   esac
 }
 
+worker_supervisor_identity_status() { # <job-dir> <pid>
+  local job=$1 pid=$2 recorded_start actual_start
+  recorded_start=$(fm_remote_job_read_single_line "$job/.claim/supervisor_start" 256 2>/dev/null) || return 2
+  actual_start=$(fm_remote_job_process_start "$pid" 2>/dev/null) || {
+    worker_process_or_group_alive process "$pid" && return 2
+    return 1
+  }
+  [ "$recorded_start" = "$actual_start" ] && return 0
+  return 1
+}
+
+worker_recorded_execution_alive() { # <job-dir> process|group <pid>
+  local job=$1 kind=$2 pid=$3 identity_status
+  if [ "$kind" = process ]; then
+    worker_supervisor_identity_status "$job" "$pid"
+    identity_status=$?
+    case "$identity_status" in
+      0) ;;
+      1) return 1 ;;
+      2) worker_process_or_group_alive process "$pid"; return ;;
+    esac
+  fi
+  worker_process_or_group_alive "$kind" "$pid"
+}
+
+worker_signal_recorded_execution() { # <job-dir> process|group <signal> <pid>
+  local job=$1 kind=$2 signal=$3 pid=$4
+  if [ "$kind" = process ]; then
+    worker_supervisor_identity_status "$job" "$pid" || return 0
+  fi
+  worker_signal_process_or_group "$kind" "$signal" "$pid"
+}
+
 worker_stop_recorded_execution() { # <job-dir>
   local job=$1 kind file pid attempt still_alive
   for kind in process group; do
@@ -270,8 +303,8 @@ worker_stop_recorded_execution() { # <job-dir>
     [ ! -e "$file" ] && [ ! -L "$file" ] && continue
     [ ! -L "$file" ] || return 1
     pid=$(worker_read_process_id "$file") || return 1
-    worker_signal_process_or_group "$kind" TERM "$pid"
-    worker_signal_process_or_group "$kind" KILL "$pid"
+    worker_signal_recorded_execution "$job" "$kind" TERM "$pid"
+    worker_signal_recorded_execution "$job" "$kind" KILL "$pid"
     wait "$pid" 2>/dev/null || true
   done
   attempt=0
@@ -282,13 +315,14 @@ worker_stop_recorded_execution() { # <job-dir>
       case "$kind" in process) file="$job/.claim/supervisor" ;; group) file="$job/.claim/group" ;; esac
       [ -e "$file" ] || continue
       pid=$(worker_read_process_id "$file") || return 1
-      worker_process_or_group_alive "$kind" "$pid" && still_alive=1
+      worker_recorded_execution_alive "$job" "$kind" "$pid" && still_alive=1
     done
     [ "$still_alive" -eq 1 ] || break
     sleep 0.01
   done
   [ "$still_alive" -eq 0 ] || return 1
-  rm -f -- "$job/.claim/supervisor" "$job/.claim/group" "$job/.claim/armed"
+  rm -f -- "$job/.claim/supervisor" "$job/.claim/supervisor_start" \
+    "$job/.claim/group" "$job/.claim/armed"
 }
 
 # Stop every tracked lane process and its recorded command execution. The lane
@@ -378,7 +412,8 @@ worker_clear_dead_claim() { # <job-dir>
   worker_claim_owner_alive "$job" && return 1
   [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   [ ! -e "$claim/owner" ] || [ ! -L "$claim/owner" ] || return 1
-  rm -f -- "$claim/owner" "$claim/supervisor" "$claim/group" "$claim/armed" || return 1
+  rm -f -- "$claim/owner" "$claim/supervisor" "$claim/supervisor_start" \
+    "$claim/group" "$claim/armed" || return 1
   rmdir "$claim"
 }
 
@@ -726,15 +761,28 @@ worker_reap_finished_lanes() {
 # arrived before running, establish the deadline, run to publication, and reap
 # the record when its caller cancelled and can no longer reap it.
 worker_lane_execute() { # <account-home> <job-dir>
-  local account_home=$1 job=$2 timeout deadline tmp
+  local account_home=$1 job=$2 timeout deadline supervisor_pid supervisor_start pid_tmp start_tmp
   worker_claim "$job" || return 0
-  tmp=$(umask 077; mktemp "$job/.claim/.supervisor.XXXXXX") || {
+  supervisor_pid=${BASHPID:-$$}
+  supervisor_start=$(fm_remote_job_process_start "$supervisor_pid") || {
     worker_publish_result "$job" 125 || true
     return 0
   }
-  if ! printf '%s\n' "${BASHPID:-$$}" > "$tmp" || ! chmod 600 "$tmp" ||
-    ! mv -f -- "$tmp" "$job/.claim/supervisor"; then
-    rm -f -- "$tmp"
+  pid_tmp=$(umask 077; mktemp "$job/.claim/.supervisor.XXXXXX") || {
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  start_tmp=$(umask 077; mktemp "$job/.claim/.supervisor_start.XXXXXX") || {
+    rm -f -- "$pid_tmp"
+    worker_publish_result "$job" 125 || true
+    return 0
+  }
+  if ! printf '%s\n' "$supervisor_pid" > "$pid_tmp" \
+    || ! printf '%s\n' "$supervisor_start" > "$start_tmp" \
+    || ! chmod 600 "$pid_tmp" "$start_tmp" \
+    || ! mv -f -- "$start_tmp" "$job/.claim/supervisor_start" \
+    || ! mv -f -- "$pid_tmp" "$job/.claim/supervisor"; then
+    rm -f -- "$pid_tmp" "$start_tmp" "$job/.claim/supervisor_start"
     worker_publish_result "$job" 125 || true
     return 0
   fi

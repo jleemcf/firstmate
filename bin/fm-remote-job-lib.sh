@@ -720,7 +720,8 @@ fm_remote_job_reap() { # <account-home> <id>; only removes an exact completed re
   done
   if [ -e "$job/.claim" ] || [ -L "$job/.claim" ]; then
     [ -d "$job/.claim" ] && [ ! -L "$job/.claim" ] || return 1
-    rm -f -- "$job/.claim/owner" "$job/.claim/supervisor" "$job/.claim/group" "$job/.claim/armed" || return 1
+    rm -f -- "$job/.claim/owner" "$job/.claim/supervisor" \
+      "$job/.claim/supervisor_start" "$job/.claim/group" "$job/.claim/armed" || return 1
     rmdir "$job/.claim" || return 1
   fi
   rmdir "$job"
