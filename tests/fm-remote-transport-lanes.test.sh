@@ -348,6 +348,7 @@ pass "a caller killed mid-wait stops its running job's process group"
 # parent-liveness probe.
 ORPHAN_START="$TMP_ROOT/orphan-cancel-start"
 ORPHAN_FINISH="$TMP_ROOT/orphan-cancel-finish"
+# shellcheck disable=SC2016 # Expansion is deliberately deferred to the child shell.
 env FM_HOME="$LOCAL_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
   FM_SSH_BIN="$FAKEBIN/fake-ssh" \
   FM_FAKE_REMOTE_ENTRYPOINT="$REMOTE_ROOT/bin/fm-remote-entrypoint.sh" \
