@@ -26,7 +26,11 @@
 # fm_chrome_wrapper_write <state-dir> <task-id> <wrapper-path> <real-tool>
 #   Writes a task-private chrome-devtools-axi launcher. Before any browser action
 #   can auto-start the bridge, the launcher atomically changes started=0 to
-#   started=1. Read-only home/help/version and setup/stop commands do not mark it.
+#   started=1. Read-only home/help/version and setup/stop commands do not mark it,
+#   and a delegated stop that the tool reports succeeded clears the marker back to
+#   started=0 the same way cleanup does, so a worker that shuts its own bridge down
+#   is not later described as one whose bridge went missing. A stop the tool
+#   reports failed leaves the marker set, so that task stays cleanup-eligible.
 #   Every delegated command - marking or not - is then handed to the real tool
 #   with the recorded session forced and any ambient CHROME_DEVTOOLS_AXI_PORT
 #   dropped, so the binding holds even when the pane shell's exports did not
@@ -42,21 +46,31 @@
 #   caller drops the PATH prepend instead of launching through it.
 #
 # fm_chrome_bridge_bound
-#   Prints the seconds one browser call may take: FM_CHROME_BRIDGE_TIMEOUT clamped
-#   to 1..120, with anything unset, non-numeric, or out of range falling back to
-#   the 20-second default. A knob that bounds teardown-time work cannot itself be
-#   a way to un-bound teardown.
+#   Prints the seconds one browser call may take, from FM_CHROME_BRIDGE_TIMEOUT:
+#   unset, non-numeric, and zero take the 20-second default, and anything above
+#   the 120-second ceiling is cut to it rather than honoured. A knob that bounds
+#   teardown-time work cannot itself be a way to un-bound teardown.
+#
+# fm_chrome_bound_was_enforced <started-at-epoch> <bound-seconds>
+#   Whether a call that came back with the bound-was-hit status really spent the
+#   bound. fm_run_timed reports that status for its own scratch-file failure, for
+#   a runner killed from outside, and for a tool that exits 124 by itself, none of
+#   which say anything about whether the tool answers. An unreadable clock proves
+#   nothing either, so it answers no.
 #
 # fm_chrome_axi_run <session> [args...]
 #   The single door to the browser tool. Every call names the session, drops an
 #   ambient CHROME_DEVTOOLS_AXI_PORT (which the tool documents as overriding the
 #   port it otherwise derives from the session name, so an inherited one would
 #   silently retarget another bridge), and runs under a hard bound because the
-#   tool can be a wrapper chain onto a browser that stopped answering. Once a call
-#   in this process has hit that bound the tool is not answering at all, so later
-#   calls report the bound status without invoking it again: teardown asks about
-#   every task and runs cleanup twice per task, and none of those calls can learn
-#   anything a hung tool did not already refuse to say.
+#   tool can be a wrapper chain onto a browser that stopped answering. It returns
+#   124 only for a bound this call is measured to have actually consumed; a
+#   bound-was-hit status from any other cause is reported as 125, which reads as
+#   one more unusable answer about one name rather than as a verdict on the tool.
+#   Once a call in this process has spent the bound the tool is not answering at
+#   all, so later calls report the bound status without invoking it again:
+#   teardown asks about every task and runs cleanup twice per task, and none of
+#   those calls can learn anything a hung tool did not already refuse to say.
 #
 # fm_chrome_session_liveness <session>
 #   Prints inactive, present, unreadable, or unresponsive for that exact named
@@ -255,6 +269,20 @@ case "${1:-}" in
     fi
     ;;
 esac
+if [ "${1:-}" = stop ]; then
+  env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
+  stop_status=$?
+  if [ "$stop_status" -eq 0 ] && [ -f "$record" ] && [ ! -L "$record" ] \
+    && grep -q '^started=1$' "$record" 2>/dev/null; then
+    cleared_tmp="$record.stopped.${BASHPID:-$$}"
+    if ! (umask 077; sed 's/^started=1$/started=0/' "$record" > "$cleared_tmp") \
+      || ! chmod 600 -- "$cleared_tmp" || ! mv -f -- "$cleared_tmp" "$record"; then
+      rm -f -- "$cleared_tmp" 2>/dev/null || true
+      echo "chrome-devtools-axi: the task bridge binding could not be reset after this stop; teardown will re-check that session" >&2
+    fi
+  fi
+  exit "$stop_status"
+fi
 exec env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" "$tool" ${1+"$@"}
 SH
   } > "$tmp" || ! chmod 700 "$tmp" || ! mv -f -- "$tmp" "$wrapper"; then
@@ -285,14 +313,33 @@ fm_chrome_bridge_bound() {
   printf '%s\n' "$bound"
 }
 
+fm_chrome_bound_was_enforced() {  # <started-at-epoch> <bound-seconds>
+  local started_at=$1 bound=$2 now
+  case "$started_at" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s 2>/dev/null || true)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$now" -ge "$started_at" ] || return 1
+  [ "$((now - started_at))" -ge "$bound" ] || return 1
+  return 0
+}
+
 fm_chrome_axi_run() {  # <session> [args...]
-  local session=$1 bound
+  local session=$1 bound started_at status
   shift
   [ "${_FM_CHROME_TOOL_UNRESPONSIVE:-0}" != 1 ] || return 124
   bound=$(fm_chrome_bridge_bound)
+  started_at=$(date +%s 2>/dev/null || true)
   fm_run_timed "$bound" \
     env -u CHROME_DEVTOOLS_AXI_PORT "CHROME_DEVTOOLS_AXI_SESSION=$session" \
     chrome-devtools-axi ${1+"$@"} < /dev/null
+  status=$?
+  # fm_run_timed also returns its bound-was-hit status when its own scratch file
+  # could not be made, when the runner itself was killed, and when the tool exits
+  # 124 of its own accord. Only a call that actually consumed the bound proves the
+  # tool does not answer, so only that one may speak for every later call.
+  [ "$status" -eq 124 ] || return "$status"
+  fm_chrome_bound_was_enforced "$started_at" "$bound" || return 125
+  return 124
 }
 
 fm_chrome_session_liveness() {  # <session>
@@ -347,7 +394,7 @@ fm_chrome_binding_clear_started() {  # <state-dir> <task-id>
 }
 
 fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
-  local state=$1 id=$2 record session started expected liveness proof tool_known_silent
+  local state=$1 id=$2 record session started expected liveness proof tool_known_silent stop_status
   record="$state/$id.chrome-devtools-session"
   [ -e "$record" ] || [ -L "$record" ] || return 0
   if [ ! -f "$record" ] || [ -L "$record" ]; then
@@ -404,7 +451,7 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
     unreadable|unresponsive)
       if [ "$started" = 1 ]; then
         echo "warning: chrome-devtools-axi returned no readable status for task $id session $session, so no stop was issued; that task's launcher did record a bridge start, so a bridge may still be running under that session and needs reclaiming by hand" >&2
-      elif [ "$liveness" != unresponsive ] || [ "$tool_known_silent" != 1 ]; then
+      elif [ "$tool_known_silent" != 1 ]; then
         echo "warning: chrome-devtools-axi returned no readable status for task $id session $session; that task's launcher recorded no bridge start, so no stop was issued" >&2
       fi
       return 0
@@ -422,7 +469,10 @@ fm_chrome_bridge_cleanup() {  # <state-dir> <task-id>
     echo "warning: chrome-devtools-axi does not act on the task-scoped session for task $id; skipping the bridge stop for session $session so no shared bridge is disturbed. Task-scoped bridge reclamation is inert on this host until chrome-devtools-axi passes CHROME_DEVTOOLS_AXI_SESSION through" >&2
     return 0
   fi
-  if ! fm_chrome_axi_run "$session" stop >/dev/null 2>&1; then
+  stop_status=0
+  fm_chrome_axi_run "$session" stop >/dev/null 2>&1 || stop_status=$?
+  if [ "$stop_status" != 0 ]; then
+    [ "$stop_status" != 124 ] || _FM_CHROME_TOOL_UNRESPONSIVE=1
     echo "warning: chrome-devtools bridge stop failed for task $id session $session; teardown will continue" >&2
     return 0
   fi

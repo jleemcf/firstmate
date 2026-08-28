@@ -1062,8 +1062,65 @@ SH
   pass "the task-private Chrome launcher forces the recorded session and drops an inherited bridge port"
 }
 
+# A worker that opens a bridge and then shuts it down itself has left nothing to
+# reclaim. Teardown's conditional disclosure - "this task recorded a start and the
+# tool now says the session is gone, which a session-blind dispatcher would also
+# say" - exists to flag a host that cannot scope bridges, so it must not fire for
+# every browser-using task that cleaned up after itself. The marker is only
+# cleared by a stop the tool reported succeeded; a failed stop stays eligible.
+test_launcher_stop_retires_the_marker_only_when_the_tool_agrees() {
+  local dir id state tool bindir wrapper record mode
+  id=launcher-selfstop-z24
+  dir="$TMP_ROOT/launcher-selfstop"
+  rm -rf "$dir"
+  mkdir -p "$dir/state" "$dir/tool"
+  chmod 700 "$dir"
+  state="$dir/state"
+  tool="$dir/tool/chrome-devtools-axi"
+  cat > "$tool" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" != stop ] || exit "${FM_FAKE_TOOL_STOP_STATUS:-0}"
+exit 0
+SH
+  chmod +x "$tool"
+
+  fm_chrome_binding_write "$state" "$id" \
+    || fail "could not write the task binding for the launcher self-stop test"
+  record="$state/$id.chrome-devtools-session"
+  bindir=$(fm_chrome_launcher_dir_create "$dir") \
+    || fail "could not mint a task-private Chrome launcher directory"
+  wrapper="$bindir/chrome-devtools-axi"
+  fm_chrome_wrapper_write "$state" "$id" "$wrapper" "$tool" \
+    || fail "could not write the task-private Chrome launcher"
+
+  "$wrapper" open https://example.invalid \
+    || fail "the task-private Chrome launcher did not delegate a bridge-starting call"
+  assert_grep 'started=1' "$record" \
+    "the launcher did not mark the binding for a bridge-starting call"
+
+  FM_FAKE_TOOL_STOP_STATUS=7 "$wrapper" stop \
+    && fail "the launcher hid a failed stop from the worker"
+  assert_grep 'started=1' "$record" \
+    "a stop the tool reported failed retired the marker and made the task ineligible for cleanup"
+
+  ( umask 022; "$wrapper" stop ) || fail "the launcher did not delegate a successful stop"
+  assert_grep 'started=0' "$record" \
+    "a bridge the worker stopped itself still reads as a recorded start teardown must explain"
+  if [ "$(uname)" = Darwin ]; then
+    mode=$(stat -f %Lp "$record" 2>/dev/null)
+  else
+    mode=$(stat -c %a "$record" 2>/dev/null)
+  fi
+  [ "$mode" = 600 ] \
+    || fail "retiring the marker after a self-stop widened the task binding record to 0$mode"
+  rm -rf "$dir"
+  pass "a worker's own successful stop retires the startup marker and a failed one does not"
+}
+
 test_task_scoped_chrome_bridge_binding_is_exported_before_launch
 test_task_private_launcher_forces_the_recorded_session
+test_launcher_stop_retires_the_marker_only_when_the_tool_agrees
 test_missing_chrome_devtools_tool_does_not_block_the_launch
 test_world_writable_task_temp_root_never_reaches_the_worker_path
 test_task_private_launcher_directory_is_unpredictable

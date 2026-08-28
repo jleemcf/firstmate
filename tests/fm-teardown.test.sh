@@ -743,6 +743,36 @@ SH
   chmod +x "$case_dir/fakebin/chrome-devtools-axi"
 }
 
+# A tool that exits with the bounded runner's own bound-was-hit status the
+# instant it is called, without ever consuming the bound. fm_run_timed reports
+# that same status for a scratch-file failure and for a runner killed from
+# outside, so this stands in for all of them: nothing here says the tool has
+# stopped answering, and later sessions must still be asked about.
+install_immediate_124_chrome_devtools() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/chrome-devtools-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+session=${CHROME_DEVTOOLS_AXI_SESSION:-default}
+[ -z "${FM_FAKE_CHROME_CALL_LOG:-}" ] || printf '%s|%s\n' "$session" "${1:-status}" >> "$FM_FAKE_CHROME_CALL_LOG"
+case "${1:-}" in
+  '')
+    [ "$session" != "${FM_FAKE_CHROME_MUTE_SESSION:-}" ] || exit 124
+    if [ -n "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] && [ -f "$FM_FAKE_CHROME_ACTIVE_DIR/$session" ]; then
+      printf '%s\n' 'page:' '  title: active bridge'
+    else
+      printf '%s\n' 'browser: no active session'
+    fi
+    ;;
+  stop)
+    [ -z "${FM_FAKE_CHROME_STOP_LOG:-}" ] || printf '%s|stop\n' "$session" >> "$FM_FAKE_CHROME_STOP_LOG"
+    [ -z "${FM_FAKE_CHROME_ACTIVE_DIR:-}" ] || rm -f -- "$FM_FAKE_CHROME_ACTIVE_DIR/$session"
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/chrome-devtools-axi"
+}
+
 chrome_record_mode() {  # <path>
   if [ "$(uname)" = Darwin ]; then
     stat -f %Lp "$1" 2>/dev/null
@@ -3087,6 +3117,53 @@ test_a_hung_bridge_tool_is_waited_on_once_per_teardown() {
   pass "a hung browser tool costs one bound and one notice per teardown, not one per cleanup pass"
 }
 
+# The bounded runner reports its bound-was-hit status for causes that have
+# nothing to do with the tool answering: its own scratch file could not be made,
+# the runner was killed from outside, or the tool exited with that status itself.
+# None of those may stand in for "this host's browser tool never answers", or one
+# unlucky task silently disarms reclamation for every task after it - which is a
+# forced secondmate-home teardown reintroducing the orphaned bridge this change
+# exists to stop. Only a call measured to have spent the bound speaks for the host.
+test_an_instant_bound_status_does_not_disarm_later_reclamation() {
+  local case_dir rc session_a session_b active_dir stop_log call_log
+  case_dir=$(make_case chrome-instant-124)
+  install_immediate_124_chrome_devtools "$case_dir"
+  write_chrome_binding "$case_dir" task-x1
+  session_a=$FM_CHROME_TASK_SESSION
+  write_chrome_binding "$case_dir" task-x2
+  session_b=$FM_CHROME_TASK_SESSION
+  active_dir="$case_dir/chrome-active"
+  stop_log="$case_dir/chrome-stop.log"
+  call_log="$case_dir/chrome-call.log"
+  mkdir -p "$active_dir"
+  touch "$active_dir/$session_b"
+
+  rc=0
+  (
+    PATH="$case_dir/fakebin:$PATH"
+    FM_CHROME_BRIDGE_TIMEOUT=30
+    FM_FAKE_CHROME_MUTE_SESSION="$session_a"
+    FM_FAKE_CHROME_ACTIVE_DIR="$active_dir"
+    FM_FAKE_CHROME_STOP_LOG="$stop_log"
+    FM_FAKE_CHROME_CALL_LOG="$call_log"
+    export FM_FAKE_CHROME_MUTE_SESSION FM_FAKE_CHROME_ACTIVE_DIR \
+      FM_FAKE_CHROME_STOP_LOG FM_FAKE_CHROME_CALL_LOG
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x1
+    fm_chrome_bridge_cleanup "$case_dir/state" task-x2
+  ) > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "an instant bound-status answer must not fail cleanup"
+  ! grep -q "^$session_a|" "$stop_log" 2>/dev/null \
+    || fail "cleanup stopped a session it was given no readable answer about"
+  assert_grep "$session_b|stop" "$stop_log" \
+    "one task's instant bound-status answer disarmed the next task's live bridge reclamation"
+  assert_absent "$active_dir/$session_b" \
+    "a second task's live bridge survived teardown because an earlier call returned the bound status"
+  assert_grep "$session_b|" "$call_log" \
+    "the browser tool was never asked about the second task's session"
+  pass "a bound status returned without spending the bound never speaks for the whole host"
+}
+
 # The knob exists to bound teardown-time work, so it must not become a way to
 # un-bound it: docs/configuration.md states the 1..120 range this enforces.
 test_bridge_call_bound_is_clamped_to_its_documented_range() {
@@ -3324,6 +3401,9 @@ test_marker_reset_keeps_the_binding_record_private() {
 # - running the browser tool unbounded makes the hung-tool test red;
 # - re-invoking a browser tool this process already waited out, or repeating the
 #   unstarted-task notice for it, makes the hung-tool-once test red;
+# - treating the bounded runner's bound-was-hit status as proof the tool never
+#   answers, without measuring that the call spent the bound, makes the
+#   instant-bound-status test red;
 # - accepting FM_CHROME_BRIDGE_TIMEOUT outside 1..120 makes the clamp test red;
 # - letting a recorded start warrant a stop for an unreadable status, or reading
 #   an unreadable status as evidence of a live bridge, makes the unreadable-status
@@ -3348,6 +3428,7 @@ test_session_blind_tool_never_stops_a_shared_bridge
 test_ambient_bridge_port_cannot_retarget_cleanup
 test_hung_bridge_tool_cannot_stall_cleanup
 test_a_hung_bridge_tool_is_waited_on_once_per_teardown
+test_an_instant_bound_status_does_not_disarm_later_reclamation
 test_bridge_call_bound_is_clamped_to_its_documented_range
 
 test_local_only_fork_remote_allows
