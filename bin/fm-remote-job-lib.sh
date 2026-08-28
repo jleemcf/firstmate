@@ -13,6 +13,9 @@
 # sequence reserved atomically by its persistent .seq-claims directory; the
 # counter is only a forward-moving allocation hint. seq is the worker's FIFO
 # ordering key within a home, with the job id as the deterministic tiebreak.
+# FIFO is defined over completed stagings: a stage that returns before another
+# begins executes first; concurrently overlapping stagings have no relative
+# ordering contract.
 # The worker atomically claims a job with .claim, establishes its execution
 # deadline, changes state to running, writes bounded stdout/stderr and exit,
 # then publishes state=done last. Callers wait for done, relay stdout and
@@ -81,6 +84,7 @@ FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
 FM_REMOTE_JOB_STAGE_REAP_SECONDS=${FM_REMOTE_JOB_STAGE_REAP_SECONDS:-600}
 FM_REMOTE_JOB_SEQ_CLAIM_REAP_SECONDS=86400
+FM_REMOTE_JOB_SEQ_CLAIM_REAP_INTERVAL=3600
 # shellcheck disable=SC2034 # Shared protocol constant consumed by the worker and sourcing callers.
 FM_REMOTE_JOB_PREEMPTED_EXIT=76
 FM_REMOTE_JOB_OPERATOR_PATH=
@@ -515,12 +519,25 @@ fm_remote_job_advance_seq_hint() { # <value>
 }
 
 fm_remote_job_next_seq() { # [stage-dir destination]
-  local stage=${1:-} destination=${2:-} counter value claim attempt=0
+  local stage=${1:-} destination=${2:-} counter value claim attempt=0 recovered=0 maximum entry
   [ -n "$FM_REMOTE_JOB_STATE" ] && [ -n "$FM_REMOTE_JOB_SEQ_CLAIMS" ] || return 1
   counter="$FM_REMOTE_JOB_STATE/seq"
   value=$(cat "$counter" 2>/dev/null || true)
   case "$value" in ''|*[!0-9]*) value=0 ;; esac
-  while [ "$attempt" -lt 100000 ]; do
+  while :; do
+    if [ "$attempt" -ge 100000 ]; then
+      [ "$recovered" -eq 0 ] || return 1
+      maximum=0
+      for entry in "$FM_REMOTE_JOB_SEQ_CLAIMS"/*; do
+        [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+        entry=${entry##*/}
+        case "$entry" in ''|*[!0-9]*|0) continue ;; esac
+        [ "$entry" -le "$maximum" ] || maximum=$entry
+      done
+      value=$maximum
+      attempt=0
+      recovered=1
+    fi
     attempt=$((attempt + 1))
     value=$((value + 1))
     claim="$FM_REMOTE_JOB_SEQ_CLAIMS/$value"
@@ -541,7 +558,6 @@ fm_remote_job_next_seq() { # [stage-dir destination]
     fi
     [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   done
-  return 1
 }
 
 fm_remote_job_cancelled() { # <job-dir>
@@ -727,7 +743,7 @@ fm_remote_job_stage_owner_alive() { # <stage-dir>
 }
 
 fm_remote_job_reap_stale() { # <account-home>
-  local account_home=$1 job id state mtime now stage claim value
+  local account_home=$1 job id state mtime now stage claim value marker tmp reap_claims=0
   fm_remote_job_prepare_state "$account_home" || return 1
   now=$(date +%s)
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
@@ -741,15 +757,29 @@ fm_remote_job_reap_stale() { # <account-home>
     [ $((now - mtime)) -ge "$FM_REMOTE_JOB_REAP_SECONDS" ] || continue
     fm_remote_job_reap "$account_home" "$id" || true
   done
-  for claim in "$FM_REMOTE_JOB_SEQ_CLAIMS"/*; do
-    [ -d "$claim" ] && [ ! -L "$claim" ] || continue
-    value=${claim##*/}
-    case "$value" in ''|*[!0-9]*|0) continue ;; esac
-    mtime=$(fm_remote_job_path_mtime "$claim" 2>/dev/null || true)
-    case "$mtime" in ''|*[!0-9]*) continue ;; esac
-    [ $((now - mtime)) -ge "$FM_REMOTE_JOB_SEQ_CLAIM_REAP_SECONDS" ] || continue
-    rmdir "$claim" 2>/dev/null || true
-  done
+  marker="$FM_REMOTE_JOB_STATE/.seq-claims-reaped"
+  mtime=$(fm_remote_job_path_mtime "$marker" 2>/dev/null || true)
+  case "$mtime" in
+    ''|*[!0-9]*) reap_claims=1 ;;
+    *) [ $((now - mtime)) -lt "$FM_REMOTE_JOB_SEQ_CLAIM_REAP_INTERVAL" ] || reap_claims=1 ;;
+  esac
+  if [ "$reap_claims" -eq 1 ]; then
+    tmp=$(umask 077; mktemp "$FM_REMOTE_JOB_STATE/.seqreap.XXXXXX") || tmp=
+    if [ -n "$tmp" ] && printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" \
+      && mv -f -- "$tmp" "$marker"; then
+      for claim in "$FM_REMOTE_JOB_SEQ_CLAIMS"/*; do
+        [ -d "$claim" ] && [ ! -L "$claim" ] || continue
+        value=${claim##*/}
+        case "$value" in ''|*[!0-9]*|0) continue ;; esac
+        mtime=$(fm_remote_job_path_mtime "$claim" 2>/dev/null || true)
+        case "$mtime" in ''|*[!0-9]*) continue ;; esac
+        [ $((now - mtime)) -ge "$FM_REMOTE_JOB_SEQ_CLAIM_REAP_SECONDS" ] || continue
+        rmdir "$claim" 2>/dev/null || true
+      done
+    else
+      [ -z "$tmp" ] || rm -f -- "$tmp"
+    fi
+  fi
   # Staging litter a killed caller left behind is reaped after its owner is no
   # longer the process that created it and the stage has exceeded the age bound.
   for stage in "$FM_REMOTE_JOB_JOBS"/.stage.*; do
