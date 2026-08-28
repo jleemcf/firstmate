@@ -34,13 +34,23 @@
 # fm_worktree_claim_retire_begin <meta-file> <expected-worktree>
 # removes the exact worktree= claim before a provider return or removal can
 # make the path reusable, while retaining a byte-for-byte recovery copy.
-# Call fm_worktree_claim_retire_commit after provider success, or
-# fm_worktree_claim_retire_restore after provider failure.
+# Call fm_worktree_claim_retire_release once the provider has released the
+# path, or fm_worktree_claim_retire_restore when the provider operation failed.
 # It retires the worktree's .fm-task-owner marker in the same step, since that
 # marker is the in-worktree half of the same claim.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
 # returned slot with a stale destructive claim, and every later refusal over a
 # record with no claim names the surviving backup as its recovery source.
+#
+# fm_worktree_claim_retire_release marks the provider side done: the marker is
+# gone for good, so its backup is dropped and the slot is immediately reusable,
+# but the record's claim backup stays until the record itself is removed.
+# fm_worktree_claim_retire_commit discards that remaining backup, and must be
+# called only once no fallible step over the record is left.
+# fm_worktree_claim_retire_restore after a release therefore puts the claim
+# back without resurrecting the marker: the task record stays valid for a
+# retry, while the released slot stays unmarked and reusable, and any task that
+# does take it stamps the marker that refuses this record's next proof.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
@@ -261,11 +271,11 @@ fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spa
     return 1
   fi
   if [ -z "$expected_gen" ]; then
-    fm_worktree_refuse "worktree $canonical is marked for task $id generation $generation, but task metadata has no exact spawn generation."
+    fm_worktree_refuse "$marker marks worktree $canonical for task $id generation $generation, but task metadata has no exact spawn generation."
     return 1
   fi
   if [ "$generation" != "$expected_gen" ]; then
-    fm_worktree_refuse "worktree $canonical is marked for task $id generation $generation, not recorded generation $expected_gen."
+    fm_worktree_refuse "$marker marks worktree $canonical for task $id generation $generation, not recorded generation $expected_gen."
     return 1
   fi
   return 0
@@ -487,6 +497,17 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=$stash
 }
 
+fm_worktree_claim_retire_release() {
+  local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
+  [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
+  if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
+    fm_worktree_refuse "the worktree owner marker was retired, but its backup could not be removed at $marker_backup."
+    return 1
+  fi
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
+}
+
 fm_worktree_claim_retire_commit() {
   local backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
@@ -504,6 +525,18 @@ fm_worktree_claim_retire_commit() {
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+}
+
+# Abandons an open retirement at an unplanned exit: a record that still exists
+# gets its claim back so a plain rerun can act on it again, and a record that is
+# already gone only needs its backups dropped.
+fm_worktree_claim_retire_abandon() {
+  [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
+  if [ -f "$FM_WORKTREE_CLAIM_RETIRE_META" ] && [ ! -L "$FM_WORKTREE_CLAIM_RETIRE_META" ]; then
+    fm_worktree_claim_retire_restore
+    return $?
+  fi
+  fm_worktree_claim_retire_commit
 }
 
 fm_worktree_claim_retire_restore() {

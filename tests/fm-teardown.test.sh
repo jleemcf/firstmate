@@ -1326,6 +1326,76 @@ EOF
   pass "the worktree owner marker is retired before the slot can become reusable"
 }
 
+# The record must stay usable until the whole teardown has succeeded: a step
+# that fails after the pool return still leaves a task a plain rerun can finish.
+test_late_teardown_failure_leaves_a_rerunnable_record() {
+  local case_dir rc
+  case_dir=$(make_case late-failure-rerun)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  # A malformed status presentation manifest fails status_retire_presentation_task,
+  # which runs long after the pool return and just before the record is removed.
+  printf 'task-x1\tfirstmate:fm-task-x1\tnot-a-number\n' \
+    > "$case_dir/state/.status-presentation-cursor"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "late-failure-rerun: a failing late step must stop the teardown"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "late-failure-rerun: the fixture never reached the pool return it is about"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "late-failure-rerun: a stopped teardown discarded the task record"
+  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
+    "late-failure-rerun: the record kept no worktree claim for a rerun to act on"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "late-failure-rerun: a released pool slot was left marked for the departing task"
+
+  rm -f "$case_dir/state/.status-presentation-cursor"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "late-failure-rerun: the rerun should finish the teardown"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "late-failure-rerun: the rerun left the task record behind"
+  pass "a teardown step failing after the pool return leaves a record a rerun can finish"
+}
+
+# The pool return promises the shared repo will not accumulate task refs, and a
+# returned slot that is still sitting on the task branch is the case where the
+# promise silently broke.
+test_pool_return_drops_the_task_branch_from_the_project() {
+  local case_dir rc
+  case_dir=$(make_case return-drops-branch)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  # A provider that leaves the slot exactly where it found it - the same shape
+  # the backend conformance fixture models.
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "return-drops-branch: teardown should return the slot"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "return-drops-branch: the pool slot was never returned"
+  if git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1; then
+    fail "return-drops-branch: the task branch survived the pool return"
+  fi
+  pass "a returned pool slot leaves no task branch behind in the shared project"
+}
+
 test_dirty_worktree_refuses() {
   local case_dir rc pr_head
   case_dir=$(make_case dirty-wt)
@@ -3066,6 +3136,8 @@ test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
 test_same_task_id_with_a_different_marker_generation_refuses
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
+test_late_teardown_failure_leaves_a_rerunnable_record
+test_pool_return_drops_the_task_branch_from_the_project
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds

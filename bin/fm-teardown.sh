@@ -255,6 +255,7 @@ teardown_release_locks() {
     fm_lock_release "$LOCAL_REGISTRY_LOCK" || true
     LOCAL_REGISTRY_LOCK=
   fi
+  fm_worktree_claim_retire_abandon || true
   if [ "$META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$META_LOCK" || true
     META_LOCK_HELD=0
@@ -1428,13 +1429,19 @@ teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-
   return 1
 }
 
-teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <state> <task-id> <meta>
+teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <state> <task-id> <meta> [detach-branch]
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
-  local claim_state=$5 claim_id=$6 claim_meta=$7 rc
+  local claim_state=$5 claim_id=$6 claim_meta=$7 detach_branch=${8:-} rc
   fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
   fm_worktree_claim_retire_begin "$claim_meta" "$dir" || return 1
+  # The branch is no longer anyone's ownership evidence once the proof has run
+  # and the claim is retired, and the slot has to leave it before the shared
+  # repo can drop the ref.
+  if [ -n "$detach_branch" ] && [ "$detach_branch" != HEAD ] && [ -d "$dir" ]; then
+    git -C "$dir" checkout --detach -q 2>/dev/null || true
+  fi
   if teardown_treehouse_return_raw "$dir" "$cd_dir" "$label" "$post_cleanup_check"; then
-    fm_worktree_claim_retire_commit
+    fm_worktree_claim_retire_release
     return $?
   else
     rc=$?
@@ -1443,6 +1450,18 @@ teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <stat
     return 1
   fi
   return "$rc"
+}
+
+# Best effort by contract, but never silent: an undeletable task branch means
+# the shared repo keeps accumulating refs, and the only place that is visible
+# is here.
+teardown_drop_task_branch() {  # <project> <branch>
+  local project=$1 branch=$2 out
+  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 0
+  [ -n "$project" ] && [ -d "$project" ] || return 0
+  out=$(git -C "$project" branch -D "$branch" 2>&1) && return 0
+  git -C "$project" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 0
+  echo "warning: could not drop task branch $branch in $project: $out" >&2
 }
 
 validate_worktree_teardown_safety() {
@@ -1994,7 +2013,7 @@ teardown_remove_orca_worktree_claimed() {  # <state> <task-id> <meta> <worktree-
   [ -n "$claim_state" ] && [ -n "$claim_id" ] || return 1
   fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
   if fm_backend_remove_worktree orca "$worktree_id"; then
-    fm_worktree_claim_retire_commit
+    fm_worktree_claim_retire_release
     return $?
   else
     rc=$?
@@ -2008,7 +2027,7 @@ teardown_safe_rm_child_worktree_claimed() {  # <state> <task-id> <meta> <worktre
   fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
   fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
   if safe_rm_rf_child_worktree "$worktree" "$project"; then
-    fm_worktree_claim_retire_commit
+    fm_worktree_claim_retire_release
     return $?
   else
     rc=$?
@@ -2022,7 +2041,7 @@ teardown_safe_rm_firstmate_home_claimed() {  # <state> <task-id> <meta> <home> <
   fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
   fm_worktree_claim_retire_begin "$claim_meta" "$home" || return 1
   if safe_rm_rf "$home" "$label"; then
-    fm_worktree_claim_retire_commit
+    fm_worktree_claim_retire_release
     return $?
   else
     rc=$?
@@ -2639,6 +2658,7 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session" "$sub_state/$child_id.reconcile-nudged"
+    fm_worktree_claim_retire_commit || true
   done
 }
 
@@ -2859,7 +2879,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   teardown_remove_orca_worktree_claimed \
     "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || exit 1
-  [ "$branch" = HEAD ] || git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
+  teardown_drop_task_branch "$PROJ" "$branch"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
@@ -2874,11 +2894,11 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
   teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" \
-    "$STATE" "$ID" "$META" || {
+    "$STATE" "$ID" "$META" "$branch" || {
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   }
-  [ "$branch" = HEAD ] || git -C "$PROJ" branch -D "$branch" >/dev/null 2>&1 || true
+  teardown_drop_task_branch "$PROJ" "$branch"
 fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
@@ -2987,6 +3007,7 @@ rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
+fm_worktree_claim_retire_commit || true
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.

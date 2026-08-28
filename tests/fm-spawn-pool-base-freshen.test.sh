@@ -82,6 +82,9 @@ test_stale_pool_base_refreshes_before_branching() {
   id='pool-current-base-repeat-r1'
   mkdir -p "$HOME_DIR/data/$id"
   printf 'brief for %s\n' "$id" > "$HOME_DIR/data/$id/brief.md"
+  # Teardown clears the owner marker when it returns the slot; without that the
+  # pool would be handing a live task's workspace to a second task.
+  rm -f "$POOL_DIR/.fm-task-owner"
   out=$(run_spawn "$id" --mode no-mistakes --yolo off)
   status=$?
   expect_code 0 "$status" "repeating the base refresh should be idempotent"
@@ -94,6 +97,40 @@ test_stale_pool_base_refreshes_before_branching() {
   assert_grep 'must survive a newly spawned branch' "$POOL_DIR/advanced-main.txt" \
     "the branch created after spawn omitted advanced-main content"
   pass "a stale pooled worktree refreshes to current origin/main before a crew branch is created"
+}
+
+# A pool slot that still carries another task's owner marker is that task's live
+# workspace. Handing it to a second agent is the exact way one task destroys
+# another's work, so acquisition refuses rather than restamping it.
+test_fresh_spawn_refuses_a_slot_marked_for_another_task() {
+  local rec id other out status
+  id='pool-foreign-marker-r1'
+  rec=$(make_case foreign-marker "$id")
+  read_case_record "$rec"
+
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off)
+  status=$?
+  expect_code 0 "$status" "the first spawn should take the pool slot"$'\n'"$out"
+
+  other='pool-foreign-marker-r2'
+  mkdir -p "$HOME_DIR/data/$other"
+  printf 'brief for %s\n' "$other" > "$HOME_DIR/data/$other/brief.md"
+
+  out=$(run_spawn "$other" --mode no-mistakes --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted a slot still marked for task $id"
+  assert_contains "$out" "already belongs to task $id" \
+    "the refusal did not name the task that still owns the slot"
+  assert_contains "$out" "not task $other" \
+    "the refusal did not name the task being refused"
+  assert_grep "task_id=$id" "$POOL_DIR/.fm-task-owner" \
+    "the refused spawn overwrote the live task's owner marker"
+  assert_absent "$HOME_DIR/state/$other.meta" \
+    "the refused spawn published a task record for the slot it could not own"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed foreign-marker refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 2 | head -n 1)"
+  fi
+  pass "a fresh spawn refuses a pool slot another task's owner marker still claims"
 }
 
 test_non_main_default_branch_refreshes_before_branching() {
@@ -278,6 +315,9 @@ strand_submodule_pin_via_spawn() {  # <seed-id>
     || fail "the first spawn did not move the pooled base across the moved submodule pin"
   [ "$(git -C "$POOL_DIR/ui" rev-parse HEAD)" = "$SUBPIN1" ] \
     || fail "the first spawn did not strand the submodule on the pin the old base recorded"
+  # The seed task hands the slot back the way a teardown would, so the case
+  # under test acquires an unowned slot rather than a live task's workspace.
+  rm -f "$POOL_DIR/.fm-task-owner"
 }
 
 test_stale_submodule_pin_explains_itself() {
@@ -427,6 +467,7 @@ test_stale_pin_beside_other_dirt_reports_one_verdict() {
 
 test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
+test_fresh_spawn_refuses_a_slot_marked_for_another_task
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool

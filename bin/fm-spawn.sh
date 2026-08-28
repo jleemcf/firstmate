@@ -840,6 +840,7 @@ spawn_abort_cleanup() {
             echo "effort=${EFFORT:-default}"
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+            [ -z "${SPAWN_GEN:-}" ] || echo "spawn_gen=$SPAWN_GEN"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
           } > "$SPAWN_META_TMP" 2>/dev/null \
             && fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE" \
@@ -2422,6 +2423,26 @@ exclude_path() {
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
 
+# Prints the task id an existing owner marker names when that is not this task,
+# or the reason it cannot be attributed at all. Silent and 0 only when the slot
+# carries no marker or carries this task's own.
+task_worktree_owner_marker_holder() {  # <marker>
+  local marker=$1 owner
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  if [ ! -f "$marker" ] || [ -L "$marker" ]; then
+    printf '%s' 'an unreadable marker that is not a regular file'
+    return 1
+  fi
+  owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
+  if [ -z "$owner" ]; then
+    printf '%s' 'a marker with no readable task identity'
+    return 1
+  fi
+  [ "$owner" != "$ID" ] || return 0
+  printf 'task %s' "$owner"
+  return 1
+}
+
 # Stamp this task's identity and this exact spawn generation into the worktree
 # after the in-pane treehouse subshell has settled there. The generation keeps
 # a recycled slot distinguishable even when a later task reuses the same id.
@@ -2429,9 +2450,14 @@ exclude_path() {
 # bin/fm-teardown.sh removes the marker before the slot is released. Exclude it
 # from git first so it can never read as uncommitted work.
 stamp_task_worktree_owner() {
-  local marker tmp
+  local marker tmp holder
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   marker="$WT/$FM_WORKTREE_TASK_OWNER_MARKER"
+  if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
+    echo "error: worktree $WT already belongs to $holder, not task $ID; refusing to launch task $ID into another task's workspace" >&2
+    echo "Its owner marker is $marker; release that slot through its own teardown before reusing it." >&2
+    return 1
+  fi
   exclude_path "$FM_WORKTREE_TASK_OWNER_MARKER"
   if [ "$RELAUNCH" -eq 1 ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
     SPAWN_TASK_OWNER_BACKUP=$(umask 077; mktemp "$STATE/.$ID.task-owner-prior.XXXXXX") || return 1
@@ -2469,11 +2495,18 @@ task_record_publishes_spawn_gen() {
 }
 
 clear_aborted_task_worktree_owner_stamp() {
-  local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER"
+  local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER" holder
   [ "$SPAWN_TASK_OWNER_STAMPED" = 1 ] || return 0
   if task_record_publishes_spawn_gen; then
     commit_task_worktree_owner_stamp
     return $?
+  fi
+  if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
+    echo "error: worktree ${WT:-} is now marked for $holder, so task $ID's aborted spawn left $marker untouched" >&2
+    [ -z "$SPAWN_TASK_OWNER_BACKUP" ] \
+      || echo "task $ID's superseded owner marker remains recoverable at $SPAWN_TASK_OWNER_BACKUP" >&2
+    SPAWN_TASK_OWNER_STAMPED=0
+    return 1
   fi
   if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
     mv -f -- "$SPAWN_TASK_OWNER_BACKUP" "$marker" || return 1
