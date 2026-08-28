@@ -881,6 +881,7 @@ worker_process_once() { # <account-home>
     state=$(fm_remote_job_read_state "$job" 2>/dev/null || true)
     case "$state" in
       queued)
+        worker_lane_owns_job "$job" && continue
         worker_clear_dead_claim "$job" || continue
         if fm_remote_job_cancelled "$job"; then
           worker_finalize_cancelled "$account_home" "$job" || true
