@@ -62,6 +62,12 @@
 # backup as the recovery source every later refusal names.
 # fm_worktree_claim_retire_commit discards a retirement's leftovers once the
 # record it describes is gone.
+#
+# fm_worktree_owner_pending_write/_read/_clear carry the durable half of the
+# owner-marker binding across the window in which a spawn holds a slot but has
+# not published its task record yet. fm_worktree_owner_marker_attribution reads
+# that pair back, so a refusal over another task's marker can tell an operator
+# whether a teardown owns the slot, an interrupted spawn does, or nothing does.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
@@ -272,6 +278,87 @@ fm_worktree_retirement_receipt_clear() {  # <meta-file>
     rm -f -- "$candidate" || rc=1
   done
   return "$rc"
+}
+
+# The durable half of the owner-marker binding. bin/fm-spawn.sh publishes it
+# beside the state directory BEFORE it stamps .fm-task-owner into the slot and
+# before the base freshen and harness launch that follow, so a spawn killed
+# anywhere in that window leaves a marker something can still attribute to a
+# task, a spawn generation, and a path - not an orphan that refuses the slot to
+# every later spawn with no record to name as its remedy.
+# It records an intent, never an outcome: nothing resolves a destructive target
+# through it, it satisfies no ownership proof, and it is superseded the moment
+# state/<id>.meta publishes the same generation.
+fm_worktree_owner_pending_path() {  # <state-dir> <task-id>
+  printf '%s/.%s.meta.worktree-owner-pending' "$1" "$2"
+}
+
+fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktree>
+  local state=$1 id=$2 generation=$3 worktree=$4 pending tmp
+  [ -n "$state" ] && [ -n "$id" ] && [ -n "$generation" ] && [ -n "$worktree" ] || return 1
+  pending=$(fm_worktree_owner_pending_path "$state" "$id")
+  tmp="$pending.next.${BASHPID:-$$}"
+  if ! (umask 077; {
+      printf '%s\n' 'schema=fm-task-owner-pending.v1'
+      printf 'task_id=%s\n' "$id"
+      printf 'spawn_gen=%s\n' "$generation"
+      printf 'worktree=%s\n' "$worktree"
+    } > "$tmp") || ! mv -f -- "$tmp" "$pending"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# 0 and prints the worktree this exact task and generation was being launched
+# into, 1 for every other state. Bound to both halves, so a record left by an
+# earlier generation never attributes a later one's marker.
+fm_worktree_owner_pending_read() {  # <state-dir> <task-id> <spawn-gen>
+  local state=$1 id=$2 generation=$3 pending
+  [ -n "$generation" ] || return 1
+  pending=$(fm_worktree_owner_pending_path "$state" "$id")
+  [ -f "$pending" ] && [ ! -L "$pending" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$pending" schema 2>/dev/null || true)" \
+    = fm-task-owner-pending.v1 ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$pending" task_id 2>/dev/null || true)" = "$id" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$pending" spawn_gen 2>/dev/null || true)" \
+    = "$generation" ] || return 1
+  fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || return 1
+}
+
+# Retracts only the record this exact generation published, so neither an abort
+# nor a teardown can withdraw a different incarnation's claim on the slot.
+fm_worktree_owner_pending_clear() {  # <state-dir> <task-id> <spawn-gen>
+  local state=$1 id=$2 generation=$3
+  fm_worktree_owner_pending_read "$state" "$id" "$generation" >/dev/null 2>&1 || return 0
+  rm -f -- "$(fm_worktree_owner_pending_path "$state" "$id")"
+}
+
+# What durable metadata, if any, still stands behind an owner marker, so a
+# refusal over a foreign one can name a remedy that exists rather than a
+# teardown for a task that was never recorded. Prints exactly one of:
+#   record  - the marked task has a task record, so its teardown owns the slot
+#   pending - no record, but the marked task's own spawn published this exact
+#             generation's ownership record before it was interrupted
+#   orphan  - nothing in this home attributes the marker to any task
+# It only reads: the marker is never moved, rewritten, or removed here.
+fm_worktree_owner_marker_attribution() {  # <state-dir> <marker-path>
+  local state=$1 marker=$2 owner generation
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
+  [ -n "$owner" ] || return 1
+  case "$owner" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  if [ -f "$state/$owner.meta" ] && [ ! -L "$state/$owner.meta" ]; then
+    printf '%s' record
+    return 0
+  fi
+  generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
+  if fm_worktree_owner_pending_read "$state" "$owner" "$generation" >/dev/null 2>&1; then
+    printf '%s' pending
+    return 0
+  fi
+  printf '%s' orphan
 }
 
 fm_worktree_refuse() {  # <message>

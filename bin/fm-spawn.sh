@@ -712,6 +712,7 @@ spawn_remote_secondmate() {
 BACKEND=
 SPAWN_TASK_OWNER_STAMPED=0
 SPAWN_TASK_OWNER_BACKUP=
+SPAWN_TASK_OWNER_PENDING=0
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
@@ -770,7 +771,7 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
-  if [ "$SPAWN_TASK_OWNER_STAMPED" = 1 ]; then
+  if [ "$SPAWN_TASK_OWNER_STAMPED" = 1 ] || [ "$SPAWN_TASK_OWNER_PENDING" = 1 ]; then
     clear_aborted_task_worktree_owner_stamp \
       || echo "warning: task $ID's worktree owner marker could not be cleared after an aborted spawn" >&2
   fi
@@ -2450,6 +2451,35 @@ task_worktree_owner_marker_holder() {  # <marker>
   return 1
 }
 
+# Names the recovery an operator can actually perform for the marker that just
+# refused this slot. A teardown only exists while the marked task still has a
+# record; an interrupted spawn leaves its ownership record instead, and a marker
+# nothing attributes leaves only itself. Nothing here reclaims, overwrites, or
+# removes the foreign marker - the slot stays refused either way.
+report_foreign_owner_marker_remedy() {  # <marker>
+  local marker=$1 attribution owner pending
+  attribution=$(fm_worktree_owner_marker_attribution "$STATE" "$marker" 2>/dev/null) || attribution=
+  owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
+  case "$attribution" in
+    record)
+      echo "Its owner marker is $marker; release that slot through task $owner's own teardown before reusing it." >&2
+      ;;
+    pending)
+      pending=$(fm_worktree_owner_pending_path "$STATE" "$owner")
+      echo "Its owner marker is $marker. Task $owner has no task record: its spawn was interrupted after it took this slot, and its ownership record at $pending names this same slot and generation." >&2
+      echo "No teardown exists for task $owner. Confirm no agent is still working in $WT, then remove $marker and $pending to release the slot." >&2
+      ;;
+    orphan)
+      echo "Its owner marker is $marker, but no task record and no spawn ownership record in $STATE attributes it to any task." >&2
+      echo "No teardown exists for it. Confirm no agent is still working in $WT, then remove $marker to release the slot." >&2
+      ;;
+    *)
+      echo "Its owner marker is $marker, and it cannot be read well enough to attribute to any task." >&2
+      echo "Confirm no agent is still working in $WT, then repair or remove $marker to release the slot." >&2
+      ;;
+  esac
+}
+
 # Stamp this task's identity and this exact spawn generation into the worktree
 # after the in-pane treehouse subshell has settled there. The generation keeps
 # a recycled slot distinguishable even when a later task reuses the same id.
@@ -2462,7 +2492,7 @@ stamp_task_worktree_owner() {
   marker="$WT/$FM_WORKTREE_TASK_OWNER_MARKER"
   if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
     echo "error: worktree $WT already belongs to $holder, not task $ID; refusing to launch task $ID into another task's workspace" >&2
-    echo "Its owner marker is $marker; release that slot through its own teardown before reusing it." >&2
+    report_foreign_owner_marker_remedy "$marker"
     return 1
   fi
   exclude_path "$FM_WORKTREE_TASK_OWNER_MARKER"
@@ -2474,6 +2504,16 @@ stamp_task_worktree_owner() {
       return 1
     fi
   fi
+  # The durable half of the binding goes down first. Everything from here to
+  # the record's publication - the base freshen's network fetch and the whole
+  # harness launch - is a window a SIGKILL or a reboot can end without running
+  # this script's abort trap, and a marker stamped without this record would
+  # survive that as an orphan no operator could attribute or safely clear.
+  if ! fm_worktree_owner_pending_write "$STATE" "$ID" "$SPAWN_GEN" "$WT"; then
+    echo "error: could not publish task $ID's ownership record for $WT in $STATE; refusing to stamp an owner marker nothing could attribute after an interrupted spawn" >&2
+    return 1
+  fi
+  SPAWN_TASK_OWNER_PENDING=1
   tmp="$marker.next.${BASHPID:-$$}"
   if ! (umask 077; {
       printf '%s\n' 'schema=fm-task-owner.v1'
@@ -2501,9 +2541,26 @@ task_record_publishes_spawn_gen() {
   [ -n "$recorded" ] && [ "$recorded" = "$SPAWN_GEN" ]
 }
 
+# Retracts only the ownership record this exact generation published, so an
+# abort can never withdraw a concurrent or later incarnation's claim on the
+# slot. Its absence is success: nothing was published, or it is already gone.
+clear_task_worktree_owner_pending() {
+  [ "$SPAWN_TASK_OWNER_PENDING" = 1 ] || return 0
+  fm_worktree_owner_pending_clear "$STATE" "$ID" "$SPAWN_GEN" || {
+    echo "warning: task $ID's superseded ownership record remains at $(fm_worktree_owner_pending_path "$STATE" "$ID")" >&2
+    return 1
+  }
+  SPAWN_TASK_OWNER_PENDING=0
+}
+
 clear_aborted_task_worktree_owner_stamp() {
   local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER" holder
-  [ "$SPAWN_TASK_OWNER_STAMPED" = 1 ] || return 0
+  if [ "$SPAWN_TASK_OWNER_STAMPED" != 1 ]; then
+    # The record went down first, so an abort before the marker existed still
+    # has one to retract.
+    clear_task_worktree_owner_pending
+    return $?
+  fi
   if task_record_publishes_spawn_gen; then
     commit_task_worktree_owner_stamp
     return $?
@@ -2513,6 +2570,7 @@ clear_aborted_task_worktree_owner_stamp() {
     [ -z "$SPAWN_TASK_OWNER_BACKUP" ] \
       || echo "task $ID's superseded owner marker remains recoverable at $SPAWN_TASK_OWNER_BACKUP" >&2
     SPAWN_TASK_OWNER_STAMPED=0
+    clear_task_worktree_owner_pending || true
     return 1
   fi
   if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
@@ -2522,6 +2580,7 @@ clear_aborted_task_worktree_owner_stamp() {
   fi
   SPAWN_TASK_OWNER_BACKUP=
   SPAWN_TASK_OWNER_STAMPED=0
+  clear_task_worktree_owner_pending
 }
 
 commit_task_worktree_owner_stamp() {
@@ -2531,6 +2590,9 @@ commit_task_worktree_owner_stamp() {
   fi
   SPAWN_TASK_OWNER_BACKUP=
   SPAWN_TASK_OWNER_STAMPED=0
+  # The record now publishes this generation itself, so it supersedes the
+  # ownership record that carried the binding until it existed.
+  clear_task_worktree_owner_pending || true
 }
 
 SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"

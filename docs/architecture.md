@@ -200,6 +200,7 @@ A returned pool slot is reissued to a later task, so no cleanup, relaunch, or re
 [`bin/fm-worktree-ownership-lib.sh`](../bin/fm-worktree-ownership-lib.sh) is the single owner of that proof, and `fm-spawn.sh` writes its positive binding: a `.fm-task-owner` marker, excluded from git, naming the task id and spawn generation the worktree belongs to.
 `fm-spawn.sh --relaunch`, `fm-control.sh relaunch`, and `fm-teardown.sh` each refuse before touching the recorded path when that marker, a secondmate home's own identity marker, the Orca worktree id, the task branch, or another task's claim on the same path contradicts the record.
 `fm-teardown.sh` retires the marker together with the record's worktree claim, so a slot handed back to the pool never carries a live claim from the task that just left it.
+The durable half of that binding goes down first: before it stamps the marker, `fm-spawn.sh` publishes an ownership record beside the state directory naming the task, the spawn generation, and the slot, so a spawn killed before it can publish its task record leaves a marker an operator can still attribute and clear rather than one that refuses the slot forever.
 The library's header owns the exact bindings, the retirement ordering, and the recovery contract for an interrupted retirement.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.

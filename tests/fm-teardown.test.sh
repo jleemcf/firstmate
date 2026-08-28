@@ -1669,6 +1669,35 @@ EOF
   pass "a receipt-backed rerun still drops the task branch whose return it skipped"
 }
 
+# Every dirty and unlanded-work gate is scoped to a worktree that still exists,
+# so a record whose recorded path is gone reaches record cleanup with nothing
+# ever having inspected the work. fm/<id> is then the only place that work
+# survives, and dropping the ref there makes it unreachable in the shared repo.
+test_vanished_worktree_teardown_keeps_the_task_branch() {
+  local case_dir rc head
+  case_dir=$(make_case vanished-wt-branch)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  wt_commit "$case_dir" "crew work that was never pushed"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  # The slot is gone and its registration pruned - the exact state in which
+  # `git branch -D` stops refusing "cannot delete branch used by worktree".
+  rm -rf "$case_dir/wt"
+  git -C "$case_dir/project" worktree prune
+
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "vanished-wt-branch: teardown should finish over a vanished worktree"$'\n'"$(cat "$case_dir/stderr")"
+  git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1 \
+    || fail "vanished-wt-branch: teardown deleted the task branch holding work no gate ever inspected"
+  [ "$(git -C "$case_dir/project" rev-parse refs/heads/fm/task-x1)" = "$head" ] \
+    || fail "vanished-wt-branch: the surviving task branch no longer holds the crew's commit"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "vanished-wt-branch: the task record outlived its own teardown"
+  pass "a teardown over a vanished worktree keeps the task branch its unlanded work is on"
+}
+
 # fm/<id> is the only ref teardown owns; whatever else the crewmate checked out
 # in the slot belongs to the crew, not to cleanup.
 test_pool_return_drops_only_this_tasks_branch() {
@@ -3470,6 +3499,7 @@ test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
+test_vanished_worktree_teardown_keeps_the_task_branch
 test_pool_return_drops_only_this_tasks_branch
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses

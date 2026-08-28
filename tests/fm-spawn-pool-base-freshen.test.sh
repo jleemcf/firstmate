@@ -52,6 +52,32 @@ $1
 EOF
 }
 
+# The durable ownership record fm-spawn publishes before it stamps a slot's
+# owner marker. bin/fm-worktree-ownership-lib.sh owns this path and its format.
+owner_pending_record() {  # <task-id>
+  printf '%s/state/.%s.meta.worktree-owner-pending' "$HOME_DIR" "$1"
+}
+
+# Replaces git with a shim that SIGKILLs its parent - the fm-spawn shell that
+# invokes `git -C <slot> fetch` directly - the first time the pooled base
+# freshen reaches the network. SIGKILL is the one abort fm-spawn's EXIT trap
+# cannot run through, so this reproduces a crashed or rebooted host exactly at
+# the point where the slot is already stamped but no task record exists yet.
+install_git_that_kills_spawn_on_fetch() {  # <fakebin> <arming-flag>
+  local fakebin=$1 flag=$2 real
+  real=$(command -v git)
+  cat > "$fakebin/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = -C ] && [ "\${3:-}" = fetch ] && [ -e "$flag" ]; then
+  rm -f "$flag"
+  kill -9 "\$PPID"
+  exit 1
+fi
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/git"
+}
+
 run_spawn() {
   local id=$1
   shift
@@ -73,6 +99,15 @@ test_stale_pool_base_refreshes_before_branching() {
   branch_head=$(git -C "$POOL_DIR" rev-parse HEAD)
   [ "$branch_head" = "$current" ] || fail "spawn left the pooled worktree on stale history"
   [ "$branch_head" != "$INITIAL_SHA" ] || fail "fixture did not prove origin/main advanced past the pool base"
+  assert_grep 'schema=fm-task-owner.v1' "$POOL_DIR/.fm-task-owner" \
+    "spawn did not stamp a versioned owner marker"
+  assert_grep "task_id=$id" "$POOL_DIR/.fm-task-owner" \
+    "spawn owner marker does not name the task"
+  assert_grep "spawn_gen=$(grep '^spawn_gen=' "$HOME_DIR/state/$id.meta" | cut -d= -f2-)" \
+    "$POOL_DIR/.fm-task-owner" \
+    "spawn owner marker generation does not match metadata"
+  assert_absent "$(owner_pending_record "$id")" \
+    "the published task record left its superseded ownership record behind"
   if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
     printf '# observed spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
     printf '# observed base: HEAD=%s origin/main=%s advanced-main=%s\n' \
@@ -133,6 +168,96 @@ test_fresh_spawn_refuses_a_slot_marked_for_another_task() {
   pass "a fresh spawn refuses a pool slot another task's owner marker still claims"
 }
 
+# A spawn killed between taking the slot and publishing its task record used to
+# leave a marker nothing could attribute: no record existed, so no teardown
+# existed either, and the pool slot refused every later spawn forever while the
+# refusal named a teardown that could not be run. The ownership record now goes
+# down before the marker, so the interruption leaves recoverable metadata.
+test_killed_spawn_leaves_an_attributable_ownership_record() {
+  local rec id other out status pending marker_gen
+  id='pool-killed-spawn-r1'
+  rec=$(make_case killed-spawn "$id")
+  read_case_record "$rec"
+  pending=$(owner_pending_record "$id")
+  install_git_that_kills_spawn_on_fetch "$FAKEBIN_DIR" "$CASE_DIR/kill-on-fetch"
+  : > "$CASE_DIR/kill-on-fetch"
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+
+  [ "$status" -ne 0 ] || fail "the fixture never interrupted the spawn"$'\n'"$out"
+  assert_present "$POOL_DIR/.fm-task-owner" \
+    "the fixture did not reproduce an interruption that skips the abort trap"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "the fixture published a task record, so the slot was never orphaned"
+  assert_present "$pending" \
+    "the killed spawn left its owner marker with no ownership record to attribute it"
+  marker_gen=$(grep '^spawn_gen=' "$POOL_DIR/.fm-task-owner" | cut -d= -f2-)
+  [ -n "$marker_gen" ] || fail "the orphaned marker carries no spawn generation"
+  assert_grep "spawn_gen=$marker_gen" "$pending" \
+    "the surviving ownership record names a different generation than the marker"
+  assert_grep "worktree=$POOL_DIR" "$pending" \
+    "the surviving ownership record does not name the slot the marker sits in"
+
+  # The recovery an operator can actually perform has to be the one the refusal
+  # names: there is no task record here, so there is no teardown to run.
+  other='pool-killed-spawn-r2'
+  mkdir -p "$HOME_DIR/data/$other"
+  printf 'brief for %s\n' "$other" > "$HOME_DIR/data/$other/brief.md"
+  status=0
+  out=$(run_spawn "$other" --mode no-mistakes --yolo off) || status=$?
+
+  [ "$status" -ne 0 ] || fail "spawn accepted a slot an interrupted spawn still marks"
+  assert_contains "$out" "already belongs to task $id" \
+    "the refusal did not name the task the marker belongs to"
+  assert_contains "$out" "No teardown exists for task $id" \
+    "the refusal still points at a teardown for a task that has no record"
+  assert_contains "$out" "$pending" \
+    "the refusal did not name the interrupted spawn's ownership record"
+  assert_grep "task_id=$id" "$POOL_DIR/.fm-task-owner" \
+    "the refused spawn reclaimed another task's owner marker"
+  assert_present "$pending" \
+    "the refused spawn deleted another task's ownership record"
+  assert_absent "$(owner_pending_record "$other")" \
+    "the refused spawn left its own ownership record on a slot it never took"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed interrupted-owner refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 2 | head -n 1)"
+  fi
+  pass "a spawn killed before publishing its record leaves an attributable owner marker"
+}
+
+# A marker whose task this home has no metadata for at all - what survives once
+# an interrupted spawn's ownership record has been cleaned up but the slot was
+# returned without clearing the marker. The slot still refuses, but the remedy
+# named is the only one that exists.
+test_unattributed_owner_marker_refusal_names_a_remedy_that_exists() {
+  local rec id out status
+  id='pool-orphan-marker-r1'
+  rec=$(make_case orphan-marker "$id")
+  read_case_record "$rec"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf 'task_id=%s\n' 'gone-task-r9'
+    printf 'spawn_gen=%s\n' 'sgone.1.1'
+  } > "$POOL_DIR/.fm-task-owner"
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+
+  [ "$status" -ne 0 ] || fail "spawn accepted a slot another task's marker still claims"
+  assert_contains "$out" "already belongs to task gone-task-r9" \
+    "the refusal did not name the task the marker claims"
+  assert_contains "$out" "no spawn ownership record" \
+    "the refusal did not report that nothing attributes the marker"
+  assert_contains "$out" "remove $POOL_DIR/.fm-task-owner to release the slot" \
+    "the refusal did not name the only recovery available for an unattributed marker"
+  assert_grep "task_id=gone-task-r9" "$POOL_DIR/.fm-task-owner" \
+    "the refused spawn overwrote an unattributed marker instead of refusing"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "the refused spawn published a task record for a slot it could not own"
+  pass "an unattributed owner marker refuses the slot and names a recovery that exists"
+}
+
 test_non_main_default_branch_refreshes_before_branching() {
   local rec id out status current branch_head
   id='pool-current-trunk-r2'
@@ -164,6 +289,12 @@ test_unreachable_origin_refuses_stale_pool_base() {
     "spawn did not clearly refuse an unreachable origin"
   after=$(git -C "$POOL_DIR" rev-parse HEAD)
   [ "$after" = "$before" ] || fail "spawn changed the pooled worktree after origin became unreachable"
+  assert_absent "$POOL_DIR/.fm-task-owner" \
+    "an aborted spawn returned control with a stale owner marker in the pool slot"
+  assert_absent "$(owner_pending_record "$id")" \
+    "an aborted spawn left this generation's ownership record behind"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "an aborted spawn published task metadata despite failing before launch"
   if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
     printf '# observed unreachable-origin refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
   fi
@@ -468,6 +599,8 @@ test_stale_pin_beside_other_dirt_reports_one_verdict() {
 test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
 test_fresh_spawn_refuses_a_slot_marked_for_another_task
+test_killed_spawn_leaves_an_attributable_ownership_record
+test_unattributed_owner_marker_refusal_names_a_remedy_that_exists
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool

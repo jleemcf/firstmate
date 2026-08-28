@@ -736,6 +736,8 @@ WORKTREE_RETIRED=0
 if fm_worktree_retirement_receipt_present "$META" >/dev/null 2>&1; then
   WORKTREE_RETIRED=1
 fi
+# Set only once THIS run has taken the recorded path back from its provider.
+TASK_WORKTREE_RELEASED=0
 BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
@@ -2956,6 +2958,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     elif [ "$return_rc" -ne 0 ]; then
       exit 1
     fi
+    TASK_WORKTREE_RELEASED=1
   fi
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
@@ -2980,9 +2983,17 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   fi
+  TASK_WORKTREE_RELEASED=1
 fi
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
-if [ "$KIND" != secondmate ]; then
+# Only once the task's path is provably out of play: either this run just
+# released it above (every landed and dirty-work gate having passed, or --force
+# having waived them), or a retirement receipt proves an earlier run already
+# did. A record whose recorded path merely no longer exists passed no such gate
+# - nothing inspected it for unpushed commits, because there was nothing to
+# inspect - so fm/<id> may still be the only place that work survives.
+if [ "$KIND" != secondmate ] \
+  && { [ "$WORKTREE_RETIRED" = 1 ] || [ "$TASK_WORKTREE_RELEASED" = 1 ]; }; then
   teardown_drop_task_branch "$PROJ" "$ID"
 fi
 
@@ -3085,6 +3096,11 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+# A spawn killed between publishing its ownership record and its task record
+# leaves that record behind; the task record it was standing in for is going
+# away now, so the exact generation it named goes with it.
+fm_worktree_owner_pending_clear "$STATE" "$ID" \
+  "$(fm_worktree_meta_exact_value "$META" spawn_gen 2>/dev/null || true)" || true
 rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
