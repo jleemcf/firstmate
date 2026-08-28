@@ -32,11 +32,12 @@ TMP_ROOT=$(cd "$TMP_ROOT" && pwd -P)
 REMOTE_ROOT="$TMP_ROOT/remote-root"
 HOME_A="$TMP_ROOT/home-a"
 HOME_B="$TMP_ROOT/home-b"
+HOME_EDGE="$TMP_ROOT/home-a "
 LOCAL_HOME="$TMP_ROOT/local-home"
 ACCOUNT_HOME="$TMP_ROOT/account"
 STATE_ROOT="$TMP_ROOT/remote-jobs"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT/fakebin")
-mkdir -p "$REMOTE_ROOT/bin" "$HOME_A" "$HOME_B" "$LOCAL_HOME/data" "$ACCOUNT_HOME"
+mkdir -p "$REMOTE_ROOT/bin" "$HOME_A" "$HOME_B" "$HOME_EDGE" "$LOCAL_HOME/data" "$ACCOUNT_HOME"
 
 cleanup_lane_fixture() {
   if [ -f "$STATE_ROOT/worker.pid" ]; then
@@ -118,100 +119,27 @@ export FM_REMOTE_JOB_STAGE_REAP_SECONDS=1
 
 fm_remote_job_prepare_state "$ACCOUNT_HOME" || fail "$FM_REMOTE_JOB_ERROR"
 rm -f -- "$STATE_ROOT/seq"
-SEQ_READ_BLOCKED="$TMP_ROOT/seq-read-blocked"
-SEQ_READ_RELEASE="$TMP_ROOT/seq-read-release"
-cat() {
-  if [ "${1:-}" = "$STATE_ROOT/seq" ] && mkdir "$TMP_ROOT/seq-read-once" 2>/dev/null; then
-    : > "$SEQ_READ_BLOCKED"
-    while [ ! -f "$SEQ_READ_RELEASE" ]; do sleep 0.02; done
-    printf '0\n'
-    return 0
-  fi
-  command cat "$@"
-}
-fm_remote_job_next_seq > "$TMP_ROOT/seq-first" &
-SEQ_FIRST_PID=$!
-for _ in $(seq 1 200); do
-  [ -f "$STATE_ROOT/.seq.lock/owner" ] && [ -f "$SEQ_READ_BLOCKED" ] && break
-  sleep 0.02
+SEQ_PIDS=()
+for i in $(seq 1 20); do
+  fm_remote_job_next_seq > "$TMP_ROOT/seq-$i" &
+  SEQ_PIDS+=("$!")
 done
-assert_present "$STATE_ROOT/.seq.lock/owner" "the first sequence allocator did not acquire its lock"
-touch -t 200001010000 "$STATE_ROOT/.seq.lock"
-fm_remote_job_next_seq > "$TMP_ROOT/seq-second" &
-SEQ_SECOND_PID=$!
-for _ in $(seq 1 400); do
-  [ -f "$STATE_ROOT/seq" ] && break
-  sleep 0.02
+for pid in "${SEQ_PIDS[@]}"; do
+  wait "$pid" || fail "a concurrent sequence allocator failed"
 done
-assert_present "$STATE_ROOT/seq" "the replacement sequence allocator did not publish"
-: > "$SEQ_READ_RELEASE"
-wait "$SEQ_FIRST_PID" || fail "the displaced sequence allocator did not retry"
-wait "$SEQ_SECOND_PID" || fail "the replacement sequence allocator failed"
-unset -f cat
-SEQ_RESULTS=$(printf '%s\n%s\n' "$(cat "$TMP_ROOT/seq-first")" "$(cat "$TMP_ROOT/seq-second")" | sort -n)
-[ "$SEQ_RESULTS" = "$(printf '1\n2')" ] \
-  || fail "stale-lock recovery reused or regressed sequence values: $SEQ_RESULTS"
-[ "$(cat "$STATE_ROOT/seq")" = 2 ] || fail "the sequence counter did not retain both allocations"
-pass "a displaced stale-lock holder retries without reusing a sequence"
-
-mkdir "$STATE_ROOT/.seq.lock"
-printf 'orphaned-holder\n' > "$STATE_ROOT/.seq.lock/owner"
-chmod 600 "$STATE_ROOT/.seq.lock/owner"
-SEQ_RECOVERY_BEGAN=$(date +%s)
-fm_remote_job_next_seq > "$TMP_ROOT/seq-after-fresh-orphan" \
-  || fail "a fresh orphaned sequence lock was not recovered"
-SEQ_RECOVERY_ELAPSED=$(( $(date +%s) - SEQ_RECOVERY_BEGAN ))
-[ "$(cat "$TMP_ROOT/seq-after-fresh-orphan")" = 3 ] \
-  || fail "fresh orphan recovery did not allocate the next sequence"
-[ "$SEQ_RECOVERY_ELAPSED" -le 10 ] \
-  || fail "fresh orphan recovery exceeded its retry deadline: ${SEQ_RECOVERY_ELAPSED}s"
-pass "a fresh orphaned sequence lock survives until stale recovery"
-
-# Reproduce a stale-lock displacement after the first stage is visible but
-# before its holder commits the counter. The replacement stage must recover the
-# visible sequence rather than reuse it and leave FIFO to random job ids.
-STALE_PUBLISH_LOG="$TMP_ROOT/stale-publish-order"
-STALE_PUBLISH_BLOCKED="$TMP_ROOT/stale-publish-blocked"
-STALE_PUBLISH_RELEASE="$TMP_ROOT/stale-publish-release"
-mv() {
-  if [ "$#" -eq 3 ] && [ "$1" = -- ]; then
-    case "$2:$3" in
-      "$STATE_ROOT/jobs/.stage."*:"$STATE_ROOT/jobs/job-"*)
-        if mkdir "$TMP_ROOT/stale-publish-once" 2>/dev/null; then
-          command mv "$@" || return
-          : > "$STALE_PUBLISH_BLOCKED"
-          while [ ! -f "$STALE_PUBLISH_RELEASE" ]; do sleep 0.02; done
-          return 0
-        fi
-        ;;
-    esac
-  fi
-  command mv "$@"
-}
-fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" \
-  fm-mark-job.sh first "$STALE_PUBLISH_LOG" 0 < /dev/null > "$TMP_ROOT/stale-first-id" &
-STALE_FIRST_PID=$!
-for _ in $(seq 1 200); do
-  [ -f "$STALE_PUBLISH_BLOCKED" ] && break
-  sleep 0.02
-done
-assert_present "$STALE_PUBLISH_BLOCKED" "the first stage did not pause after publication"
-touch -t 200001010000 "$STATE_ROOT/.seq.lock"
-fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" \
-  fm-mark-job.sh second "$STALE_PUBLISH_LOG" 0 < /dev/null > "$TMP_ROOT/stale-second-id" &
-STALE_SECOND_PID=$!
-wait "$STALE_SECOND_PID" || fail "the replacement stage failed after stale-lock displacement"
-: > "$STALE_PUBLISH_RELEASE"
-wait "$STALE_FIRST_PID" || fail "the published displaced stage did not finish"
-unset -f mv
-STALE_FIRST=$(cat "$TMP_ROOT/stale-first-id")
-STALE_SECOND=$(cat "$TMP_ROOT/stale-second-id")
-STALE_FIRST_SEQ=$(fm_remote_job_read_number "$STATE_ROOT/jobs/$STALE_FIRST" seq) \
-  || fail "the displaced published stage lost its sequence"
-STALE_SECOND_SEQ=$(fm_remote_job_read_number "$STATE_ROOT/jobs/$STALE_SECOND" seq) \
-  || fail "the replacement published stage lost its sequence"
-[ "$STALE_SECOND_SEQ" -eq $((STALE_FIRST_SEQ + 1)) ] \
-  || fail "stale-lock recovery reused a published sequence: first=$STALE_FIRST_SEQ second=$STALE_SECOND_SEQ"
+SEQ_RESULTS=$(cat "$TMP_ROOT"/seq-* | sort -n)
+SEQ_EXPECTED=$(seq 1 20)
+[ "$SEQ_RESULTS" = "$SEQ_EXPECTED" ] \
+  || fail "concurrent sequence claims were not unique and monotonic: $SEQ_RESULTS"
+[ "$(find "$STATE_ROOT/.seq-claims" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 20 ] \
+  || fail "concurrent sequence allocations did not retain every durable claim"
+mkdir "$STATE_ROOT/.seq-claims/999998" "$STATE_ROOT/.seq-claims/999999"
+touch -t 200001010000 "$STATE_ROOT/.seq-claims/999998"
+fm_remote_job_reap_stale "$ACCOUNT_HOME" || fail "sequence claim reaping failed"
+assert_absent "$STATE_ROOT/.seq-claims/999998" "an expired sequence claim survived stale reaping"
+assert_present "$STATE_ROOT/.seq-claims/999999" "a fresh sequence claim was reaped"
+rmdir "$STATE_ROOT/.seq-claims/999999"
+pass "atomic sequence claims remain unique and reap only after expiry"
 
 fm_on() {
   FM_HOME="$LOCAL_HOME" \
@@ -243,13 +171,6 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 assert_present "$STATE_ROOT/worker.ready" "the worker did not publish its readiness heartbeat"
-fm_remote_job_wait "$ACCOUNT_HOME" "$STALE_FIRST" || fail "$FM_REMOTE_JOB_ERROR"
-fm_remote_job_wait "$ACCOUNT_HOME" "$STALE_SECOND" || fail "$FM_REMOTE_JOB_ERROR"
-[ "$(cat "$STALE_PUBLISH_LOG")" = "$(printf 'first\nsecond')" ] \
-  || fail "stale-lock displacement broke publication FIFO: $(tr '\n' ' ' < "$STALE_PUBLISH_LOG")"
-fm_remote_job_reap "$ACCOUNT_HOME" "$STALE_FIRST" || true
-fm_remote_job_reap "$ACCOUNT_HOME" "$STALE_SECOND" || true
-pass "stale-lock displacement preserves published same-home FIFO"
 
 # T9: home B's job completes while home A runs a long job, and A's queued job
 # stays strictly behind A's running job.
@@ -260,7 +181,7 @@ A1=$FM_REMOTE_JOB_ID
 wait_for_state "$A1" running || fail "home A's long job did not begin running"
 fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_A" fm-mark-job.sh a2 "$LOG_A" 0 < /dev/null > /dev/null
 A2=$FM_REMOTE_JOB_ID
-fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_B" fm-mark-job.sh b1 "$LOG_B" 0 < /dev/null > /dev/null
+fm_remote_job_stage "$ACCOUNT_HOME" "$REMOTE_ROOT" "$HOME_EDGE" fm-mark-job.sh b1 "$LOG_B" 0 < /dev/null > /dev/null
 B1=$FM_REMOTE_JOB_ID
 B_BEGAN=$(date +%s)
 fm_remote_job_wait "$ACCOUNT_HOME" "$B1" || fail "$FM_REMOTE_JOB_ERROR"

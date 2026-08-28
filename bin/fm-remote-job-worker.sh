@@ -827,7 +827,7 @@ worker_process_once() { # <account-home>
         # sequenced work as the older job it is.
         seq=$(fm_remote_job_read_number "$job" seq 2>/dev/null || true)
         case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-        candidates="$candidates$seq $id $home"$'\n'
+        candidates="$candidates$seq"$'\t'"$id"$'\t'"$home"$'\n'
         ;;
       running)
         worker_lane_owns_job "$job" || worker_reclaim_running_job "$job" || true
@@ -837,14 +837,14 @@ worker_process_once() { # <account-home>
     esac
   done
   [ -n "$candidates" ] || return 0
-  while IFS=' ' read -r seq id home; do
+  while IFS=$'\t' read -r seq id home; do
     [ -n "$id" ] || continue
     worker_lane_busy "$home" && continue
     job=$(fm_remote_job_job_dir "$id" 2>/dev/null || true)
     [ -n "$job" ] || continue
     [ "$(fm_remote_job_read_state "$job" 2>/dev/null || true)" = queued ] || continue
     worker_start_lane "$job" "$home"
-  done < <(printf '%s' "$candidates" | sort -k1,1n -k2,2)
+  done < <(printf '%s' "$candidates" | sort -t $'\t' -k1,1n -k2,2)
 }
 
 main() {

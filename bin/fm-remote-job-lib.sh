@@ -10,7 +10,8 @@
 # A job directory is mode 0700 and contains root, home, argv (NUL-delimited),
 # stdin, seq, stdout, stderr, queue_deadline, timeout, deadline, exit, and
 # state. Stage writes state=queued last. seq is a queue-wide monotonic staging
-# sequence allocated under the .seq.lock counter; it is the worker's FIFO
+# sequence reserved atomically by its persistent .seq-claims directory; the
+# counter is only a forward-moving allocation hint. seq is the worker's FIFO
 # ordering key within a home, with the job id as the deterministic tiebreak.
 # The worker atomically claims a job with .claim, establishes its execution
 # deadline, changes state to running, writes bounded stdout/stderr and exit,
@@ -79,12 +80,14 @@ FM_REMOTE_JOB_WAIT_GRACE=${FM_REMOTE_JOB_WAIT_GRACE:-30}
 FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
 FM_REMOTE_JOB_STAGE_REAP_SECONDS=${FM_REMOTE_JOB_STAGE_REAP_SECONDS:-600}
+FM_REMOTE_JOB_SEQ_CLAIM_REAP_SECONDS=86400
 # shellcheck disable=SC2034 # Shared protocol constant consumed by the worker and sourcing callers.
 FM_REMOTE_JOB_PREEMPTED_EXIT=76
 FM_REMOTE_JOB_OPERATOR_PATH=
 FM_REMOTE_JOB_CHILD_PATH=
 FM_REMOTE_JOB_STATE=
 FM_REMOTE_JOB_JOBS=
+FM_REMOTE_JOB_SEQ_CLAIMS=
 FM_REMOTE_JOB_ID=
 FM_REMOTE_JOB_STDOUT=
 FM_REMOTE_JOB_STDERR=
@@ -418,6 +421,10 @@ fm_remote_job_prepare_state() { # <account-home>
     FM_REMOTE_JOB_ERROR="remote job queue is unsafe"
     return 1
   }
+  FM_REMOTE_JOB_SEQ_CLAIMS=$(fm_remote_job_safe_child_dir "$FM_REMOTE_JOB_STATE" .seq-claims) || {
+    FM_REMOTE_JOB_ERROR="remote job sequence claims are unsafe"
+    return 1
+  }
   fm_remote_job_safe_child_dir "$FM_REMOTE_JOB_STATE" logs >/dev/null || {
     FM_REMOTE_JOB_ERROR="remote job log directory is unsafe"
     return 1
@@ -489,105 +496,52 @@ fm_remote_job_read_deadline() { # <job-dir>
   fm_remote_job_read_number "$1" deadline
 }
 
-# Allocate the next queue-wide staging sequence value. The critical section is
-# a read-increment-publish on one counter file, held for microseconds under a
-# mkdir lock. A holder killed inside that window would wedge every later stage,
-# so a lock older than five seconds is stolen. Each allocation reconciles the
-# counter with already-published records before incrementing: if a displaced
-# holder published its job just before losing the lock, its sequence cannot be
-# reused. Each holder publishes through a token-specific file inside its lock
-# and retries if the lock was displaced.
-fm_remote_job_seq_lock_owned() { # <lock-dir> <token>
-  local owner
-  owner=$(fm_remote_job_read_single_line "$1/owner" 128 2>/dev/null) || return 1
-  [ "$owner" = "$2" ]
+fm_remote_job_advance_seq_hint() { # <value>
+  local value=$1 counter current tmp
+  counter="$FM_REMOTE_JOB_STATE/seq"
+  current=$(cat "$counter" 2>/dev/null || true)
+  case "$current" in ''|*[!0-9]*) current=0 ;; esac
+  [ "$value" -gt "$current" ] || return 0
+  tmp=$(umask 077; mktemp "$FM_REMOTE_JOB_STATE/.seqhint.XXXXXX") || return 1
+  printf '%s\n' "$value" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  current=$(cat "$counter" 2>/dev/null || true)
+  case "$current" in ''|*[!0-9]*) current=0 ;; esac
+  if [ "$value" -gt "$current" ]; then
+    mv -f -- "$tmp" "$counter" || { rm -f -- "$tmp"; return 1; }
+  else
+    rm -f -- "$tmp"
+  fi
 }
 
 fm_remote_job_next_seq() { # [stage-dir destination]
-  local stage=${1:-} destination=${2:-} published=0
-  local lock counter tmp value observed job attempt=0 mtime now token stolen file retry_deadline
-  [ -n "$FM_REMOTE_JOB_STATE" ] || return 1
-  lock="$FM_REMOTE_JOB_STATE/.seq.lock"
+  local stage=${1:-} destination=${2:-} counter value claim attempt=0
+  [ -n "$FM_REMOTE_JOB_STATE" ] && [ -n "$FM_REMOTE_JOB_SEQ_CLAIMS" ] || return 1
   counter="$FM_REMOTE_JOB_STATE/seq"
-  retry_deadline=$(( $(date +%s) + 10 ))
-  while :; do
+  value=$(cat "$counter" 2>/dev/null || true)
+  case "$value" in ''|*[!0-9]*) value=0 ;; esac
+  while [ "$attempt" -lt 100000 ]; do
     attempt=$((attempt + 1))
-    if (umask 077; mkdir "$lock") 2>/dev/null; then
-      token="${BASHPID:-$$}-$RANDOM-$attempt-$(date +%s)"
-      if (umask 077; set -C; printf '%s\n' "$token" > "$lock/owner") 2>/dev/null \
-        && chmod 600 "$lock/owner" \
-        && fm_remote_job_seq_lock_owned "$lock" "$token"; then
-        value=$(cat "$counter" 2>/dev/null || true)
-        case "$value" in ''|*[!0-9]*) value=0 ;; esac
-        # A stale holder can be displaced after publishing its queued record
-        # but before committing the counter. Recover that published allocation
-        # before choosing the next value, preserving publication FIFO instead
-        # of reusing its sequence and falling back to random-id ordering.
-        for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
-          [ -d "$job" ] && [ ! -L "$job" ] || continue
-          observed=$(fm_remote_job_read_number "$job" seq 2>/dev/null || true)
-          case "$observed" in ''|*[!0-9]*) continue ;; esac
-          [ "$observed" -le "$value" ] || value=$observed
-        done
-        value=$((value + 1))
-        tmp="$lock/.seqval.$token"
-        if [ -n "$stage" ]; then
-          if fm_remote_job_write_number "$stage" seq "$value" \
-            && fm_remote_job_write_state "$stage" queued \
-            && fm_remote_job_seq_lock_owned "$lock" "$token" \
-            && mv -- "$stage" "$destination"; then
-            published=1
-            rm -f -- "$destination/.owner-pid" "$destination/.owner-start" || true
-          else
-            rm -f -- "$stage/state" "$stage/seq"
-          fi
+    value=$((value + 1))
+    claim="$FM_REMOTE_JOB_SEQ_CLAIMS/$value"
+    if (umask 077; mkdir "$claim") 2>/dev/null; then
+      chmod 700 "$claim" || return 1
+      fm_remote_job_advance_seq_hint "$value" || true
+      if [ -n "$stage" ]; then
+        if ! fm_remote_job_write_number "$stage" seq "$value" \
+          || ! fm_remote_job_write_state "$stage" queued \
+          || ! mv -- "$stage" "$destination"; then
+          rm -f -- "$stage/state" "$stage/seq"
+          return 1
         fi
-        if [ -z "$stage" ] || [ "$published" -eq 1 ]; then
-          if { printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
-            && fm_remote_job_seq_lock_owned "$lock" "$token" \
-            && mv -f -- "$tmp" "$counter"; } 2>/dev/null; then
-            if fm_remote_job_seq_lock_owned "$lock" "$token"; then
-              rm -f -- "$lock/owner"
-              rmdir "$lock" 2>/dev/null || true
-            fi
-            printf '%s\n' "$value"
-            return 0
-          fi
-        fi
-        if [ "$published" -eq 1 ]; then
-          printf '%s\n' "$value"
-          return 0
-        fi
-        rm -f -- "$tmp"
-        if fm_remote_job_seq_lock_owned "$lock" "$token"; then
-          rm -f -- "$lock/owner"
-          rmdir "$lock" 2>/dev/null || true
-        fi
+        rm -f -- "$destination/.owner-pid" "$destination/.owner-start" || true
       fi
-    else
-      mtime=$(fm_remote_job_path_mtime "$lock" 2>/dev/null || true)
-      now=$(date +%s)
-      case "$mtime" in
-        ''|*[!0-9]*) ;;
-        *)
-          if [ $((now - mtime)) -gt 5 ]; then
-            stolen="$FM_REMOTE_JOB_STATE/.seq.stale.${BASHPID:-$$}.$RANDOM.$attempt"
-            if [ ! -e "$stolen" ] && [ ! -L "$stolen" ] && mv -- "$lock" "$stolen" 2>/dev/null; then
-              rm -f -- "$stolen/owner"
-              for file in "$stolen"/.seqval.*; do
-                [ -e "$file" ] || [ -L "$file" ] || continue
-                rm -f -- "$file"
-              done
-              rmdir "$stolen" 2>/dev/null || true
-            fi
-          fi
-          ;;
-      esac
+      printf '%s\n' "$value"
+      return 0
     fi
-    now=$(date +%s)
-    [ "$now" -lt "$retry_deadline" ] || return 1
-    sleep 0.02
+    [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
   done
+  return 1
 }
 
 fm_remote_job_cancelled() { # <job-dir>
@@ -773,7 +727,7 @@ fm_remote_job_stage_owner_alive() { # <stage-dir>
 }
 
 fm_remote_job_reap_stale() { # <account-home>
-  local account_home=$1 job id state mtime now stage
+  local account_home=$1 job id state mtime now stage claim value
   fm_remote_job_prepare_state "$account_home" || return 1
   now=$(date +%s)
   for job in "$FM_REMOTE_JOB_JOBS"/job-*; do
@@ -786,6 +740,15 @@ fm_remote_job_reap_stale() { # <account-home>
     case "$mtime" in ''|*[!0-9]*) continue ;; esac
     [ $((now - mtime)) -ge "$FM_REMOTE_JOB_REAP_SECONDS" ] || continue
     fm_remote_job_reap "$account_home" "$id" || true
+  done
+  for claim in "$FM_REMOTE_JOB_SEQ_CLAIMS"/*; do
+    [ -d "$claim" ] && [ ! -L "$claim" ] || continue
+    value=${claim##*/}
+    case "$value" in ''|*[!0-9]*|0) continue ;; esac
+    mtime=$(fm_remote_job_path_mtime "$claim" 2>/dev/null || true)
+    case "$mtime" in ''|*[!0-9]*) continue ;; esac
+    [ $((now - mtime)) -ge "$FM_REMOTE_JOB_SEQ_CLAIM_REAP_SECONDS" ] || continue
+    rmdir "$claim" 2>/dev/null || true
   done
   # Staging litter a killed caller left behind is reaped after its owner is no
   # longer the process that created it and the stage has exceeded the age bound.
