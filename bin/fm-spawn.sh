@@ -277,7 +277,6 @@ if [ -e "$STATE" ] || [ -L "$STATE" ]; then
     exit 1
   }
 fi
-SPAWN_TASK_OWNER_MARKER=".fm-task-owner"
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
@@ -2432,8 +2431,8 @@ exclude_path() {
 stamp_task_worktree_owner() {
   local marker tmp
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
-  marker="$WT/$SPAWN_TASK_OWNER_MARKER"
-  exclude_path "$SPAWN_TASK_OWNER_MARKER"
+  marker="$WT/$FM_WORKTREE_TASK_OWNER_MARKER"
+  exclude_path "$FM_WORKTREE_TASK_OWNER_MARKER"
   if [ "$RELAUNCH" -eq 1 ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
     SPAWN_TASK_OWNER_BACKUP=$(umask 077; mktemp "$STATE/.$ID.task-owner-prior.XXXXXX") || return 1
     if ! cp -p -- "$marker" "$SPAWN_TASK_OWNER_BACKUP"; then
@@ -2456,9 +2455,26 @@ stamp_task_worktree_owner() {
   SPAWN_TASK_OWNER_STAMPED=1
 }
 
+# The marker and the task record are two halves of one generation binding, so
+# the rollback decision is read from what the record itself publishes rather
+# than from how far this run got. Once state/<id>.meta names this spawn
+# generation, restoring the superseded marker would contradict the live record
+# and wedge every later ownership proof, so the stamp is committed instead.
+task_record_publishes_spawn_gen() {
+  local meta="$STATE/$ID.meta" recorded
+  [ -n "${SPAWN_GEN:-}" ] || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  recorded=$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)
+  [ -n "$recorded" ] && [ "$recorded" = "$SPAWN_GEN" ]
+}
+
 clear_aborted_task_worktree_owner_stamp() {
-  local marker="${WT:-}/$SPAWN_TASK_OWNER_MARKER"
+  local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER"
   [ "$SPAWN_TASK_OWNER_STAMPED" = 1 ] || return 0
+  if task_record_publishes_spawn_gen; then
+    commit_task_worktree_owner_stamp
+    return $?
+  fi
   if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
     mv -f -- "$SPAWN_TASK_OWNER_BACKUP" "$marker" || return 1
   else

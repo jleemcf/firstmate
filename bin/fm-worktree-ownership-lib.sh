@@ -25,7 +25,11 @@
 # The function prints a concrete REFUSED reason and returns nonzero whenever a
 # proof is missing, contradictory, unreadable, or ambiguous.
 # On success it sets FM_WORKTREE_OWNERSHIP_PATH and
-# FM_WORKTREE_OWNERSHIP_PROOF.
+# FM_WORKTREE_OWNERSHIP_PROOF. FM_WORKTREE_OWNERSHIP_PROOF names the single
+# strongest binding, so an independently verified Orca id/path match is
+# published separately as FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=1: a marker
+# that outranks it in the proof string must not cost the caller a second
+# provider round trip it has already paid for.
 #
 # fm_worktree_claim_retire_begin <meta-file> <expected-worktree>
 # removes the exact worktree= claim before a provider return or removal can
@@ -40,6 +44,7 @@
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
+FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
@@ -272,6 +277,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   local backup marker_rc=0
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
+  FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
   case "$id" in
     ''|*[!A-Za-z0-9._-]*)
       fm_worktree_refuse "cannot prove worktree ownership for invalid task id '${id:-missing}'."
@@ -334,6 +340,9 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
         return 1
       fi
       provider_proof=orca-worktree-id
+      # Published to callers that source this library.
+      # shellcheck disable=SC2034
+      FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=1
     else
       # An id the provider cannot resolve binds to no live worktree, so it can
       # only stay a refusal while the recorded path is still there to inspect.

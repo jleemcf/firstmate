@@ -1046,6 +1046,66 @@ test_ship_teardown_removes_orca_worktree_when_id_path_matches() {
   pass "fm-teardown.sh backend=orca: ship teardown requires a matching Orca id path"
 }
 
+# Stamp a worktree's owner marker exactly as bin/fm-spawn.sh does: excluded
+# from git first, so it never reads as uncommitted work.
+orca_stamp_owner_marker() {  # <worktree> <task-id> <spawn-generation>
+  local wt=$1 id=$2 generation=$3 excl
+  excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
+    || printf '%s\n' '.fm-task-owner' >> "$excl"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf 'task_id=%s\n' "$id"
+    printf 'spawn_gen=%s\n' "$generation"
+  } > "$wt/.fm-task-owner"
+}
+
+# Every worktree a current spawn hands out carries the owner marker, so the
+# marker is the strongest binding the ownership proof reports. The Orca id/path
+# match it verified on the way there must still be honoured: re-resolving the
+# same id through the provider a second time turns one transient provider
+# failure into a refused teardown of a worktree already proved to be this
+# task's.
+test_ship_teardown_reuses_proved_orca_path_match_when_marker_owns_worktree() {
+  local proj wt data state config id out rc neutral shows
+  id="orcashipmarkedz1"
+  proj="$TMP_ROOT/ship-marked-project"
+  wt="$TMP_ROOT/ship-marked-wt"
+  data="$TMP_ROOT/ship-marked-data"
+  state="$TMP_ROOT/ship-marked-state"
+  config="$TMP_ROOT/ship-marked-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  touch "$state/.last-watcher-beat"
+  fm_write_meta "$state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-ship-marked" "worktree=$wt" "project=$proj" \
+    "harness=claude" "kind=ship" "mode=local-only" "yolo=off" \
+    "backend=orca" "orca_worktree_id=wt-ship-marked" "spawn_gen=gen-ship-marked"
+  orca_stamp_owner_marker "$wt" "$id" gen-ship-marked
+  orca_case ship-marked
+  # Only ONE worktree show is answered; a second resolution attempt gets an
+  # empty result and refuses.
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-ship-marked","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/2.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/3.out"
+  neutral=$(neutral_fm_root "$CASE_DIR/neutral")
+  set +e
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    "$ROOT/bin/fm-teardown.sh" "$id" 2>&1 )
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "a marked Orca ship worktree should tear down on its already proved id path match"$'\n'"$out"
+  shows=$(grep -c -F $'orca\x1f''worktree'$'\x1f''show'$'\x1f''--worktree'$'\x1f''id:wt-ship-marked' "$LOG" || true)
+  [ "$shows" = 1 ] \
+    || fail "teardown resolved the Orca worktree id $shows times; the proved match should be resolved once"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-ship-marked'$'\x1f''--force'$'\x1f''--json' \
+    "teardown did not remove the marked Orca worktree"
+  assert_absent "$state/$id.meta" "successful marked teardown should remove task metadata"
+  pass "fm-teardown.sh backend=orca: an owner-marked ship reuses the id/path match proved during ownership"
+}
+
 test_ship_teardown_refuses_orca_unresolvable_worktree_id() {
   local proj wt data state config id out rc neutral
   id="orcashipunresolvedz1"
@@ -1364,6 +1424,7 @@ test_teardown_preserves_metadata_when_orca_remove_error_json
 test_scout_teardown_refuses_orca_missing_report_when_path_missing
 test_ship_teardown_refuses_orca_missing_worktree_path
 test_ship_teardown_removes_orca_worktree_when_id_path_matches
+test_ship_teardown_reuses_proved_orca_path_match_when_marker_owns_worktree
 test_ship_teardown_refuses_orca_unresolvable_worktree_id
 test_ship_teardown_refuses_orca_id_path_mismatch
 test_teardown_refuses_orca_missing_worktree_id

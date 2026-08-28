@@ -2760,7 +2760,7 @@ if [ "$KIND" != secondmate ]; then
   # Prove it before path-based safety inspection, run abort, process reap, hook
   # removal, provider return, or provider removal can touch the recorded path.
   fm_worktree_ownership_prove "$STATE" "$ID" "$META" || exit 1
-  if [ "$BACKEND" = orca ] && [ "$FM_WORKTREE_OWNERSHIP_PROOF" = orca-worktree-id ]; then
+  if [ "$BACKEND" = orca ] && [ "$FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH" = 1 ]; then
     ORCA_PATH_MATCH_VERIFIED=1
   fi
 fi
