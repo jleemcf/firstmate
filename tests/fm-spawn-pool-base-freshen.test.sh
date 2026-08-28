@@ -339,6 +339,79 @@ test_owner_marker_a_moved_on_record_cannot_retire_names_the_real_remedy() {
   pass "a marker its own task's record has moved past names marker removal, not a teardown"
 }
 
+# A record that says two things about its worktree says nothing safe about who
+# owns this slot. Calling that "moved on" and telling the operator to delete the
+# marker would delete the only binding protecting a live worker - the exact
+# outcome the marker exists to prevent - so ambiguity must read as unknown
+# ownership instead.
+test_ambiguous_record_never_advises_removing_the_marker() {
+  local rec id other out status
+  id='pool-ambiguous-record-r1'
+  rec=$(make_case ambiguous-record "$id")
+  read_case_record "$rec"
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+  expect_code 0 "$status" "the first spawn should take the pool slot"$'\n'"$out"
+
+  # A partially rewritten record that ends up saying two different things about
+  # both halves of ownership - the state fm_worktree_meta_claim already treats
+  # as a real possibility - while the task is live in the slot.
+  printf 'spawn_gen=%s\n' 'sduplicate.1.1' >> "$HOME_DIR/state/$id.meta"
+  printf 'worktree=%s\n' "$CASE_DIR/some-other-slot" >> "$HOME_DIR/state/$id.meta"
+
+  other='pool-ambiguous-record-r2'
+  mkdir -p "$HOME_DIR/data/$other"
+  printf 'brief for %s\n' "$other" > "$HOME_DIR/data/$other/brief.md"
+  status=0
+  out=$(run_spawn "$other" --mode no-mistakes --yolo off) || status=$?
+
+  [ "$status" -ne 0 ] || fail "spawn accepted a slot a live task's marker still claims"
+  assert_contains "$out" "already belongs to task $id" \
+    "the refusal did not name the task the marker claims"
+  assert_contains "$out" "does not say clearly enough who owns this slot" \
+    "the refusal did not report the record as undecidable"
+  assert_not_contains "$out" "remove $POOL_DIR/.fm-task-owner to release the slot" \
+    "an unreadable record led the refusal to advise deleting a live worker's marker"
+  assert_not_contains "$out" "will never retire this marker" \
+    "an ambiguous record was reported as one that had moved on"
+  assert_grep "task_id=$id" "$POOL_DIR/.fm-task-owner" \
+    "the refused spawn removed the live task's owner marker"
+  pass "an ambiguous record reads as unknown ownership, never as a marker to delete"
+}
+
+# An ownership record whose slot carries no marker for it strands nothing: the
+# claim is already resolved and the file is leftover paperwork. Refusing on it
+# would wedge the task id for good with no supported way out.
+test_resolved_ownership_record_does_not_block_a_fresh_spawn() {
+  local rec id out status leftover
+  id='pool-resolved-claim-r1'
+  rec=$(make_case resolved-claim "$id")
+  read_case_record "$rec"
+  leftover=$(owner_pending_record "$id" sgone.1.1)
+  mkdir -p "$CASE_DIR/returned-slot"
+  {
+    printf '%s\n' 'schema=fm-task-owner-pending.v1'
+    printf 'task_id=%s\n' "$id"
+    printf '%s\n' 'spawn_gen=sgone.1.1'
+    printf 'worktree=%s\n' "$CASE_DIR/returned-slot"
+  } > "$leftover"
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+
+  expect_code 0 "$status" "a resolved ownership record must not block a fresh spawn"$'\n'"$out"
+  assert_contains "$out" "already resolved" \
+    "the spawn stepped over the leftover record without reporting it"
+  assert_contains "$out" "$leftover" \
+    "the notice did not name the leftover record that is safe to delete"
+  assert_grep "task_id=$id" "$POOL_DIR/.fm-task-owner" \
+    "the spawn did not take the slot it was given"
+  assert_present "$leftover" \
+    "the spawn deleted a leftover ownership record instead of reporting it"
+  pass "an ownership record whose slot strands nothing is reported, not treated as a block"
+}
+
 # A marker whose task this home has no metadata for at all - what survives once
 # an interrupted spawn's ownership record has been cleaned up but the slot was
 # returned without clearing the marker. The slot still refuses, but the remedy
@@ -715,6 +788,8 @@ test_fresh_spawn_refuses_a_slot_marked_for_another_task
 test_killed_spawn_leaves_an_attributable_ownership_record
 test_respawn_of_a_killed_task_id_refuses_until_its_claim_is_resolved
 test_owner_marker_a_moved_on_record_cannot_retire_names_the_real_remedy
+test_ambiguous_record_never_advises_removing_the_marker
+test_resolved_ownership_record_does_not_block_a_fresh_spawn
 test_unattributed_owner_marker_refusal_names_a_remedy_that_exists
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work

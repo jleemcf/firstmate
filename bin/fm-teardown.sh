@@ -1486,6 +1486,30 @@ teardown_drop_task_branch() {  # <project> <task-id>
   echo "warning: could not drop task branch $branch in $project: $out" >&2
 }
 
+# Once the provider release is proved, every ownership record this task
+# published for that exact path is resolved with it: the slot is the provider's
+# again and no longer carries this task's marker. Records naming any other path
+# are not this release's to retract - one may still be holding a slot - so they
+# outlive the record and are reported rather than deleted, because this record
+# is the last thing that would have named them.
+teardown_retire_task_owner_pending_claims() {  # <state-dir> <task-id> <released-worktree>
+  local state=$1 id=$2 released=$3 retained rc=0 pending worktree
+  retained=$(fm_worktree_owner_pending_retire_released "$state" "$id" "$released") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "warning: task $id's ownership record for the released worktree $released could not be removed; delete it before this task id is reused" >&2
+  fi
+  [ -n "$retained" ] || return 0
+  echo "warning: task $id's record is being removed, but these worktree ownership records from other incarnations survive it:" >&2
+  while IFS= read -r pending; do
+    [ -n "$pending" ] || continue
+    worktree=$(fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || true)
+    echo "  $pending names ${worktree:-an unrecorded worktree}, which this teardown did not release" >&2
+  done <<EOF
+$retained
+EOF
+  echo "Confirm no agent is working in each, remove any $FM_WORKTREE_TASK_OWNER_MARKER there that still names task $id, then delete the record; until then a fresh spawn of task $id will refuse." >&2
+}
+
 # The other half of the same contract: a task branch retained because this run
 # could not prove the recorded path was released is just as invisible as one
 # that failed to delete, and this record is about to stop naming it.
@@ -3111,10 +3135,18 @@ remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
 # A spawn killed between publishing its ownership record and its task record
-# leaves that record behind; the task record it was standing in for is going
-# away now, so the exact generation it named goes with it.
-fm_worktree_owner_pending_clear "$STATE" "$ID" \
-  "$(fm_worktree_meta_exact_value "$META" spawn_gen 2>/dev/null || true)" "$WT" || true
+# leaves that record behind, and the task record it was standing in for is
+# going away now. What settles it is the released path, not this record's own
+# generation: an interrupted restamp leaves one record per incarnation, and
+# every one of them naming the slot this teardown just handed back is resolved
+# by that release.
+TEARDOWN_RELEASED_WT=
+if [ "$WORKTREE_RETIRED" = 1 ] || [ "$TASK_WORKTREE_RELEASED" = 1 ]; then
+  TEARDOWN_RELEASED_WT=$WT
+  [ -n "$TEARDOWN_RELEASED_WT" ] \
+    || TEARDOWN_RELEASED_WT=$(fm_worktree_retirement_receipt_present "$META" 2>/dev/null || true)
+fi
+teardown_retire_task_owner_pending_claims "$STATE" "$ID" "$TEARDOWN_RELEASED_WT"
 rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

@@ -894,13 +894,54 @@ trap spawn_abort_cleanup EXIT
 # slot would strand the first one behind a marker nothing can name. Refuse
 # instead, naming every unresolved generation and the path it took, so the
 # operator resolves those before this id takes another worktree.
+# 0 when the worktree an ownership record names still carries this exact task
+# and generation's marker, so a slot really is stranded behind it; 1 when the
+# path provably strands nothing (it is gone, carries no marker, or carries one
+# that is some other task's or generation's); 2 when that cannot be established
+# and the claim must be treated as unresolved.
+task_owner_pending_claim_strands_a_slot() {  # <pending-record>
+  local pending=$1 worktree generation marker
+  generation=$(fm_worktree_meta_exact_value "$pending" spawn_gen 2>/dev/null || true)
+  worktree=$(fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || true)
+  [ -n "$generation" ] && [ -n "$worktree" ] || return 2
+  [ -d "$worktree" ] || return 1
+  marker="$worktree/$FM_WORKTREE_TASK_OWNER_MARKER"
+  [ -e "$marker" ] || [ -L "$marker" ] || return 1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 2
+  [ "$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)" = "$ID" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)" = "$generation" ] || return 1
+  return 0
+}
+
+# An ownership record that outlived the spawn that published it means some pool
+# slot may still carry this task id's owner marker with no task record to
+# attribute it. Recovery is told to keep the same task identity, so the very
+# next thing that happens is a fresh spawn of this id - and handing it a second
+# slot would strand the first one behind a marker nothing can name. Refuse
+# instead, naming every unresolved generation and the path it took, so the
+# operator resolves those before this id takes another worktree.
+# A record whose slot provably strands nothing is not a reason to refuse: it is
+# leftover paperwork, so it is reported as safe to delete and stepped over
+# rather than wedging the id for good. Nothing here removes it - this runs
+# under this task's spawn lock, but the record is still evidence somebody else
+# may be reading.
 refuse_unresolved_task_owner_pending_claims() {  # <state-dir> <task-id>
-  local state=$1 id=$2 pending generation worktree
-  local -a claims=()
+  local state=$1 id=$2 pending generation worktree strands
+  local -a claims=() resolved=()
   while IFS= read -r pending; do
     [ -n "$pending" ] || continue
-    claims+=("$pending")
+    strands=0
+    task_owner_pending_claim_strands_a_slot "$pending" || strands=$?
+    if [ "$strands" -eq 1 ]; then
+      resolved+=("$pending")
+    else
+      claims+=("$pending")
+    fi
   done < <(fm_worktree_owner_pending_list "$state" "$id")
+  for pending in ${resolved[@]+"${resolved[@]}"}; do
+    worktree=$(fm_worktree_meta_exact_value "$pending" worktree 2>/dev/null || true)
+    echo "warning: task $id's ownership record at $pending is already resolved - ${worktree:-the worktree it names} carries no $FM_WORKTREE_TASK_OWNER_MARKER for it - so it is not blocking this spawn and is safe to delete" >&2
+  done
   [ "${#claims[@]}" -gt 0 ] || return 0
   echo "error: task $id has ${#claims[@]} unresolved worktree ownership record(s) from an earlier spawn that never published a task record; refusing to allocate another worktree for task $id while they are unresolved" >&2
   for pending in "${claims[@]}"; do
@@ -2479,6 +2520,19 @@ task_worktree_owner_marker_holder() {  # <marker>
   return 1
 }
 
+# 0 when the slot's marker is still exactly the one this run stamped - same task
+# and same spawn generation - 2 when no marker is there at all, and 1 when it
+# now carries anything else. A rollback may only undo a marker that is still
+# byte-for-byte this run's transition; anything else has moved on and is not
+# this run's to put back or remove.
+task_worktree_owner_marker_is_this_stamp() {  # <marker>
+  local marker=$1
+  [ -e "$marker" ] || [ -L "$marker" ] || return 2
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)" = "$ID" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)" = "$SPAWN_GEN" ] || return 1
+}
+
 # Names the recovery an operator can actually perform for the marker that just
 # refused this slot. A teardown only exists while the marked task still has a
 # record; an interrupted spawn leaves its ownership record instead, and a marker
@@ -2502,6 +2556,10 @@ report_foreign_owner_marker_remedy() {  # <marker>
       echo "Its owner marker is $marker, but task $owner's own record names a different spawn generation and a different worktree, so task $owner's teardown will never retire this marker." >&2
       echo "Confirm no agent is still working in $WT, then remove $marker to release the slot." >&2
       ;;
+    unreadable)
+      echo "Its owner marker is $marker, and task $owner's record in $STATE does not say clearly enough who owns this slot: its spawn generation or worktree line is missing, duplicated, or not a usable path." >&2
+      echo "Ownership is unknown, so nothing here may be removed - this marker may be protecting a live worker. Repair task $owner's record, or establish with the crew which task is working in $WT, before reusing this slot." >&2
+      ;;
     orphan)
       echo "Its owner marker is $marker, but no task record and no spawn ownership record in $STATE attributes it to any task." >&2
       echo "No teardown exists for it. Confirm no agent is still working in $WT, then remove $marker to release the slot." >&2
@@ -2520,7 +2578,7 @@ report_foreign_owner_marker_remedy() {  # <marker>
 # bin/fm-teardown.sh removes the marker before the slot is released. Exclude it
 # from git first so it can never read as uncommitted work.
 stamp_task_worktree_owner() {
-  local marker tmp holder
+  local marker tmp holder prior
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   marker="$WT/$FM_WORKTREE_TASK_OWNER_MARKER"
   if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
@@ -2537,12 +2595,23 @@ stamp_task_worktree_owner() {
       return 1
     fi
   fi
+  # Rewriting a marker this task already owns is one exact generation
+  # transition, not two independent writes, so the record published below names
+  # the generation being replaced. The record is what proves, after a crash
+  # between the rewrite and the metadata advance, that the marker one generation
+  # ahead is still this task's. Anchored on what the record currently publishes,
+  # because that is the value every later ownership proof compares against.
+  prior=
+  if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+    prior=$(fm_worktree_meta_exact_value "$STATE/$ID.meta" spawn_gen 2>/dev/null || true)
+    [ -n "$prior" ] || prior=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
+  fi
   # The durable half of the binding goes down first. Everything from here to
   # the record's publication - the base freshen's network fetch and the whole
   # harness launch - is a window a SIGKILL or a reboot can end without running
   # this script's abort trap, and a marker stamped without this record would
   # survive that as an orphan no operator could attribute or safely clear.
-  if ! fm_worktree_owner_pending_write "$STATE" "$ID" "$SPAWN_GEN" "$WT"; then
+  if ! fm_worktree_owner_pending_write "$STATE" "$ID" "$SPAWN_GEN" "$WT" "$prior"; then
     echo "error: could not publish task $ID's ownership record for $WT in $STATE; refusing to stamp an owner marker nothing could attribute after an interrupted spawn" >&2
     return 1
   fi
@@ -2587,7 +2656,7 @@ clear_task_worktree_owner_pending() {
 }
 
 clear_aborted_task_worktree_owner_stamp() {
-  local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER" holder
+  local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER" stamp_rc
   if [ "$SPAWN_TASK_OWNER_STAMPED" != 1 ]; then
     # The record went down first, so an abort before the marker existed still
     # has one to retract.
@@ -2598,18 +2667,27 @@ clear_aborted_task_worktree_owner_stamp() {
     commit_task_worktree_owner_stamp
     return $?
   fi
-  if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
-    echo "error: worktree ${WT:-} is now marked for $holder, so task $ID's aborted spawn left $marker untouched" >&2
+  stamp_rc=0
+  task_worktree_owner_marker_is_this_stamp "$marker" || stamp_rc=$?
+  if [ "$stamp_rc" -eq 1 ]; then
+    echo "error: $marker no longer carries task $ID generation $SPAWN_GEN, so task $ID's aborted spawn left it untouched" >&2
     [ -z "$SPAWN_TASK_OWNER_BACKUP" ] \
       || echo "task $ID's superseded owner marker remains recoverable at $SPAWN_TASK_OWNER_BACKUP" >&2
     SPAWN_TASK_OWNER_STAMPED=0
     clear_task_worktree_owner_pending || true
     return 1
   fi
-  if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
-    mv -f -- "$SPAWN_TASK_OWNER_BACKUP" "$marker" || return 1
-  else
-    rm -f -- "$marker" || return 1
+  if [ "$stamp_rc" -eq 0 ]; then
+    if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
+      mv -f -- "$SPAWN_TASK_OWNER_BACKUP" "$marker" || return 1
+    else
+      rm -f -- "$marker" || return 1
+    fi
+  elif [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
+    # The slot carries no marker at all, so there is no transition of this
+    # run's left to undo and nothing here may put one back onto a path that may
+    # already have been released.
+    echo "warning: $marker is gone, so task $ID's aborted spawn did not restore it; its superseded owner marker remains at $SPAWN_TASK_OWNER_BACKUP" >&2
   fi
   SPAWN_TASK_OWNER_BACKUP=
   SPAWN_TASK_OWNER_STAMPED=0

@@ -204,6 +204,30 @@ stamp_owner_marker() {
   } > "$wt/.fm-task-owner"
 }
 
+# The durable ownership record fm-spawn publishes before it stamps a slot's
+# owner marker; bin/fm-worktree-ownership-lib.sh owns this path and its format.
+# A prior generation makes it a generation handoff: the record of one exact
+# restamp, from the generation the metadata still names to the one now stamped.
+# Args: case_dir task-id spawn-generation worktree [prior-spawn-generation]
+write_owner_pending_record() {
+  local case_dir=$1 id=$2 generation=$3 worktree=$4 prior=${5:-}
+  {
+    printf '%s\n' 'schema=fm-task-owner-pending.v1'
+    printf 'task_id=%s\n' "$id"
+    printf 'spawn_gen=%s\n' "$generation"
+    printf 'worktree=%s\n' "$worktree"
+    [ -z "$prior" ] || printf 'prior_spawn_gen=%s\n' "$prior"
+  } > "$case_dir/state/.$id.meta.worktree-owner-pending.$generation"
+}
+
+owner_pending_records() {  # <case_dir> <task-id>
+  local case_dir=$1 id=$2 candidate
+  for candidate in "$case_dir/state/.$id.meta.worktree-owner-pending."*; do
+    [ -e "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+  done
+}
+
 # Commit something on the worktree's task branch. Args: case_dir [message]
 wt_commit() {
   local case_dir=$1 msg=${2:-wt work}
@@ -1700,6 +1724,99 @@ test_vanished_worktree_teardown_keeps_the_task_branch() {
   assert_grep "never released it" "$case_dir/stderr" \
     "vanished-wt-branch: the diagnostic did not say why branch cleanup was skipped"
   pass "a teardown over a vanished worktree keeps the task branch its unlanded work is on and says so"
+}
+
+# An interrupted relaunch leaves the marker one generation ahead of the record
+# it is compared against. That is the crash the marker was introduced for, and
+# the restamp publishes a handoff naming exactly that transition for exactly
+# this path, so teardown must read it as the task's own ownership rather than
+# refusing the record forever as a recycled slot.
+test_interrupted_restamp_is_still_provable_ownership() {
+  local case_dir rc
+  case_dir=$(make_case restamp-handoff)
+  write_meta "$case_dir" no-mistakes ship
+  # Durable state a SIGKILL between the restamp and the metadata advance leaves.
+  stamp_owner_marker "$case_dir/wt" task-x1 test-generation-task-x1-next
+  write_owner_pending_record "$case_dir" task-x1 test-generation-task-x1-next \
+    "$case_dir/wt" test-generation-task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "restamp-handoff: an interrupted restamp must stay tearable down"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "restamp-handoff: the pool slot was never returned"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "restamp-handoff: the slot went back to the pool still carrying its owner marker"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "restamp-handoff: the task record outlived its own teardown"
+  [ -z "$(owner_pending_records "$case_dir" task-x1)" ] \
+    || fail "restamp-handoff: the released slot's ownership records outlived the teardown"$'\n'"$(owner_pending_records "$case_dir" task-x1)"
+  pass "an interrupted generation restamp is proved by its handoff and torn down"
+}
+
+# The same skew without the handoff is exactly what the generation check exists
+# to catch - a slot recycled to another incarnation - and must still refuse.
+test_generation_skew_without_a_handoff_still_refuses() {
+  local case_dir rc
+  case_dir=$(make_case restamp-no-handoff)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1 test-generation-task-x1-next
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "restamp-no-handoff: an unproved generation skew must refuse"
+  assert_grep "not recorded generation test-generation-task-x1" "$case_dir/stderr" \
+    "restamp-no-handoff: the refusal did not name the generation mismatch"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "restamp-no-handoff: a refused teardown removed the record anyway"
+  assert_present "$case_dir/wt/.fm-task-owner" \
+    "restamp-no-handoff: a refused teardown removed another incarnation's marker"
+  pass "a generation skew no handoff proves is still refused as a recycled slot"
+}
+
+# Teardown retracts by released path, not by its own generation: one crash can
+# leave several incarnations' records, and every one naming the slot just handed
+# back is resolved by that release. A record naming somewhere else is not, so it
+# survives and is reported rather than silently dropped or silently kept.
+test_released_slot_retires_every_ownership_record_naming_it() {
+  local case_dir rc elsewhere
+  case_dir=$(make_case released-pending-sweep)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  elsewhere="$case_dir/other-slot"
+  mkdir -p "$elsewhere"
+  write_owner_pending_record "$case_dir" task-x1 test-generation-task-x1 "$case_dir/wt"
+  write_owner_pending_record "$case_dir" task-x1 test-generation-task-x1-next \
+    "$case_dir/wt" test-generation-task-x1
+  write_owner_pending_record "$case_dir" task-x1 test-generation-elsewhere "$elsewhere"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "released-pending-sweep: teardown should return the slot"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/.task-x1.meta.worktree-owner-pending.test-generation-task-x1" \
+    "released-pending-sweep: the released slot's own ownership record outlived the release"
+  assert_absent "$case_dir/state/.task-x1.meta.worktree-owner-pending.test-generation-task-x1-next" \
+    "released-pending-sweep: an interrupted restamp's record for the released slot survived it"
+  assert_present "$case_dir/state/.task-x1.meta.worktree-owner-pending.test-generation-elsewhere" \
+    "released-pending-sweep: a record naming a worktree this teardown never released was deleted"
+  assert_grep "$elsewhere" "$case_dir/stderr" \
+    "released-pending-sweep: the surviving ownership record was passed over in silence"
+  pass "a released slot retires every ownership record naming it and reports the rest"
 }
 
 # fm/<id> is the only ref teardown owns; whatever else the crewmate checked out
@@ -3504,6 +3621,9 @@ test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
 test_vanished_worktree_teardown_keeps_the_task_branch
+test_interrupted_restamp_is_still_provable_ownership
+test_generation_skew_without_a_handoff_still_refuses
+test_released_slot_retires_every_ownership_record_naming_it
 test_pool_return_drops_only_this_tasks_branch
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses

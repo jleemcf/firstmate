@@ -68,12 +68,19 @@
 # not published its task record yet. Each record is keyed by task id AND spawn
 # generation, so a same-id recovery adds its own rather than overwriting the
 # evidence of the incarnation it is recovering from, and _read/_clear bind id,
-# generation, and canonical path together. fm_worktree_owner_pending_list is the
-# discovery half a fresh spawn uses to refuse a second slot while an earlier
-# claim is unresolved. fm_worktree_owner_marker_attribution reads a marker back
-# against both, so a refusal over another task's marker can tell an operator
-# whether a teardown owns the slot, an interrupted spawn does, a record that
-# moved on does, or nothing does.
+# generation, and canonical path together. A record that is rewriting this same
+# task's existing marker also names the generation it replaces, and
+# fm_worktree_owner_handoff_read is what turns that pair back into proof that an
+# interrupted restamp is still this task's own ownership rather than a recycled
+# slot. fm_worktree_owner_pending_list is the discovery half a fresh spawn uses
+# to refuse a second slot while an earlier claim is unresolved, and
+# fm_worktree_owner_pending_retire_released is how a proved provider release
+# retracts every record naming that exact path while preserving any that name
+# another. fm_worktree_owner_marker_attribution reads a marker back against all
+# of it, so a refusal over another task's marker can tell an operator whether a
+# teardown owns the slot, an interrupted spawn does, a record that moved on
+# does, nothing does, or - when the record does not say clearly enough -
+# that ownership is unknown and nothing may be removed.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
@@ -99,6 +106,26 @@ fm_worktree_meta_exact_value() {  # <meta-file> <key>
   [ "$count" -eq 1 ] || return 1
   value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
   [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+# 0 and prints the single value, 2 when the key is absent or empty, 3 when
+# duplicate lines make it ambiguous, and 1 when the file itself could not be
+# read. Ambiguity is deliberately not collapsed into "missing": a record that
+# says two things about ownership says nothing safe, and a caller that cannot
+# tell the two apart ends up acting on a difference it never established.
+fm_worktree_meta_probe() {  # <meta-file> <key>
+  local meta=$1 key=$2 count value
+  [ -f "$meta" ] && [ ! -L "$meta" ] && [ -r "$meta" ] || return 1
+  count=$(grep -c "^${key}=" "$meta" 2>/dev/null || true)
+  [ -n "$count" ] || return 1
+  case "$count" in
+    0) return 2 ;;
+    1) ;;
+    *) return 3 ;;
+  esac
+  value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
+  [ -n "$value" ] || return 2
   printf '%s' "$value"
 }
 
@@ -296,9 +323,16 @@ fm_worktree_retirement_receipt_clear() {  # <meta-file>
 # the same task identity: a later incarnation of the same id publishes its own
 # record beside an interrupted one rather than overwriting the only evidence of
 # the slot that one took.
+# When it is rewriting a marker this same task already owns, the record also
+# names the generation being replaced. That makes the rewrite one exact
+# transition rather than two disagreeing halves: a crash between the restamp and
+# the record's publication leaves marker=new, metadata=old, and a handoff naming
+# exactly that pair for exactly this path, which fm_worktree_task_owner_marker_binding
+# accepts as the task's own ownership mid-transition instead of refusing it as a
+# recycled slot.
 # It records an intent, never an outcome: nothing resolves a destructive target
-# through it, it satisfies no ownership proof, and it is superseded the moment
-# state/<id>.meta publishes the same generation.
+# through it, it satisfies no ownership proof on its own, and it is superseded
+# the moment state/<id>.meta publishes the same generation.
 fm_worktree_owner_pending_path() {  # <state-dir> <task-id> <spawn-gen>
   local state=$1 id=$2 generation=$3
   [ -n "$state" ] || return 1
@@ -311,9 +345,10 @@ fm_worktree_owner_pending_path() {  # <state-dir> <task-id> <spawn-gen>
   printf '%s/.%s.meta.worktree-owner-pending.%s' "$state" "$id" "$generation"
 }
 
-fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktree>
-  local state=$1 id=$2 generation=$3 worktree=$4 pending tmp
+fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktree> [prior-spawn-gen]
+  local state=$1 id=$2 generation=$3 worktree=$4 prior=${5:-} pending tmp
   [ -n "$worktree" ] || return 1
+  [ "$prior" != "$generation" ] || prior=
   pending=$(fm_worktree_owner_pending_path "$state" "$id" "$generation") || return 1
   # Outside the discovery namespace, so an interrupted write can never read as
   # an unresolved claim of its own.
@@ -323,6 +358,7 @@ fm_worktree_owner_pending_write() {  # <state-dir> <task-id> <spawn-gen> <worktr
       printf 'task_id=%s\n' "$id"
       printf 'spawn_gen=%s\n' "$generation"
       printf 'worktree=%s\n' "$worktree"
+      [ -z "$prior" ] || printf 'prior_spawn_gen=%s\n' "$prior"
     } > "$tmp") || ! mv -f -- "$tmp" "$pending"; then
     rm -f -- "$tmp"
     return 1
@@ -352,6 +388,19 @@ fm_worktree_owner_pending_read() {  # <state-dir> <task-id> <spawn-gen> [expecte
   printf '%s' "$recorded"
 }
 
+# 0 only when an unresolved record proves this exact generation handoff: the
+# same task, from exactly the generation the caller still records, to exactly
+# the generation now stamped, for exactly this path. Every axis is compared;
+# nothing is inferred from a partial match.
+fm_worktree_owner_handoff_read() {  # <state-dir> <task-id> <new-gen> <expected-worktree> <prior-gen>
+  local state=$1 id=$2 generation=$3 expected=$4 prior=$5 pending
+  [ -n "$prior" ] && [ -n "$expected" ] && [ "$prior" != "$generation" ] || return 1
+  fm_worktree_owner_pending_read "$state" "$id" "$generation" "$expected" >/dev/null || return 1
+  pending=$(fm_worktree_owner_pending_path "$state" "$id" "$generation") || return 1
+  [ "$(fm_worktree_meta_exact_value "$pending" prior_spawn_gen 2>/dev/null || true)" \
+    = "$prior" ] || return 1
+}
+
 # Retracts only the record this exact task, generation, and path published, so
 # neither an abort nor a teardown can withdraw a different incarnation's claim
 # on a slot it may still be holding.
@@ -377,20 +426,64 @@ fm_worktree_owner_pending_list() {  # <state-dir> <task-id>
   done
 }
 
+# The generation an ownership record's own file name carries. Reading it back
+# from the name is what lets a caller retract that exact record instead of
+# globbing for whichever one it happens to find first.
+fm_worktree_owner_pending_generation_of() {  # <pending-record-path>
+  local pending=$1 generation=${1##*.worktree-owner-pending.}
+  [ "$generation" != "$pending" ] || return 1
+  case "$generation" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  printf '%s' "$generation"
+}
+
+# Once a provider release is proved, every ownership record this task published
+# for that exact path is resolved: the slot belongs to the provider again and
+# carries no marker of this task's, so nothing is stranded behind that record.
+# Records naming any OTHER path are not this release's to retract - one may
+# still be holding a slot somewhere - so they are preserved and printed for the
+# caller to report. Returns 1 when a retraction it attempted failed.
+fm_worktree_owner_pending_retire_released() {  # <state-dir> <task-id> <released-path>
+  local state=$1 id=$2 released=$3 pending generation rc=0
+  while IFS= read -r pending; do
+    [ -n "$pending" ] || continue
+    generation=$(fm_worktree_owner_pending_generation_of "$pending") || {
+      printf '%s\n' "$pending"
+      continue
+    }
+    if [ -n "$released" ] \
+      && fm_worktree_owner_pending_read "$state" "$id" "$generation" "$released" >/dev/null 2>&1; then
+      fm_worktree_owner_pending_clear "$state" "$id" "$generation" "$released" || rc=1
+      continue
+    fi
+    printf '%s\n' "$pending"
+  done <<EOF
+$(fm_worktree_owner_pending_list "$state" "$id")
+EOF
+  return "$rc"
+}
+
 # What durable metadata, if any, still stands behind an owner marker, so a
 # refusal over a foreign one can name a remedy that exists rather than a
 # teardown that will never touch this slot. Prints exactly one of:
-#   record  - the marked task's record binds this marker: it publishes the
-#             marker's own spawn generation, or it claims this very slot, so
-#             that task's teardown is what retires this marker
-#   pending - the marked task's own spawn published this exact generation's
-#             ownership record for this slot and was then interrupted
-#   stale   - the marked task has a record, but it names another generation and
-#             another worktree, so its teardown will never clear this marker
-#   orphan  - nothing in this home attributes the marker to any task
+#   record     - the marked task's record binds this marker: it publishes the
+#                marker's own spawn generation, it claims this very slot, or an
+#                exact handoff proves this marker is that record mid-transition,
+#                so that task's teardown is what retires this marker
+#   pending    - the marked task's own spawn published this exact generation's
+#                ownership record for this slot and was then interrupted
+#   stale      - positive evidence that the record moved on: an exact spawn
+#                generation that differs AND an exact worktree that canonically
+#                is somewhere else, so its teardown will never clear this marker
+#   unreadable - a record exists but does not say clearly enough who owns this
+#                slot; ownership is unknown and nothing may be removed on it
+#   orphan     - nothing in this home attributes the marker to any task
 # It only reads: the marker is never moved, rewritten, or removed here.
 fm_worktree_owner_marker_attribution() {  # <state-dir> <marker-path>
-  local state=$1 marker=$2 owner generation meta slot recorded recorded_present=0
+  local state=$1 marker=$2 owner generation meta slot slot_canonical
+  local recorded_gen='' recorded_wt='' recorded_canonical='' gen_rc=0 wt_rc=0
+  local record_present=0 undecidable=0
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
   owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
   case "$owner" in
@@ -398,30 +491,49 @@ fm_worktree_owner_marker_attribution() {  # <state-dir> <marker-path>
   esac
   generation=$(fm_worktree_meta_exact_value "$marker" spawn_gen 2>/dev/null || true)
   slot=${marker%/*}
+  slot_canonical=$(fm_worktree_claim_comparison_path "$slot" 2>/dev/null || true)
   meta="$state/$owner.meta"
   if [ -f "$meta" ] && [ ! -L "$meta" ]; then
-    recorded_present=1
-    if [ -n "$generation" ] \
-      && [ "$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)" \
-        = "$generation" ]; then
+    record_present=1
+    recorded_gen=$(fm_worktree_meta_probe "$meta" spawn_gen) || gen_rc=$?
+    recorded_wt=$(fm_worktree_meta_probe "$meta" worktree) || wt_rc=$?
+    if [ "$gen_rc" -eq 0 ] && [ -n "$generation" ] && [ "$recorded_gen" = "$generation" ]; then
       printf '%s' record
       return 0
     fi
-    recorded=$(fm_worktree_meta_exact_value "$meta" worktree 2>/dev/null || true)
-    if [ -n "$recorded" ] \
-      && [ -n "$(fm_worktree_claim_comparison_path "$slot" 2>/dev/null || true)" ] \
-      && [ "$(fm_worktree_claim_comparison_path "$recorded" 2>/dev/null || true)" \
-        = "$(fm_worktree_claim_comparison_path "$slot" 2>/dev/null || true)" ]; then
+    if [ "$wt_rc" -eq 0 ]; then
+      recorded_canonical=$(fm_worktree_claim_comparison_path "$recorded_wt" 2>/dev/null || true)
+      if [ -n "$slot_canonical" ] && [ -n "$recorded_canonical" ] \
+        && [ "$recorded_canonical" = "$slot_canonical" ]; then
+        printf '%s' record
+        return 0
+      fi
+    fi
+    if [ "$gen_rc" -eq 0 ] \
+      && fm_worktree_owner_handoff_read "$state" "$owner" "$generation" "$slot" "$recorded_gen" \
+        >/dev/null 2>&1; then
       printf '%s' record
       return 0
+    fi
+    # Only a readable, exact, differing generation AND a readable, exact
+    # worktree that canonically is somewhere else prove the record moved on.
+    # Anything less is unknown ownership, and the marker may be a live
+    # worker's - the one thing this marker exists to protect.
+    if [ "$gen_rc" -ne 0 ] || [ "$wt_rc" -ne 0 ] || [ -z "$generation" ] \
+      || [ -z "$slot_canonical" ] || [ -z "$recorded_canonical" ]; then
+      undecidable=1
     fi
   fi
   if fm_worktree_owner_pending_read "$state" "$owner" "$generation" "$slot" >/dev/null 2>&1; then
     printf '%s' pending
     return 0
   fi
-  if [ "$recorded_present" -eq 1 ]; then
-    printf '%s' stale
+  if [ "$record_present" -eq 1 ]; then
+    if [ "$undecidable" -eq 1 ]; then
+      printf '%s' unreadable
+    else
+      printf '%s' stale
+    fi
     return 0
   fi
   printf '%s' orphan
@@ -544,8 +656,8 @@ EOF
 # task's metadata, 1 when either differs or the marker cannot be read, and 2
 # when no marker has been stamped there yet (a pre-marker task or a returned
 # slot). A generation mismatch refuses even when the task id was reused.
-fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation>
-  local canonical=$1 id=$2 expected_gen=$3 marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
+fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation> [state-dir]
+  local canonical=$1 id=$2 expected_gen=$3 state=${4:-} marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
   local schema owner generation
   [ -e "$marker" ] || [ -L "$marker" ] || return 2
   if [ ! -f "$marker" ] || [ -L "$marker" ]; then
@@ -568,7 +680,16 @@ fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spa
     return 1
   fi
   if [ "$generation" != "$expected_gen" ]; then
-    fm_worktree_refuse "$marker marks worktree $canonical for task $id generation $generation, not recorded generation $expected_gen."
+    # A restamp publishes its handoff before it rewrites the marker, so a crash
+    # between the rewrite and the record's own advance is distinguishable from a
+    # slot recycled to a later spawn of this id: only the former leaves an
+    # unresolved record naming exactly this transition, for exactly this path.
+    if [ -n "$state" ] \
+      && fm_worktree_owner_handoff_read "$state" "$id" "$generation" "$canonical" "$expected_gen" \
+        >/dev/null 2>&1; then
+      return 0
+    fi
+    fm_worktree_refuse "$marker marks worktree $canonical for task $id generation $generation, not recorded generation $expected_gen, and no unresolved generation handoff for this path proves task $id restamped it."
     return 1
   fi
   return 0
@@ -685,7 +806,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
     marker_rc=0
-    fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" || marker_rc=$?
+    fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" "$state" || marker_rc=$?
     [ "$marker_rc" -ne 1 ] || return 1
     if [ "$marker_rc" -eq 0 ]; then
       provider_proof=task-owner-marker
