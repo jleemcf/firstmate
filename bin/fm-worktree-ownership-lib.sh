@@ -42,21 +42,28 @@
 # returned slot with a stale destructive claim, and every later refusal over a
 # record with no claim names the surviving backup as its recovery source.
 #
-# fm_worktree_claim_retire_release marks the provider side done: the marker is
-# gone for good, so its backup is dropped and the slot is immediately reusable,
-# but the record's claim backup stays until the record itself is removed.
-# fm_worktree_claim_retire_commit discards that remaining backup, and must be
-# called only once no fallible step over the record is left.
-# fm_worktree_claim_retire_restore after a release therefore puts the claim
-# back without resurrecting the marker: the task record stays valid for a
-# retry, while the released slot stays unmarked and reusable, and any task that
-# does take it stamps the marker that refuses this record's next proof.
+# fm_worktree_claim_retire_release ends the retirement the moment the provider
+# reports the path released, because the provider may hand that path to another
+# task immediately. The claim and the marker are gone for good: both backups are
+# dropped, neither can be restored, and what survives is a retirement receipt
+# beside the record. The receipt is evidence, never authority - it records that
+# this record's provider step already ran so a rerun can skip it and finish the
+# remaining cleanup, and it never satisfies an ownership proof or supplies a
+# path any destructive helper can act on.
+# fm_worktree_claim_retire_restore is therefore reachable only while the
+# provider operation is known to have failed, and puts back both halves.
+# fm_worktree_claim_retire_abandon closes an interrupted retirement whose
+# provider outcome is unknown: it never restores, and leaves the surviving
+# backup as the recovery source every later refusal names.
+# fm_worktree_claim_retire_commit discards a retirement's leftovers once the
+# record it describes is gone.
 
 FM_WORKTREE_OWNERSHIP_PATH=
 FM_WORKTREE_OWNERSHIP_PROOF=
 FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
 FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+FM_WORKTREE_CLAIM_RETIRE_PATH=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 FM_WORKTREE_CLAIM_RETIRE_MARKER=
 FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
@@ -132,6 +139,46 @@ fm_worktree_claim_backup_hint() {  # <meta-file>
     return 0
   done
   return 1
+}
+
+# The durable evidence that a provider already released this record's worktree.
+# It carries no path authority: nothing resolves a target through it, and a
+# record that has one still proves ownership of no path at all.
+fm_worktree_retirement_receipt_path() {  # <meta-file>
+  local meta=$1 dir base
+  dir=${meta%/*}
+  base=${meta##*/}
+  printf '%s/.%s.worktree-retired' "$dir" "$base"
+}
+
+# 0 and prints the path the provider released, 1 when no readable receipt is
+# beside the record.
+fm_worktree_retirement_receipt_present() {  # <meta-file>
+  local receipt released
+  receipt=$(fm_worktree_retirement_receipt_path "$1")
+  [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$receipt" schema 2>/dev/null || true)" = fm-worktree-retired.v1 ] || return 1
+  released=$(fm_worktree_meta_exact_value "$receipt" released_worktree 2>/dev/null || true)
+  printf '%s' "$released"
+}
+
+fm_worktree_retirement_receipt_write() {  # <meta-file> <released-worktree>
+  local meta=$1 released=$2 receipt tmp
+  receipt=$(fm_worktree_retirement_receipt_path "$meta")
+  tmp="$receipt.next.${BASHPID:-$$}"
+  if ! (umask 077; {
+      printf '%s\n' 'schema=fm-worktree-retired.v1'
+      printf 'released_worktree=%s\n' "$released"
+    } > "$tmp") || ! mv -f -- "$tmp" "$receipt"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+fm_worktree_retirement_receipt_clear() {  # <meta-file>
+  local receipt
+  receipt=$(fm_worktree_retirement_receipt_path "$1")
+  rm -f -- "$receipt"
 }
 
 fm_worktree_refuse() {  # <message>
@@ -413,7 +460,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
 
 fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   local meta=$1 expected=$2 recorded expected_canonical recorded_canonical dir base backup tmp
-  local claim_rc=0 hint
+  local claim_rc=0 hint released receipt_rc=1
   if [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ]; then
     fm_worktree_refuse "cannot retire worktree claim in $meta because another claim retirement is already active on $FM_WORKTREE_CLAIM_RETIRE_META."
     return 1
@@ -430,8 +477,11 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   if [ "$claim_rc" -eq 2 ]; then
     if [ -n "$expected" ]; then
       hint=$(fm_worktree_claim_backup_hint "$meta" || true)
+      released=$(fm_worktree_retirement_receipt_present "$meta") && receipt_rc=0 || receipt_rc=$?
       if [ -n "$hint" ]; then
         fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected; an interrupted claim retirement left its recoverable copy at $hint."
+      elif [ "$receipt_rc" -eq 0 ]; then
+        fm_worktree_refuse "cannot clear worktree claim in $meta because the provider already released ${released:-its worktree}; expected $expected."
       else
         fm_worktree_refuse "cannot clear worktree claim in $meta because it claims no path, yet expected $expected."
       fi
@@ -441,6 +491,7 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
     # retirement exists to establish already holds.
     FM_WORKTREE_CLAIM_RETIRE_META=$meta
     FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+    FM_WORKTREE_CLAIM_RETIRE_PATH=
     FM_WORKTREE_CLAIM_RETIRE_MARKER=
     FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
     FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
@@ -470,6 +521,7 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   fi
   FM_WORKTREE_CLAIM_RETIRE_META=$meta
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=$backup
+  FM_WORKTREE_CLAIM_RETIRE_PATH=$expected
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
   fm_worktree_marker_retire "$dir" "$base" "$expected" || {
     fm_worktree_claim_retire_restore || true
@@ -498,14 +550,27 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
 }
 
 fm_worktree_claim_retire_release() {
+  local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
+  local released=$FM_WORKTREE_CLAIM_RETIRE_PATH
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
-  if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
-    fm_worktree_refuse "the worktree owner marker was retired, but its backup could not be removed at $marker_backup."
-    return 1
-  fi
+  FM_WORKTREE_CLAIM_RETIRE_META=
+  FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_PATH=
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+  if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
+    echo "warning: the retired owner marker's copy at $marker_backup could not be removed; it names a slot this task no longer owns and is safe to delete." >&2
+  fi
+  if [ -n "$released" ] && [ -n "$meta" ] \
+    && ! fm_worktree_retirement_receipt_write "$meta" "$released"; then
+    fm_worktree_refuse "the provider released $released, but the retirement receipt beside $meta could not be written; the claim copy at ${backup:-<none>} is the only surviving record of it."
+    return 1
+  fi
+  if [ -n "$backup" ] && ! rm -f -- "$backup"; then
+    echo "warning: the retired worktree claim's copy at $backup could not be removed; $released is released and that copy must not be restored over the record." >&2
+  fi
 }
 
 fm_worktree_claim_retire_commit() {
@@ -522,21 +587,33 @@ fm_worktree_claim_retire_commit() {
   fi
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_PATH=
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }
 
-# Abandons an open retirement at an unplanned exit: a record that still exists
-# gets its claim back so a plain rerun can act on it again, and a record that is
-# already gone only needs its backups dropped.
+# Closes a retirement interrupted between the claim rewrite and the provider's
+# verdict. The provider may or may not have released the path, so the claim is
+# never put back: the surviving copy is named as the recovery source and every
+# later proof over the claimless record refuses until an operator resolves it.
 fm_worktree_claim_retire_abandon() {
+  local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
+  local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
-  if [ -f "$FM_WORKTREE_CLAIM_RETIRE_META" ] && [ ! -L "$FM_WORKTREE_CLAIM_RETIRE_META" ]; then
-    fm_worktree_claim_retire_restore
-    return $?
+  FM_WORKTREE_CLAIM_RETIRE_META=
+  FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_PATH=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER=
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+  if [ -n "$backup" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    echo "warning: a worktree claim retirement for $meta was interrupted before the provider reported its result; the recoverable claim is at $backup and every lifecycle verb refuses this record until it is resolved." >&2
+    [ -z "$marker_backup" ] || rm -f -- "$marker_backup" || true
+    return 0
   fi
-  fm_worktree_claim_retire_commit
+  [ -z "$backup" ] || rm -f -- "$backup" || true
+  [ -z "$marker_backup" ] || rm -f -- "$marker_backup" || true
 }
 
 fm_worktree_claim_retire_restore() {
@@ -555,6 +632,7 @@ fm_worktree_claim_retire_restore() {
   [ -z "$marker_backup" ] || rm -f -- "$marker_backup"
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
+  FM_WORKTREE_CLAIM_RETIRE_PATH=
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0

@@ -394,8 +394,8 @@ fm_backend_report_worktree_claim_backup() {  # <meta-file>
   echo "An interrupted worktree claim retirement left the recoverable claim at $backup; restore it there before retrying." >&2
 }
 
-fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
-  local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
+fm_backend_validate_task_endpoint() {  # <meta-file> <task-id> [allow-retired]
+  local meta=$1 id=$2 allow_retired=${3:-} backend_count backend window worktree project binding_count binding
   local session pane recorded_session workspace tab terminal worktree_id surface
   FM_BACKEND_VALIDATED_BACKEND=
   FM_BACKEND_VALIDATED_TARGET=
@@ -412,9 +412,17 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
     return 1
   }
   worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
-    echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
-    fm_backend_report_worktree_claim_backup "$meta"
-    return 1
+    # A retired record legitimately identifies no worktree: its provider step
+    # already released the path. Only cleanup asks to accept that, and it gets
+    # no path to act on either way.
+    if [ "$allow_retired" != allow-retired ] \
+      || ! declare -F fm_worktree_retirement_receipt_present >/dev/null 2>&1 \
+      || ! fm_worktree_retirement_receipt_present "$meta" >/dev/null 2>&1; then
+      echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
+      fm_backend_report_worktree_claim_backup "$meta"
+      return 1
+    fi
+    worktree=
   }
   project=$(fm_backend_meta_exact_value "$meta" project) || {
     echo "REFUSED: task $id has a missing, empty, or ambiguous project identity; preserving task state." >&2

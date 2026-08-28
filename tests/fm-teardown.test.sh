@@ -1352,8 +1352,10 @@ EOF
     "late-failure-rerun: the fixture never reached the pool return it is about"
   assert_present "$case_dir/state/task-x1.meta" \
     "late-failure-rerun: a stopped teardown discarded the task record"
-  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
-    "late-failure-rerun: the record kept no worktree claim for a rerun to act on"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "late-failure-rerun: the record regained a claim on a slot the pool can reissue"
+  assert_present "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "late-failure-rerun: no retirement receipt records that the pool return already ran"
   assert_absent "$case_dir/wt/.fm-task-owner" \
     "late-failure-rerun: a released pool slot was left marked for the departing task"
 
@@ -1364,7 +1366,53 @@ EOF
   expect_code 0 "$rc" "late-failure-rerun: the rerun should finish the teardown"$'\n'"$(cat "$case_dir/stderr2")"
   assert_absent "$case_dir/state/task-x1.meta" \
     "late-failure-rerun: the rerun left the task record behind"
+  assert_absent "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "late-failure-rerun: the retirement receipt outlived the record it describes"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "late-failure-rerun: the rerun returned the pool slot a second time"
   pass "a teardown step failing after the pool return leaves a record a rerun can finish"
+}
+
+# The slot is the provider's again the instant the return succeeds, so no later
+# failure may hand this record authority over it - even before the task that
+# takes it has stamped its own marker.
+test_retired_record_cannot_act_on_a_reissued_pool_slot() {
+  local case_dir rc
+  case_dir=$(make_case reissued-slot)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  # A pool return resets the slot, so anything the next holder has written is
+  # gone with it - which is what makes a second return destructive.
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+rm -f "$case_dir/wt/next-holder-live.txt"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  printf 'task-x1\tfirstmate:fm-task-x1\tnot-a-number\n' \
+    > "$case_dir/state/.status-presentation-cursor"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "reissued-slot: the fixture must stop teardown after the pool return"
+
+  # The pool reissues the returned slot. The task taking it is mid-acquisition:
+  # its work is already in the slot, before its own record or owner marker land.
+  printf 'next holder live work\n' > "$case_dir/wt/next-holder-live.txt"
+
+  rm -f "$case_dir/state/.status-presentation-cursor"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "reissued-slot: task-x1's rerun should finish its own record"$'\n'"$(cat "$case_dir/stderr2")"
+  [ "$(cat "$case_dir/wt/next-holder-live.txt" 2>/dev/null)" = "next holder live work" ] \
+    || fail "reissued-slot: task-x1's rerun destroyed the work of the task now holding the slot"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "reissued-slot: task-x1 returned a slot the pool had already reissued"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "reissued-slot: task-x1's rerun left its own record behind"
+  pass "a record whose slot the provider already reissued can never act on that path again"
 }
 
 # The pool return promises the shared repo will not accumulate task refs, and a
@@ -3137,6 +3185,7 @@ test_same_task_id_with_a_different_marker_generation_refuses
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_late_teardown_failure_leaves_a_rerunnable_record
+test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses

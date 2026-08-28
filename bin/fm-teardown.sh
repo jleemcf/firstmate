@@ -236,6 +236,7 @@ DESCENDANT_TASK_KINDS=()
 DESCENDANT_TASK_HOMES=()
 teardown_release_locks() {
   local status=$? i
+  fm_worktree_claim_retire_abandon || true
   if declare -F teardown_release_herdr_locks >/dev/null 2>&1; then
     teardown_release_herdr_locks || true
   fi
@@ -255,7 +256,6 @@ teardown_release_locks() {
     fm_lock_release "$LOCAL_REGISTRY_LOCK" || true
     LOCAL_REGISTRY_LOCK=
   fi
-  fm_worktree_claim_retire_abandon || true
   if [ "$META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$META_LOCK" || true
     META_LOCK_HELD=0
@@ -731,7 +731,11 @@ fi
 # This is the first cleanup authorization check. It is metadata-only and must
 # complete before fm-guard, a backend command, file removal, branch deletion,
 # worktree return, registry change, or process termination can run.
-fm_backend_validate_task_endpoint "$META" "$ID" || exit 1
+fm_backend_validate_task_endpoint "$META" "$ID" allow-retired || exit 1
+WORKTREE_RETIRED=0
+if fm_worktree_retirement_receipt_present "$META" >/dev/null 2>&1; then
+  WORKTREE_RETIRED=1
+fi
 BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
@@ -2399,7 +2403,7 @@ validate_firstmate_home_children_removal() {
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
-    fm_backend_validate_task_endpoint "$child_meta" "$child_id" || return 1
+    fm_backend_validate_task_endpoint "$child_meta" "$child_id" allow-retired || return 1
     validate_pr_poll_cleanup "$sub_state" "$child_id" || return 1
     child_wt=$(meta_value "$child_meta" worktree)
     child_kind=$(meta_value "$child_meta" kind)
@@ -2545,7 +2549,7 @@ preflight_firstmate_home_herdr_children() {  # <home>
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
-    fm_backend_validate_task_endpoint "$child_meta" "$child_id" || return 1
+    fm_backend_validate_task_endpoint "$child_meta" "$child_id" allow-retired || return 1
     child_backend=$FM_BACKEND_VALIDATED_BACKEND
     child_target=$FM_BACKEND_VALIDATED_TARGET
     if [ "$child_backend" = herdr ]; then
@@ -2619,8 +2623,10 @@ cleanup_firstmate_home_children() {
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" \
           "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       fi
-      teardown_remove_orca_worktree_claimed \
-        "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || return 1
+      if ! fm_worktree_retirement_receipt_present "$child_meta" >/dev/null 2>&1; then
+        teardown_remove_orca_worktree_claimed \
+          "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || return 1
+      fi
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" \
@@ -2659,6 +2665,7 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session" "$sub_state/$child_id.reconcile-nudged"
     fm_worktree_claim_retire_commit || true
+    fm_worktree_retirement_receipt_clear "$child_meta" || true
   done
 }
 
@@ -2785,7 +2792,8 @@ if [ "$KIND" != secondmate ]; then
   fi
 fi
 
-if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+  && [ "$WORKTREE_RETIRED" != 1 ] && [ "$FORCE" != "--force" ]; then
   if ! inspectable_git_worktree "$WT"; then
     echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
     echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
@@ -2877,8 +2885,10 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
       "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  teardown_remove_orca_worktree_claimed \
-    "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || exit 1
+  if [ "$WORKTREE_RETIRED" != 1 ]; then
+    teardown_remove_orca_worktree_claimed \
+      "$STATE" "$ID" "$META" "$ORCA_WORKTREE_ID" "$WT" || exit 1
+  fi
   teardown_drop_task_branch "$PROJ" "$branch"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
@@ -3008,6 +3018,7 @@ rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
 fm_worktree_claim_retire_commit || true
+fm_worktree_retirement_receipt_clear "$META" || true
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
