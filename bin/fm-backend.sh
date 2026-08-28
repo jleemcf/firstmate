@@ -385,13 +385,16 @@ fm_backend_endpoint_atom_valid() {  # <value>
 
 # An interrupted worktree-claim retirement (bin/fm-worktree-ownership-lib.sh)
 # is the one way a live record loses its worktree identity, and its backup is
-# the only remaining copy, so name it wherever that loss surfaces.
+# the only remaining copy, so name it wherever that loss surfaces. The provider
+# outcome is unknown at that point, so the copy is named as evidence and never
+# advertised as a claim to put back unexamined: a path the provider did release
+# can already belong to another task.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
   local meta=$1 backup
   declare -F fm_worktree_claim_backup_hint >/dev/null 2>&1 || return 0
   backup=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || return 0
   [ -n "$backup" ] || return 0
-  echo "An interrupted worktree claim retirement left the recoverable claim at $backup; restore it there before retrying." >&2
+  echo "An interrupted worktree claim retirement left the recorded claim at $backup; confirm the provider did NOT release that path before restoring it, since a released path may already belong to another task." >&2
 }
 
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id> [allow-retired]

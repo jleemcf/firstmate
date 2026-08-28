@@ -1106,6 +1106,50 @@ test_ship_teardown_reuses_proved_orca_path_match_when_marker_owns_worktree() {
   pass "fm-teardown.sh backend=orca: an owner-marked ship reuses the id/path match proved during ownership"
 }
 
+# A retirement receipt is evidence about one incarnation of a task id. A copy
+# left behind by an earlier one must never let a live record skip the provider
+# removal that hands its worktree back.
+test_ship_teardown_ignores_a_superseded_retirement_receipt() {
+  local proj wt data state config id out rc neutral
+  id="orcastalereceiptz1"
+  proj="$TMP_ROOT/stale-receipt-project"
+  wt="$TMP_ROOT/stale-receipt-wt"
+  data="$TMP_ROOT/stale-receipt-data"
+  state="$TMP_ROOT/stale-receipt-state"
+  config="$TMP_ROOT/stale-receipt-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  touch "$state/.last-watcher-beat"
+  fm_write_meta "$state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-stale-receipt" "worktree=$wt" "project=$proj" \
+    "harness=claude" "kind=ship" "mode=local-only" "yolo=off" \
+    "backend=orca" "orca_worktree_id=wt-stale-receipt" "spawn_gen=gen-live"
+  # Left behind by an earlier task that carried this id and has since been
+  # torn down; this record's own worktree is very much still claimed.
+  {
+    printf '%s\n' 'schema=fm-worktree-retired.v1'
+    printf 'task_id=%s\n' "$id"
+    printf '%s\n' 'spawn_gen=gen-superseded'
+    printf 'released_worktree=%s\n' "$wt"
+  } > "$state/.$id.meta.worktree-retired"
+  orca_case stale-receipt
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-stale-receipt","path":"%s"}}}\n' "$wt" > "$RESP/1.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/2.out"
+  printf '%s\n' '{"ok":true,"result":{}}' > "$RESP/3.out"
+  neutral=$(neutral_fm_root "$CASE_DIR/neutral")
+  set +e
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    "$ROOT/bin/fm-teardown.sh" "$id" 2>&1 )
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "a superseded receipt should not change an ordinary Orca ship teardown"$'\n'"$out"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-stale-receipt'$'\x1f''--force'$'\x1f''--json' \
+    "a superseded receipt let teardown skip the Orca worktree removal"
+  assert_absent "$state/$id.meta" "teardown left the task record behind"
+  pass "fm-teardown.sh backend=orca: a superseded retirement receipt never skips the provider removal"
+}
+
 test_ship_teardown_refuses_orca_unresolvable_worktree_id() {
   local proj wt data state config id out rc neutral
   id="orcashipunresolvedz1"
@@ -1425,6 +1469,7 @@ test_scout_teardown_refuses_orca_missing_report_when_path_missing
 test_ship_teardown_refuses_orca_missing_worktree_path
 test_ship_teardown_removes_orca_worktree_when_id_path_matches
 test_ship_teardown_reuses_proved_orca_path_match_when_marker_owns_worktree
+test_ship_teardown_ignores_a_superseded_retirement_receipt
 test_ship_teardown_refuses_orca_unresolvable_worktree_id
 test_ship_teardown_refuses_orca_id_path_mismatch
 test_teardown_refuses_orca_missing_worktree_id

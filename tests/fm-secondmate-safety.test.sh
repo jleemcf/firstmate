@@ -1854,6 +1854,82 @@ EOF
   pass "secondmate teardown refuses to hide failed leased-home return"
 }
 
+# Returning a leased home hands the slot back, so the record loses its claim on
+# it. A step that fails afterwards must still leave a record a plain rerun can
+# finish, and the rerun must not try to hand the slot back a second time.
+test_secondmate_teardown_reruns_after_a_returned_leased_home() {
+  local home subhome subhome_abs fakebin log fmroot err rc returns
+  home="$TMP_ROOT/leased-return-rerun-home"
+  subhome="$TMP_ROOT/leased-return-rerun-subhome"
+  fmroot="$TMP_ROOT/leased-return-rerun-fmroot"
+  err="$TMP_ROOT/leased-return-rerun.err"
+  make_firstmate_git_root "$fmroot"
+  git -C "$fmroot" worktree add --quiet --detach "$subhome" HEAD
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  subhome_abs=$(cd "$subhome" && pwd -P)
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+spawn_gen=test-generation-domain
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  # A malformed status presentation manifest fails the last step before the
+  # record is removed, long after the leased home has been handed back.
+  printf 'domain\tfirstmate:fm-domain\tnot-a-number\n' > "$home/state/.status-presentation-cursor"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/leased-return-rerun-fake")
+  log="$TMP_ROOT/leased-return-rerun-fake/tmux.log"
+  # A returned lease goes back to the pool; the slot directory stays, which is
+  # what makes a second return of it destructive.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/leased-return-rerun-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "the fixture never stopped teardown after the leased home was returned"
+  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null \
+    || fail "teardown did not return the leased home before the failing step"
+  [ -e "$home/state/domain.meta" ] || fail "a stopped teardown discarded the secondmate record"
+  grep -q '^worktree=' "$home/state/domain.meta" \
+    && fail "the record regained a claim on a home the lease pool can reissue"
+  [ -e "$home/state/.domain.meta.worktree-retired" ] \
+    || fail "no retirement receipt records that the leased home was already returned"
+
+  rm -f "$home/state/.status-presentation-cursor"
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/leased-return-rerun-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "the rerun could not finish a teardown whose leased home was already returned: $(cat "$err")"
+  [ ! -e "$home/state/domain.meta" ] || fail "the rerun left the secondmate record behind"
+  [ ! -e "$home/state/.domain.meta.worktree-retired" ] \
+    || fail "the retirement receipt outlived the record it describes"
+  [ -d "$subhome" ] || fail "the rerun removed a home slot the lease pool already holds"
+  returns=$(grep -cF "treehouse return --force $subhome_abs" "$log")
+  [ "$returns" = 1 ] || fail "the rerun returned the leased home a second time"
+  grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null \
+    && fail "the rerun left the registry route behind"
+  pass "secondmate teardown reruns cleanly after its leased home was already returned"
+}
+
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return() {
   local home subhome subhome_abs fakebin log
   home="$TMP_ROOT/plain-clone-teardown-home"
@@ -3116,6 +3192,7 @@ test_secondmate_teardown_preserves_process_events_on_later_refusal
 test_secondmate_force_teardown_sweeps_nested_homes
 test_secondmate_force_teardown_preserves_nested_restore_status
 test_secondmate_teardown_refuses_failed_leased_home_return
+test_secondmate_teardown_reruns_after_a_returned_leased_home
 test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work

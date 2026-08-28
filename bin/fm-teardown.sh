@@ -1456,6 +1456,21 @@ teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <stat
   return "$rc"
 }
 
+# The task branch this slot is on, or was on before an earlier attempt detached
+# it: a return that failed after the detach leaves HEAD detached, and the retry
+# still has to drop the ref that attempt was going to.
+teardown_task_branch_of() {  # <worktree> <project> <task-id>
+  local dir=$1 project=$2 id=$3 branch=HEAD
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  fi
+  if [ "$branch" = HEAD ] && [ -n "$project" ] && [ -d "$project" ] \
+    && git -C "$project" rev-parse --verify --quiet "refs/heads/fm/$id" >/dev/null 2>&1; then
+    branch=fm/$id
+  fi
+  printf '%s' "$branch"
+}
+
 # Best effort by contract, but never silent: an undeletable task branch means
 # the shared repo keeps accumulating refs, and the only place that is visible
 # is here.
@@ -2109,8 +2124,12 @@ EOF
 
 remove_firstmate_home() {
   local home=$1 label=$2 expected_id=${3:-} claim_meta=${4:-} abs_home_path process_event_backup claim_state
+  local return_rc
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
+  if [ -n "$claim_meta" ] && fm_worktree_retirement_receipt_present "$claim_meta" >/dev/null 2>&1; then
+    return 0
+  fi
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
   [ -n "$claim_meta" ] || {
@@ -2136,8 +2155,13 @@ remove_firstmate_home() {
     }
     teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" "" \
       "$claim_state" "$expected_id" "$claim_meta" || {
-      echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
-      restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
+      return_rc=$?
+      if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+        echo "error: $label $abs_home_path was returned, but its retirement could not be recorded" >&2
+      else
+        echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
+        restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
+      fi
       return 1
     }
     [ -z "$process_event_backup" ] || rm -rf -- "$process_event_backup"
@@ -2638,7 +2662,8 @@ cleanup_firstmate_home_children() {
           :
         else
           child_return_rc=$?
-          if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
+          if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ] \
+            || [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
             return "$child_return_rc"
           fi
           teardown_safe_rm_child_worktree_claimed \
@@ -2665,7 +2690,10 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session" "$sub_state/$child_id.reconcile-nudged"
     fm_worktree_claim_retire_commit || true
-    fm_worktree_retirement_receipt_clear "$child_meta" || true
+    fm_worktree_retirement_receipt_clear "$child_meta" || {
+      echo "error: child $child_id's records were removed, but its retirement receipt at $(fm_worktree_retirement_receipt_path "$child_meta") could not be deleted; remove it before that task id is reused" >&2
+      return 1
+    }
   done
 }
 
@@ -2697,7 +2725,9 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   handoff_wake_retire_stage_recover "$HOME_PATH" || exit 1
   handoff_wake_retire_validate || exit 1
-  validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
+  if [ "$WORKTREE_RETIRED" != 1 ]; then
+    validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
+  fi
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
     preflight_descendant_task_locks "$HOME_PATH" || exit 1
@@ -2877,9 +2907,8 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
     ORCA_PATH_MATCH_VERIFIED=1
   fi
-  branch=HEAD
+  branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
   if [ -d "$WT" ]; then
-    branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
       "$WT/.opencode/plugins/fm-busy-state.js" \
       "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
@@ -2891,7 +2920,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   teardown_drop_task_branch "$PROJ" "$branch"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  branch=$(teardown_task_branch_of "$WT" "$PROJ" "$ID")
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
     "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
@@ -2905,7 +2934,12 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   fi
   teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" \
     "$STATE" "$ID" "$META" "$branch" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+    return_rc=$?
+    if [ "$return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+      echo "error: worktree $WT was returned to the pool, but its retirement could not be recorded; teardown aborted" >&2
+    else
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+    fi
     exit 1
   }
   teardown_drop_task_branch "$PROJ" "$branch"
@@ -3018,7 +3052,10 @@ rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
 fm_worktree_claim_retire_commit || true
-fm_worktree_retirement_receipt_clear "$META" || true
+fm_worktree_retirement_receipt_clear "$META" || {
+  echo "error: task $ID's records were removed, but its retirement receipt at $(fm_worktree_retirement_receipt_path "$META") could not be deleted; remove it before this task id is reused" >&2
+  exit 1
+}
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.

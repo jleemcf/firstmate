@@ -1418,6 +1418,76 @@ EOF
 # The pool return promises the shared repo will not accumulate task refs, and a
 # returned slot that is still sitting on the task branch is the case where the
 # promise silently broke.
+# A return that fails after the slot is already detached leaves nothing on disk
+# naming the branch, so the retry has to recover the task's own branch identity
+# or the ref is leaked with no output at all.
+test_retried_pool_return_still_drops_the_task_branch() {
+  local case_dir rc
+  case_dir=$(make_case retried-return-branch)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+n=\$(cat "$case_dir/treehouse.count" 2>/dev/null || echo 0)
+n=\$((n + 1))
+printf '%s\n' "\$n" > "$case_dir/treehouse.count"
+if [ "\$n" = 1 ]; then
+  echo 'pool busy' >&2
+  exit 1
+fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "retried-return-branch: the first return must fail"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "retried-return-branch: a failed return discarded the task record"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+  expect_code 0 "$rc" "retried-return-branch: the retry should complete"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "retried-return-branch: the retry never returned the slot"
+  if git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1; then
+    fail "retried-return-branch: the task branch survived a return that succeeded on retry"
+  fi
+  pass "a pool return that succeeds only on retry still drops the task branch"
+}
+
+# A failed return does not prove the lease was not handed on, so the rollback
+# must never put this task's marker over the marker of whoever holds it now.
+test_failed_return_never_overwrites_a_reissued_slots_marker() {
+  local case_dir rc
+  case_dir=$(make_case failed-return-foreign-marker)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+{
+  printf '%s\n' 'schema=fm-task-owner.v1'
+  printf '%s\n' 'task_id=task-b'
+  printf '%s\n' 'spawn_gen=test-generation-task-b'
+} > "$case_dir/wt/.fm-task-owner"
+echo 'return failed after the pool handed the slot on' >&2
+exit 1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "failed-return-foreign-marker: a failed return must stop teardown"
+  assert_grep "task_id=task-b" "$case_dir/wt/.fm-task-owner" \
+    "failed-return-foreign-marker: the rollback overwrote the marker of the task now holding the slot"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "failed-return-foreign-marker: a failed return discarded the task record"
+  pass "a failed pool return never restores this task's marker over another task's"
+}
+
 test_pool_return_drops_the_task_branch_from_the_project() {
   local case_dir rc
   case_dir=$(make_case return-drops-branch)
@@ -3187,6 +3257,8 @@ test_owner_marker_is_retired_before_the_pool_return
 test_late_teardown_failure_leaves_a_rerunnable_record
 test_retired_record_cannot_act_on_a_reissued_pool_slot
 test_pool_return_drops_the_task_branch_from_the_project
+test_retried_pool_return_still_drops_the_task_branch
+test_failed_return_never_overwrites_a_reissued_slots_marker
 test_dirty_worktree_refuses
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds

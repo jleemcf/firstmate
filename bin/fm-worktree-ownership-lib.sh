@@ -65,6 +65,9 @@ FM_WORKTREE_CLAIM_RETIRE_META=
 FM_WORKTREE_CLAIM_RETIRE_BACKUP=
 FM_WORKTREE_CLAIM_RETIRE_PATH=
 FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+# Distinguishes "the provider released the path but the retirement could not be
+# recorded" from an ordinary provider failure, which is the opposite situation.
+FM_WORKTREE_RETIREMENT_UNRECORDED=4
 FM_WORKTREE_CLAIM_RETIRE_MARKER=
 FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
 # Stamped by bin/fm-spawn.sh into a crewmate worktree once the task owns it, and
@@ -151,23 +154,41 @@ fm_worktree_retirement_receipt_path() {  # <meta-file>
   printf '%s/.%s.worktree-retired' "$dir" "$base"
 }
 
-# 0 and prints the path the provider released, 1 when no readable receipt is
-# beside the record.
+fm_worktree_record_identity() {  # <meta-file>
+  local meta=$1 base=${1##*/}
+  printf '%s' "${base%.meta}"
+}
+
+# 0 and prints the path the provider released, 1 otherwise. A receipt speaks
+# only for the exact incarnation that wrote it: it is bound to the record's task
+# id and spawn generation, and it is only believed while the record still claims
+# no path. A leaked receipt therefore says nothing about a later task that
+# reuses the id, and never about a record holding a live claim.
 fm_worktree_retirement_receipt_present() {  # <meta-file>
-  local receipt released
-  receipt=$(fm_worktree_retirement_receipt_path "$1")
+  local meta=$1 receipt released claim_rc=0
+  receipt=$(fm_worktree_retirement_receipt_path "$meta")
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   [ "$(fm_worktree_meta_exact_value "$receipt" schema 2>/dev/null || true)" = fm-worktree-retired.v1 ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$receipt" task_id 2>/dev/null || true)" \
+    = "$(fm_worktree_record_identity "$meta")" ] || return 1
+  [ "$(fm_worktree_meta_exact_value "$receipt" spawn_gen 2>/dev/null || true)" \
+    = "$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)" ] || return 1
+  fm_worktree_meta_claim "$meta" worktree >/dev/null || claim_rc=$?
+  [ "$claim_rc" -eq 2 ] || return 1
   released=$(fm_worktree_meta_exact_value "$receipt" released_worktree 2>/dev/null || true)
   printf '%s' "$released"
 }
 
 fm_worktree_retirement_receipt_write() {  # <meta-file> <released-worktree>
-  local meta=$1 released=$2 receipt tmp
+  local meta=$1 released=$2 receipt tmp generation
   receipt=$(fm_worktree_retirement_receipt_path "$meta")
+  generation=$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)
   tmp="$receipt.next.${BASHPID:-$$}"
   if ! (umask 077; {
       printf '%s\n' 'schema=fm-worktree-retired.v1'
+      printf 'task_id=%s\n' "$(fm_worktree_record_identity "$meta")"
+      printf 'spawn_gen=%s\n' "$generation"
       printf 'released_worktree=%s\n' "$released"
     } > "$tmp") || ! mv -f -- "$tmp" "$receipt"; then
     rm -f -- "$tmp"
@@ -549,10 +570,24 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=$stash
 }
 
+# A failed provider call does not prove the path was not handed on, so the
+# marker only goes back onto a path that carries no marker or still carries this
+# exact task and generation.
+fm_worktree_marker_still_ours() {  # <marker-path> <marker-backup>
+  local marker=$1 backup=$2 key
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  for key in task_id spawn_gen; do
+    [ "$(fm_worktree_meta_exact_value "$marker" "$key" 2>/dev/null || true)" \
+      = "$(fm_worktree_meta_exact_value "$backup" "$key" 2>/dev/null || true)" ] || return 1
+  done
+}
+
 fm_worktree_claim_retire_release() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
   local released=$FM_WORKTREE_CLAIM_RETIRE_PATH
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
+  local recorded=0
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
@@ -563,14 +598,19 @@ fm_worktree_claim_retire_release() {
   if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
     echo "warning: the retired owner marker's copy at $marker_backup could not be removed; it names a slot this task no longer owns and is safe to delete." >&2
   fi
-  if [ -n "$released" ] && [ -n "$meta" ] \
-    && ! fm_worktree_retirement_receipt_write "$meta" "$released"; then
-    fm_worktree_refuse "the provider released $released, but the retirement receipt beside $meta could not be written; the claim copy at ${backup:-<none>} is the only surviving record of it."
-    return 1
+  if [ -z "$released" ] || [ -z "$meta" ] || fm_worktree_retirement_receipt_write "$meta" "$released"; then
+    recorded=1
   fi
+  # The path is the provider's again either way, so its claim copy goes even
+  # when the retirement could not be recorded: nothing may put this record back
+  # in charge of a slot that can already be someone else's.
   if [ -n "$backup" ] && ! rm -f -- "$backup"; then
-    echo "warning: the retired worktree claim's copy at $backup could not be removed; $released is released and that copy must not be restored over the record." >&2
+    echo "warning: the retired worktree claim's copy at $backup could not be removed; $released is released and that copy must never be restored over the record." >&2
   fi
+  [ "$recorded" -eq 1 ] || {
+    fm_worktree_refuse "the provider released $released, but the retirement beside $meta could not be recorded; the record now identifies no worktree and cleanup cannot resume on its own."
+    return "$FM_WORKTREE_RETIREMENT_UNRECORDED"
+  }
 }
 
 fm_worktree_claim_retire_commit() {
@@ -625,9 +665,15 @@ fm_worktree_claim_retire_restore() {
     fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
     return 1
   fi
-  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] && ! mv -f -- "$marker_backup" "$marker"; then
-    fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
-    return 1
+  if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ]; then
+    if ! fm_worktree_marker_still_ours "$marker" "$marker_backup"; then
+      fm_worktree_refuse "provider return failed, but $marker now belongs to another task, so task ownership was not restored there; the superseded marker is at $marker_backup."
+      return 1
+    fi
+    if ! mv -f -- "$marker_backup" "$marker"; then
+      fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
+      return 1
+    fi
   fi
   [ -z "$marker_backup" ] || rm -f -- "$marker_backup"
   FM_WORKTREE_CLAIM_RETIRE_META=
