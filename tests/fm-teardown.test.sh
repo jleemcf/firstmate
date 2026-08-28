@@ -3124,6 +3124,45 @@ test_hung_bridge_tool_cannot_stall_cleanup() {
   pass "an unresponsive browser bridge is bounded instead of stalling teardown"
 }
 
+# chrome-devtools-axi is an optional universal tool, so a host without one is an
+# ordinary host - and the fix for an orphaned bridge must not become a new way
+# for teardown to fail or to strand a worktree. The task did record a bridge
+# start, which is the only case where an absent tool has anything to say.
+test_missing_browser_tool_is_reported_and_never_fails_teardown() {
+  local case_dir rc path_dir tool resolved
+  case_dir=$(make_case chrome-tool-missing)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  write_chrome_binding "$case_dir"
+  mark_chrome_binding_started "$case_dir"
+  # The allowlisted standard-command path carries no browser tool, so a host that
+  # installs chrome-devtools-axi can neither make this case pass vacuously nor
+  # have its own live browser reached by a test.
+  path_dir=$(make_path_without_lsof "$case_dir")
+  # The task session is derived from a digest, so the digest tool has to be on
+  # that reduced path or the binding fails its identity check before the absent
+  # browser tool is ever reached.
+  for tool in shasum sha256sum; do
+    resolved=$(command -v "$tool" 2>/dev/null) || continue
+    case "$resolved" in /*) ln -sf "$resolved" "$path_dir/$tool" ;; esac
+  done
+  rm -f "$case_dir/fakebin/chrome-devtools-axi"
+  ! PATH="$path_dir" command -v chrome-devtools-axi >/dev/null 2>&1 \
+    || fail "the browser-tool-free search path still resolved chrome-devtools-axi"
+
+  rc=0
+  FM_TEARDOWN_TEST_PATH="$path_dir" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an absent chrome-devtools-axi must not fail teardown"
+  assert_grep "chrome-devtools-axi is unavailable; task task-x1 bridge cleanup was skipped" \
+    "$case_dir/stderr" "an absent browser tool was not reported at teardown"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" \
+    "an absent browser tool stopped teardown from completing"
+  assert_absent "$case_dir/state/task-x1.chrome-devtools-session" \
+    "completed teardown retained the Chrome binding on a host with no browser tool"
+  pass "an absent chrome-devtools-axi is reported at teardown and never fails it"
+}
+
 # The knob exists to bound teardown-time work, so it must not become a way to
 # un-bound it: docs/configuration.md states the 1..120 range this enforces.
 test_bridge_call_bound_is_clamped_to_its_documented_range() {
@@ -3478,7 +3517,9 @@ test_a_bridge_opened_during_the_status_read_keeps_its_marker() {
 # - stopping when the ownership probe cannot be answered makes the probe-mute
 #   test red;
 # - rewriting the binding record under the ambient umask makes the record-mode
-#   test red.
+#   test red;
+# - dropping the missing-tool check, so cleanup runs a chrome-devtools-axi that
+#   is not installed, makes the absent-tool test red.
 test_an_unreadable_status_never_stops_a_session
 test_an_unanswered_ownership_probe_declines_the_stop
 test_ownership_probe_is_a_fresh_task_scoped_nonce
@@ -3498,6 +3539,7 @@ test_session_blind_tool_never_stops_a_shared_bridge
 test_ambient_bridge_port_cannot_retarget_cleanup
 test_hung_bridge_tool_cannot_stall_cleanup
 test_bridge_call_bound_is_clamped_to_its_documented_range
+test_missing_browser_tool_is_reported_and_never_fails_teardown
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
