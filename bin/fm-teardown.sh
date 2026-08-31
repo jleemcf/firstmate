@@ -48,6 +48,13 @@
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
 # for the common case where there is no remote at all.
+# Every one of those checks inspects the WORKTREE's HEAD. The fm/<task-id> ref
+# is a separate thing that a detached HEAD, a paused rebase or bisect, or any
+# other checked-out branch leaves uninspected, so teardown deletes that ref only
+# when the ref itself proves every commit on it is on a remote-tracking branch
+# or in the landed target this run already accepted. Otherwise the branch is
+# retained and reported, in every mode - retention is never a refusal, and
+# --force does not turn it into a deletion.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
@@ -1494,15 +1501,66 @@ teardown_task_branch_of() {  # <worktree> <project> <task-id>
   printf '%s' "$branch"
 }
 
+# The landed targets this teardown's own unlanded-work gate accepted, as commit
+# ids: the exact HEAD work_is_landed proved, or the default branch a local-only
+# teardown proved the work was merged into. Nothing else may stand in for them -
+# they are the only landing this run actually inspected.
+TEARDOWN_LANDED_TARGETS=
+teardown_record_landed_target() {  # <rev>
+  local rev=$1 resolved
+  [ -n "$rev" ] && [ -n "${WT:-}" ] && [ -d "${WT:-}" ] || return 0
+  resolved=$(git -C "$WT" rev-parse --verify --quiet "$rev^{commit}" 2>/dev/null) || return 0
+  [ -n "$resolved" ] || return 0
+  case " $TEARDOWN_LANDED_TARGETS " in
+    *" $resolved "*) return 0 ;;
+  esac
+  TEARDOWN_LANDED_TARGETS="${TEARDOWN_LANDED_TARGETS}${TEARDOWN_LANDED_TARGETS:+ }$resolved"
+}
+
+# The commits fm/<task-id> holds that neither a remote-tracking ref nor a landed
+# target this run accepted contains. Prints them (capped) when the ref is not
+# provably droppable, prints nothing when it is, and returns non-zero when the
+# containment could not be inspected at all - which is not a proof either.
+teardown_task_branch_unproved_commits() {  # <project> <branch>
+  local project=$1 branch=$2 target out
+  local -a range
+  range=("refs/heads/$branch" --not --remotes)
+  for target in $TEARDOWN_LANDED_TARGETS; do
+    git -C "$project" rev-parse --verify --quiet "$target^{commit}" >/dev/null 2>&1 || continue
+    range+=("$target")
+  done
+  out=$(git -C "$project" log --oneline "${range[@]}" -- 2>/dev/null) || return 1
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out" | head -5
+}
+
 # fm/<task-id> is the only ref this task owns, so it is the only one teardown
 # may drop - whatever else the crewmate happened to check out in the slot is not
 # teardown's to delete. Best effort by contract, but never silent: an
 # undeletable task branch means the shared repo keeps accumulating refs, and the
 # only place that is visible is here.
+#
+# Every dirty and unlanded-work gate above inspects the SLOT's HEAD, which is
+# not this ref: a detached HEAD, a paused bisect or rebase, or any other branch
+# the crewmate checked out leaves fm/<id> holding commits nothing ever looked
+# at. So the ref proves its own containment here, and retention - loud, and
+# naming what went unproved - is what a branch that cannot prove it gets.
 teardown_drop_task_branch() {  # <project> <task-id>
-  local project=$1 id=$2 branch="fm/$2" out
+  local project=$1 id=$2 branch="fm/$2" out unproved inspect_rc=0
   [ -n "$id" ] && [ -n "$project" ] && [ -d "$project" ] || return 0
   git -C "$project" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || return 0
+  unproved=$(teardown_task_branch_unproved_commits "$project" "$branch") || inspect_rc=$?
+  if [ "$inspect_rc" -ne 0 ]; then
+    echo "warning: task branch $branch is retained in $project: task $id's teardown could not inspect that branch, so nothing proves its commits are on a remote or in a landed target." >&2
+    echo "Inspect $branch and delete it yourself once its work is accounted for." >&2
+    return 0
+  fi
+  if [ -n "$unproved" ]; then
+    echo "warning: task branch $branch is retained in $project: no remote ref and no landed target task $id's teardown accepted contains these commits:" >&2
+    printf '%s\n' "$unproved" >&2
+    echo "Push $branch, land it, or delete it yourself once its work is accounted for." >&2
+    return 0
+  fi
   out=$(git -C "$project" branch -D "$branch" 2>&1) && return 0
   echo "warning: could not drop task branch $branch in $project: $out" >&2
 }
@@ -1588,6 +1646,7 @@ validate_worktree_teardown_safety() {
       echo "Merge the branch into local $DEFAULT first (bin/fm-merge-local.sh after the captain approves), or push to a fork/remote, or get the captain's explicit OK to discard, then --force." >&2
       return 1
     fi
+    teardown_record_landed_target "$DEFAULT"
   elif [ -n "$dirty" ]; then
     echo "REFUSED: worktree $WT has uncommitted changes." >&2
     echo "uncommitted changes present" >&2
@@ -1605,6 +1664,7 @@ validate_worktree_teardown_safety() {
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
       return 1
     fi
+    teardown_record_landed_target HEAD
   fi
 }
 
@@ -3030,6 +3090,8 @@ fi
 # did. A record whose recorded path merely no longer exists passed no such gate
 # - nothing inspected it for unpushed commits, because there was nothing to
 # inspect - so fm/<id> may still be the only place that work survives.
+# Those gates are about the SLOT, never about this ref, so the drop itself
+# proves the ref's own containment before it deletes anything.
 if [ "$KIND" != secondmate ]; then
   if [ "$WORKTREE_RETIRED" = 1 ] || [ "$TASK_WORKTREE_RELEASED" = 1 ]; then
     teardown_drop_task_branch "$PROJ" "$ID"

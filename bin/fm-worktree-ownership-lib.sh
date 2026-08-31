@@ -61,10 +61,13 @@
 # receipt is, so a rerun still finishes the remaining cleanup, and no consumer
 # can read it as a claim to put back over a path the provider owns again.
 # fm_worktree_claim_retire_restore is therefore reachable only while the
-# provider operation is known to have failed, and puts back both halves.
+# provider operation is known to have failed, and puts back both halves. Each
+# half stops being recoverable the moment it is back in place, so a restore that
+# gets the claim in and then fails on the marker leaves exactly one surviving
+# copy - the marker's - and nothing may still name the consumed one.
 # fm_worktree_claim_retire_abandon closes an interrupted retirement whose
-# provider outcome is unknown: it never restores, and leaves the surviving
-# backup as the recovery source every later refusal names.
+# provider outcome is unknown: it never restores, and leaves whichever backup
+# actually survives as the recovery source every later refusal names.
 # fm_worktree_claim_retire_commit discards a retirement's leftovers once the
 # record it describes is gone.
 #
@@ -1031,6 +1034,7 @@ fm_worktree_claim_retire_commit() {
 # later proof over the claimless record refuses until an operator resolves it.
 fm_worktree_claim_retire_abandon() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
+  local marker=$FM_WORKTREE_CLAIM_RETIRE_MARKER
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   FM_WORKTREE_CLAIM_RETIRE_META=
@@ -1042,6 +1046,13 @@ fm_worktree_claim_retire_abandon() {
   if [ -n "$backup" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
     echo "warning: a worktree claim retirement for $meta was interrupted before the provider reported its result; the recoverable claim is at $backup and every lifecycle verb refuses this record until it is resolved." >&2
     [ -z "$marker_backup" ] || rm -f -- "$marker_backup" || true
+    return 0
+  fi
+  # The claim went back and only its marker did not: the record is whole, so the
+  # marker's copy is the one surviving half and the state that refuses every
+  # later proof is the absent marker, not a claim anyone has to recover.
+  if [ -z "$backup" ] && [ -n "$marker_backup" ] && [ -f "$marker_backup" ]; then
+    echo "warning: the worktree claim in $meta was restored, but its $FM_WORKTREE_TASK_OWNER_MARKER could not be put back at ${marker:-the recorded worktree}; every lifecycle verb refuses this record until that marker is restored from $marker_backup." >&2
     return 0
   fi
   [ -z "$backup" ] || rm -f -- "$backup" || true
@@ -1060,9 +1071,15 @@ fm_worktree_claim_retire_restore() {
     fm_worktree_refuse "provider return failed, but $marker now belongs to another task, so this record was left retired rather than pointed back at that path."
     return 1
   fi
-  if [ -n "$backup" ] && ! mv -f -- "$backup" "$meta"; then
-    fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
-    return 1
+  if [ -n "$backup" ]; then
+    if ! mv -f -- "$backup" "$meta"; then
+      fm_worktree_refuse "provider return failed and the worktree claim could not be restored to $meta; recover it from $backup."
+      return 1
+    fi
+    # The copy is consumed the moment the record carries its claim again, so
+    # nothing downstream may go on naming it as the recoverable one.
+    backup=
+    FM_WORKTREE_CLAIM_RETIRE_BACKUP=
   fi
   if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] \
     && ! mv -f -- "$marker_backup" "$marker"; then

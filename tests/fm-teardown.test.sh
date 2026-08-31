@@ -1873,6 +1873,119 @@ test_vanished_worktree_teardown_keeps_the_task_branch() {
   pass "a teardown over a vanished worktree keeps the task branch its unlanded work is on and says so"
 }
 
+# Every dirty and unlanded-work gate inspects the SLOT's HEAD. A crewmate parked
+# at a bisect, a paused rebase, or a plain `git checkout origin/main` leaves a
+# clean tree at a commit every remote already has, so all of those gates pass
+# without ever looking at fm/<id> - which is where the unpushed work is. No
+# --force is involved: the branch is the only surviving copy of those commits.
+test_detached_reachable_head_keeps_the_unpushed_task_branch() {
+  local case_dir rc head
+  case_dir=$(make_case detached-head-branch)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "crew work that was never pushed"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/wt" checkout -q --detach origin/main
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "detached-head-branch: a clean detached HEAD must still tear down"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "detached-head-branch: the pool slot was never returned"
+  git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1 \
+    || fail "detached-head-branch: teardown deleted the task branch holding the only copy of unpushed work"
+  [ "$(git -C "$case_dir/project" rev-parse refs/heads/fm/task-x1)" = "$head" ] \
+    || fail "detached-head-branch: the surviving task branch no longer holds the crew's commit"
+  assert_grep "task branch fm/task-x1 is retained" "$case_dir/stderr" \
+    "detached-head-branch: the retained task branch was passed over in silence"
+  assert_grep "crew work that was never pushed" "$case_dir/stderr" \
+    "detached-head-branch: the diagnostic did not name the commits nothing proved"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "detached-head-branch: the task record outlived its own teardown"
+  pass "a clean detached HEAD never stands in as proof for the task branch's own commits"
+}
+
+# The other half of the same rule: the branch's own commits live on no remote
+# after a squash merge, but this teardown's landed-work gate accepted them, so
+# the ref is contained by that accepted target and is still dropped.
+test_landed_task_branch_is_still_dropped() {
+  local case_dir rc
+  case_dir=$(make_case landed-branch-drop)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_on_origin_main "$case_dir" feature.txt hello
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "landed-branch-drop: landed content should tear down"$'\n'"$(cat "$case_dir/stderr")"
+  if git -C "$case_dir/project" rev-parse --verify --quiet refs/heads/fm/task-x1 >/dev/null 2>&1; then
+    fail "landed-branch-drop: the task branch survived a teardown that accepted its work as landed"
+  fi
+  pass "a task branch contained in the landed target this teardown accepted is still dropped"
+}
+
+# A restore puts the claim back first and the marker second. Once the claim is
+# in, its copy is consumed, so a marker restore that then fails must leave the
+# operator pointed at the copy that still exists - and must not delete it.
+test_failed_marker_restore_names_the_surviving_copy() {
+  local case_dir rc real_mv
+  local -a marker_backups claim_backups
+  case_dir=$(make_case marker-restore-fails)
+  write_meta "$case_dir" no-mistakes ship
+  real_mv=$(command -v mv)
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+echo 'return failed' >&2
+exit 1
+EOF
+  cat > "$case_dir/fakebin/mv" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    */.fm-task-owner)
+      echo 'mv: simulated failure putting the owner marker back' >&2
+      exit 1 ;;
+  esac
+done
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/mv"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "marker-restore-fails: a failed return must stop teardown"
+  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
+    "marker-restore-fails: the claim was not put back, so the retry lost its path"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ -f "${marker_backups[0]}" ] \
+    || fail "marker-restore-fails: the only surviving copy of the owner marker was deleted"
+  assert_grep "task_id=task-x1" "${marker_backups[0]}" \
+    "marker-restore-fails: the surviving copy is not this task's marker"
+  assert_grep "restored from ${marker_backups[0]}" "$case_dir/stderr" \
+    "marker-restore-fails: the abandon diagnostic never named the copy that still exists"
+  assert_no_grep "recoverable claim is at" "$case_dir/stderr" \
+    "marker-restore-fails: the diagnostic named a claim backup the restore already consumed"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "marker-restore-fails: the consumed claim backup was left behind as a second recovery source"
+  pass "a restore that gets the claim in and fails on the marker names only the copy that survived"
+}
+
 # An interrupted relaunch leaves the marker one generation ahead of the record
 # it is compared against. That is the crash the marker was introduced for, and
 # the restamp publishes a handoff naming exactly that transition for exactly
@@ -3779,7 +3892,10 @@ test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
+test_failed_marker_restore_names_the_surviving_copy
 test_vanished_worktree_teardown_keeps_the_task_branch
+test_detached_reachable_head_keeps_the_unpushed_task_branch
+test_landed_task_branch_is_still_dropped
 test_interrupted_restamp_is_still_provable_ownership
 test_generation_skew_without_a_handoff_still_refuses
 test_released_slot_retires_every_ownership_record_naming_it
