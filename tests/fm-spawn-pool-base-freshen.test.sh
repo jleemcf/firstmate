@@ -245,6 +245,45 @@ test_killed_spawn_leaves_an_attributable_ownership_record() {
   pass "a spawn killed before publishing its record leaves an attributable owner marker"
 }
 
+# A lost ownership record must not turn the task id in a surviving marker into
+# authority for a fresh spawn. Only --relaunch first proves the record, path,
+# generation handoff, and prior worker state; a fresh recovery spawn has none of
+# that evidence and must preserve the marker rather than restamping the slot.
+test_fresh_respawn_refuses_same_id_marker_after_pending_record_is_lost() {
+  local rec id out status marker_gen pending before
+  id='pool-respawn-lost-pending-r1'
+  rec=$(make_case respawn-lost-pending "$id")
+  read_case_record "$rec"
+  install_git_that_kills_spawn_on_fetch "$FAKEBIN_DIR" "$CASE_DIR/kill-on-fetch"
+  : > "$CASE_DIR/kill-on-fetch"
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+  [ "$status" -ne 0 ] || fail "the fixture never interrupted the first spawn"$'\n'"$out"
+  marker_gen=$(marker_spawn_generation "$POOL_DIR")
+  [ -n "$marker_gen" ] || fail "the fixture left no owner marker to protect"
+  pending=$(owner_pending_record "$id" "$marker_gen")
+  assert_present "$pending" "the fixture left no ownership record to lose"
+  rm -f "$pending"
+  before=$(cat "$POOL_DIR/.fm-task-owner")
+
+  status=0
+  out=$(run_spawn "$id" --mode no-mistakes --yolo off) || status=$?
+
+  [ "$status" -ne 0 ] || fail "a fresh spawn reused $id and overwrote its surviving owner marker"$'\n'"$out"
+  assert_contains "$out" "a fresh spawn refuses any existing owner marker" \
+    "the refusal did not distinguish fresh spawn from metadata-backed relaunch"
+  assert_contains "$out" "task $id" \
+    "the refusal did not name the task identity in the surviving marker"
+  [ "$(cat "$POOL_DIR/.fm-task-owner")" = "$before" ] \
+    || fail "the refused fresh spawn overwrote the surviving marker's generation"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "the refused fresh spawn published a task record for a slot it could not prove"
+  assert_no_owner_pending_records "$id" \
+    "the refused fresh spawn published a replacement ownership record"
+  pass "a fresh spawn refuses a same-id marker after its pending record is lost"
+}
+
 # Recovery is told to keep the same task identity, so respawning the very id
 # whose spawn was killed is the expected next move. That respawn must not draw a
 # second slot: doing so leaves the first one behind an owner marker whose only
@@ -786,6 +825,7 @@ test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
 test_fresh_spawn_refuses_a_slot_marked_for_another_task
 test_killed_spawn_leaves_an_attributable_ownership_record
+test_fresh_respawn_refuses_same_id_marker_after_pending_record_is_lost
 test_respawn_of_a_killed_task_id_refuses_until_its_claim_is_resolved
 test_owner_marker_a_moved_on_record_cannot_retire_names_the_real_remedy
 test_ambiguous_record_never_advises_removing_the_marker

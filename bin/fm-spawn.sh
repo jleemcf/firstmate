@@ -2496,9 +2496,12 @@ exclude_path() {
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
 
-# Prints the task id an existing owner marker names when that is not this task,
-# or the reason it cannot be attributed at all. Silent and 0 only when the slot
-# carries no marker or carries this task's own.
+# Prints the task id an existing owner marker names, or the reason it cannot be
+# attributed at all. Silent and 0 only when there is no marker, or when a
+# relaunch finds this task's own marker after the metadata-backed ownership
+# proof above accepted that exact handoff. A fresh spawn refuses every existing
+# marker, including one with the same task id: without relaunch metadata, task
+# identity alone cannot prove that the marked generation stopped working.
 task_worktree_owner_marker_holder() {  # <marker>
   local marker=$1 owner
   [ -e "$marker" ] || [ -L "$marker" ] || return 0
@@ -2511,7 +2514,9 @@ task_worktree_owner_marker_holder() {  # <marker>
     printf '%s' 'a marker with no readable task identity'
     return 1
   fi
-  [ "$owner" != "$ID" ] || return 0
+  if [ "$RELAUNCH" -eq 1 ] && [ "$owner" = "$ID" ]; then
+    return 0
+  fi
   printf 'task %s' "$owner"
   return 1
 }
@@ -2578,7 +2583,11 @@ stamp_task_worktree_owner() {
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   marker="$WT/$FM_WORKTREE_TASK_OWNER_MARKER"
   if ! holder=$(task_worktree_owner_marker_holder "$marker"); then
-    echo "error: worktree $WT already belongs to $holder, not task $ID; refusing to launch task $ID into another task's workspace" >&2
+    if [ "$RELAUNCH" -eq 0 ]; then
+      echo "error: worktree $WT already belongs to $holder; its marker is not task $ID's fresh-spawn authority, because a fresh spawn refuses any existing owner marker and only relaunch has metadata that can prove a same-task handoff" >&2
+    else
+      echo "error: worktree $WT already belongs to $holder, not task $ID; refusing to relaunch task $ID into another task's workspace" >&2
+    fi
     report_foreign_owner_marker_remedy "$marker"
     return 1
   fi
