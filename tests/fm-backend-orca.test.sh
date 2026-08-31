@@ -623,7 +623,7 @@ test_spawn_refuses_orca_nonisolated_worktree() {
 
 test_spawn_removes_orca_worktree_when_terminal_create_fails() {
   local proj wt data state config id out status
-  id="orcatermfailz8"
+  id="orcatermfailz8-$$"
   proj="$TMP_ROOT/terminal-fail-project"
   wt="$TMP_ROOT/terminal-fail-wt"
   data="$TMP_ROOT/terminal-fail-data"
@@ -699,7 +699,7 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
 
 test_spawn_releases_orca_resources_when_metadata_write_fails() {
   local proj wt data state config id out status
-  id="orcametafailz9"
+  id="orcametafailz9-$$"
   proj="$TMP_ROOT/meta-fail-project"
   wt="$TMP_ROOT/meta-fail-wt"
   data="$TMP_ROOT/meta-fail-data"

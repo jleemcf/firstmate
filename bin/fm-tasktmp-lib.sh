@@ -18,8 +18,25 @@
 # canonicalizes, traverses, or removes an untrusted task root.
 # Missing tasktmp fields and recognized roots that are already absent remain
 # compatible no-ops for lifecycle cleanup.
+#
+# Trust is a THREE-state answer, so no caller may reduce it to a boolean.
+# fm_tasktmp_trust is the only interface call sites use; it sets
+# FM_TASKTMP_TRUST to exactly one of:
+#   trusted - the root, and unless the root-only scope is asked for its gotmp
+#             child, is present, task-owned, and private; it may be used,
+#             scanned, and removed.
+#   unsafe  - the path exists and failed a trust check; refuse it, report
+#             FM_TASKTMP_ERROR, and neither chmod, enter, canonicalize,
+#             traverse, adopt, nor delete it.
+#   absent  - the recognized root does not exist; a compatible no-op that is
+#             never a refusal.
+# fm_tasktmp_validate and fm_tasktmp_validate_root stay the underlying
+# primitives (0 trusted, 1 unsafe, 2 absent) and must never be called as
+# `if ! fm_tasktmp_validate ...`, which silently merges unsafe with absent and
+# turns a vanished root into a refusal.
 
 FM_TASKTMP_ERROR=
+FM_TASKTMP_TRUST=
 FM_TASKTMP_KIND=
 FM_TASKTMP_STAT_UID=
 FM_TASKTMP_STAT_MODE=
@@ -167,23 +184,39 @@ fm_tasktmp_validate() {  # <task-id> <path>
   fm_tasktmp_directory_stat_valid "$gotmp" "$kind" || return 1
 }
 
+fm_tasktmp_trust() {  # <task-id> <path> [root]
+  local id=$1 path=$2 scope=${3:-gotmp} rc=0
+  if [ "$scope" = root ]; then
+    fm_tasktmp_validate_root "$id" "$path" || rc=$?
+  else
+    fm_tasktmp_validate "$id" "$path" || rc=$?
+  fi
+  case "$rc" in
+    0) FM_TASKTMP_TRUST=trusted ;;
+    2) FM_TASKTMP_TRUST=absent ;;
+    *) FM_TASKTMP_TRUST=unsafe ;;
+  esac
+  return 0
+}
+
 fm_tasktmp_recorded_prepare() {  # <state> <task-id> <recorded-path>
-  local state=$1 id=$2 path=$3 rc
+  local state=$1 id=$2 path=$3
   if [ -z "$path" ]; then
     fm_tasktmp_claim_create "$state" "$id"
     return
   fi
-  if fm_tasktmp_validate "$id" "$path"; then
-    printf '%s\n' "$path"
-    return 0
-  else
-    rc=$?
-  fi
-  if [ "$rc" -eq 2 ]; then
-    fm_tasktmp_claim_create "$state" "$id"
-    return
-  fi
-  return "$rc"
+  fm_tasktmp_trust "$id" "$path"
+  case "$FM_TASKTMP_TRUST" in
+    trusted)
+      printf '%s\n' "$path"
+      return 0
+      ;;
+    absent)
+      fm_tasktmp_claim_create "$state" "$id"
+      return
+      ;;
+  esac
+  return 1
 }
 
 fm_tasktmp_claim_path() {  # <state> <task-id>
@@ -267,10 +300,13 @@ fm_tasktmp_claim_mark_committed() {  # <state> <task-id>
   [ "$FM_TASKTMP_CLAIM_PHASE" = pending ] || return 0
   claim=$(fm_tasktmp_claim_path "$state" "$id")
   temp=$state/.$id.tasktmp-claim.commit.${BASHPID:-$$}
-  if ! awk '$0 == "phase=pending" { print "phase=committed"; changed += 1; next } { print } END { if (changed != 1) exit 1 }' \
+  if ! (
+    umask 077
+    awk '$0 == "phase=pending" { print "phase=committed"; changed += 1; next } { print } END { if (changed != 1) exit 1 }' \
       "$claim" > "$temp" \
-     || ! chmod 600 -- "$temp" \
-     || ! mv -- "$temp" "$claim"; then
+      && chmod 600 -- "$temp" \
+      && mv -- "$temp" "$claim"
+  ); then
     rm -f -- "$temp" 2>/dev/null || true
     fm_tasktmp_error "task temporary claim $claim could not record its commit point"
     return 1
@@ -302,27 +338,23 @@ fm_tasktmp_claim_transfer() {  # <state> <task-id> <meta>
 }
 
 fm_tasktmp_remove() {  # <task-id> <path>
-  local id=$1 path=$2 rc
+  local id=$1 path=$2
   [ -n "$path" ] || return 0
-  if fm_tasktmp_validate "$id" "$path"; then
-    rm -rf -- "$path" || fm_tasktmp_error "trusted task temporary root $path could not be removed"
-    return
-  else
-    rc=$?
-  fi
-  [ "$rc" -eq 2 ] && return 0
-  return "$rc"
+  fm_tasktmp_trust "$id" "$path"
+  case "$FM_TASKTMP_TRUST" in
+    absent) return 0 ;;
+    unsafe) return 1 ;;
+  esac
+  rm -rf -- "$path" || fm_tasktmp_error "trusted task temporary root $path could not be removed"
 }
 
 fm_tasktmp_claim_cleanup_root() {  # <task-id> <claimed-path>
-  local id=$1 path=$2 rc gotmp
-  if fm_tasktmp_validate_root "$id" "$path"; then
-    :
-  else
-    rc=$?
-    [ "$rc" -eq 2 ] && return 0
-    return "$rc"
-  fi
+  local id=$1 path=$2 gotmp
+  fm_tasktmp_trust "$id" "$path" root
+  case "$FM_TASKTMP_TRUST" in
+    absent) return 0 ;;
+    unsafe) return 1 ;;
+  esac
   [ "$FM_TASKTMP_KIND" = new ] || {
     fm_tasktmp_error "claimed task temporary root $path is not a random root"
     return 1
@@ -348,13 +380,15 @@ fm_tasktmp_claim_reconcile_one() {  # <state> <task-id>
   if [ -f "$meta" ] && [ ! -L "$meta" ] \
      && [ "$(fm_tasktmp_meta_tasktmp "$meta" 2>/dev/null || true)" = "$FM_TASKTMP_CLAIM_PATH" ]; then
     # Durable metadata naming the identical root is the completed transfer, even
-    # when a crash lost the commit point, but only while that exact root still
-    # passes validation.
-    # Any other spelling, or a root that no longer validates, stays preserved.
-    if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ] \
-       && ! fm_tasktmp_validate "$id" "$FM_TASKTMP_CLAIM_PATH"; then
-      fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point and $FM_TASKTMP_CLAIM_PATH no longer validates: $FM_TASKTMP_ERROR; the root and claim were preserved"
-      return 1
+    # when a crash lost the commit point.
+    # An already-absent root leaves nothing to own, clean, or leak, so only a
+    # path that still exists and stopped being trusted is preserved.
+    if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ]; then
+      fm_tasktmp_trust "$id" "$FM_TASKTMP_CLAIM_PATH"
+      if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
+        fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point and $FM_TASKTMP_CLAIM_PATH is no longer trusted: $FM_TASKTMP_ERROR; the root and claim were preserved"
+        return 1
+      fi
     fi
     fm_tasktmp_claim_retire "$state" "$id"
     return
@@ -421,7 +455,7 @@ fm_tasktmp_claim_create() {  # <state> <task-id>
 }
 
 fm_tasktmp_audit_meta() {  # <meta>
-  local meta=$1 id path rc
+  local meta=$1 id path
   id=${meta##*/}
   id=${id%.meta}
   path=$(fm_tasktmp_meta_tasktmp "$meta" 2>/dev/null) || {
@@ -429,12 +463,8 @@ fm_tasktmp_audit_meta() {  # <meta>
     return 1
   }
   [ -n "$path" ] || return 0
-  if fm_tasktmp_validate "$id" "$path"; then
-    return 0
-  else
-    rc=$?
-  fi
-  [ "$rc" -eq 2 ] && return 0
+  fm_tasktmp_trust "$id" "$path"
+  [ "$FM_TASKTMP_TRUST" = unsafe ] || return 0
   printf 'TASKTMP_RECONCILE: %s: unsafe recorded task temporary root refused: %s; nothing was touched\n' "$id" "$FM_TASKTMP_ERROR"
   return 1
 }

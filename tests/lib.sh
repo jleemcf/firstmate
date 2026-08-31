@@ -84,16 +84,28 @@ FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
 }
 
 fm_test_cleanup_tasktmp_roots() {  # <fixture-root>
-  local fixture=$1 meta id task_tmp
+  local fixture=$1
   [ -d "$fixture" ] || return 0
-  while IFS= read -r meta; do
-    id=${meta##*/}
-    id=${id%.meta}
-    task_tmp=$(awk -F= '$1 == "tasktmp" { value = substr($0, index($0, "=") + 1); found += 1 } END { if (found == 1) print value }' "$meta" 2>/dev/null || true)
-    [ -n "$task_tmp" ] || continue
-    bash -c '. "$1"; fm_tasktmp_remove "$2" "$3"' _ \
-      "$ROOT/bin/fm-tasktmp-lib.sh" "$id" "$task_tmp" 2>/dev/null || true
-  done < <(find "$fixture" -type f -name '*.meta' -print 2>/dev/null)
+  # Task roots are recorded only in a home's state/<id>.meta, so prune the walk
+  # to those directories rather than crawling fixtures that hold real clones and
+  # worktrees, and source the shared owner once for the whole sweep.
+  find "$fixture" -type d -name state -prune -exec find {} -maxdepth 1 -type f -name '*.meta' -print \; 2>/dev/null \
+    | (
+        local_meta=
+        . "$ROOT/bin/fm-tasktmp-lib.sh"
+        while IFS= read -r local_meta; do
+          fm_test_remove_recorded_tasktmp "$local_meta"
+        done
+      )
+}
+
+fm_test_remove_recorded_tasktmp() {  # <meta>
+  local meta=$1 id task_tmp
+  id=${meta##*/}
+  id=${id%.meta}
+  task_tmp=$(awk -F= '$1 == "tasktmp" { value = substr($0, index($0, "=") + 1); found += 1 } END { if (found == 1) print value }' "$meta" 2>/dev/null || true)
+  [ -n "$task_tmp" ] || return 0
+  fm_tasktmp_remove "$id" "$task_tmp" >/dev/null 2>&1 || true
 }
 
 fm_test_cleanup() {

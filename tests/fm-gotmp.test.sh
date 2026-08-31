@@ -413,17 +413,19 @@ test_teardown_refuses_unsafe_tasktmp_without_touching_it() {
   mode=$(tasktmp_lstat_mode "$target")
   fake=$(make_fake_root "$id" "$task_tmp")
   out=$(FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "teardown accepted a symlinked unsafe task root"
-  case "$out" in *"Nothing under that path was scanned, changed, or removed"*) ;; *) fail "unsafe teardown refusal did not state its no-touch result" ;; esac
+  [ "$rc" -eq 0 ] || fail "one unsafe task root stranded the whole teardown: $out"
+  case "$out" in *"Nothing under that path is scanned, changed, or removed"*) ;; *) fail "unsafe teardown refusal did not state its no-touch result" ;; esac
+  case "$out" in *"was preserved untouched for an operator"*) ;; *) fail "the completion line did not name the preserved untrusted root" ;; esac
   [ -L "$task_tmp" ] && [ "$(readlink "$task_tmp")" = "$target" ] \
     || fail "unsafe teardown refusal changed the symlink"
   [ "$(tasktmp_lstat_identity "$target")" = "$inode" ] && [ "$(tasktmp_lstat_mode "$target")" = "$mode" ] \
     || fail "unsafe teardown refusal changed the target"
   grep -qx 'unsafe sentinel' "$target/gotmp/sentinel" \
     || fail "unsafe teardown refusal changed the sentinel"
-  [ -f "$fake/state/$id.meta" ] || fail "unsafe teardown refusal removed task metadata"
+  [ ! -e "$fake/state/$id.meta" ] \
+    || fail "the refusal was not scoped to the temporary root: the task record survived teardown"
   rm -f -- "$task_tmp"
-  pass "fm-teardown refuses a symlinked unsafe root without scanning, changing, or deleting it"
+  pass "fm-teardown preserves an unsafe root untouched and still completes the rest of the teardown"
 }
 
 test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
@@ -438,9 +440,19 @@ test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
     *"trusted temporary parent"*) ;;
     *) fail "an unresolvable trusted temporary parent did not refuse loudly: $out" ;;
   esac
+  # A parent that fails OPEN would keep going with an empty parent, publish a
+  # claim, and only give up after exhausting its collision attempts against
+  # candidates rooted at the filesystem root.
+  case "$out" in
+    *"collision-free"*) fail "the allocator kept going after an unresolvable parent" ;;
+  esac
+  [ -z "$(find / -maxdepth 1 -name "fm-$id.*" -print -quit 2>/dev/null)" ] \
+    || fail "an unresolvable parent was used as an empty prefix for a real candidate"
   [ ! -e "$state/$id.tasktmp-claim" ] \
     || fail "a refused allocation published a claim anyway"
-  pass "tasktmp allocator: an unresolvable trusted temporary parent refuses loudly instead of allocating"
+  [ -z "$(find "$state" -maxdepth 1 -name "*.tasktmp-claim*" -print -quit 2>/dev/null)" ] \
+    || fail "a refused allocation left a private claim candidate behind"
+  pass "tasktmp allocator: an unresolvable trusted temporary parent refuses before any candidate exists"
 }
 
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root() {
@@ -482,32 +494,79 @@ test_crash_window_preserves_a_recorded_root_that_no_longer_validates() {
   pass "tasktmp claim: identical metadata never retires a claimed root that stopped validating"
 }
 
+# Hold the per-task spawn lock exactly the way fm-spawn does - through the real
+# fm_lock_try_acquire producer in a separate live process - so this fixture
+# cannot drift from the lock layout the read-only audit reads.
+start_real_spawn_lock_holder() {  # <state> <task-id> <ready-file>
+  local state=$1 id=$2 ready=$3 holder waited
+  holder="$TMP_ROOT/hold-spawn-lock-$id.sh"
+  cat > "$holder" <<'SH'
+#!/usr/bin/env bash
+set -u
+# shellcheck source=/dev/null
+. "$1/bin/fm-wake-lib.sh"
+STATE=$2
+fm_lock_try_acquire "$2/.spawn-$3.lock" || exit 1
+: > "$4"
+exec sleep 300
+SH
+  chmod +x "$holder"
+  bash "$holder" "$ROOT" "$state" "$id" "$ready" &
+  SPAWN_LOCK_HOLDER_PID=$!
+  waited=0
+  while [ ! -e "$ready" ]; do
+    kill -0 "$SPAWN_LOCK_HOLDER_PID" 2>/dev/null \
+      || fail "the real spawn-lock holder exited before it acquired the lock"
+    waited=$((waited + 1))
+    [ "$waited" -le 200 ] || fail "the real spawn-lock holder never acquired the lock"
+    sleep 0.05
+  done
+}
+
+test_crash_window_retires_a_claim_whose_recorded_root_already_vanished() {
+  local state="$TMP_ROOT/crashgone-state" id="crash-gone-z16-$$" root second
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "crash-window fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
+  # The claim never reached its commit point and a reaper then took the root.
+  rm -rf -- "$root"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" \
+    || fail "an already-absent claimed root was preserved as an error"
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "an already-absent claimed root left the task id permanently unspawnable"
+  second=$(fm_tasktmp_claim_create "$state" "$id") \
+    || fail "the task id could not allocate again after its root vanished"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
+  rm -rf -- "$second"
+  pass "tasktmp claim: an identically recorded root that is already gone retires rather than wedging the id"
+}
+
 test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact() {
-  local state="$TMP_ROOT/readonly-live-state" id="readonly-live-z15-$$" root lock pid out rc
+  local state="$TMP_ROOT/readonly-live-state" id="readonly-live-z15-$$" root lock out rc
   mkdir -p "$state"
   root=$(fm_tasktmp_claim_create "$state" "$id") || fail "read-only fixture allocation failed"
   lock=$state/.spawn-$id.lock
-  sleep 300 &
-  pid=$!
-  mkdir -p "$lock"
-  printf '%s\n' "$pid" > "$lock/pid"
+  SPAWN_LOCK_HOLDER_PID=
+  start_real_spawn_lock_holder "$state" "$id" "$TMP_ROOT/readonly-live-ready"
+  [ -L "$lock" ] || fail "the real lock producer no longer publishes the spawn lock as a symlink"
   out=$(fm_tasktmp_startup "$state" read-only); rc=$?
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
   [ "$rc" -eq 0 ] || fail "an in-flight spawn made read-only startup report an unreconciled remnant"
   case "$out" in *"BOOTSTRAP_INFO: $id: pending task temporary claim"*) ;; *) fail "a live spawn's claim was not reported as an ordinary fact: $out" ;; esac
   case "$out" in *TASKTMP_RECONCILE*) fail "an ordinary in-flight spawn raised an actionable reconcile diagnostic" ;; esac
   [ -d "$root/gotmp" ] && [ -f "$state/$id.tasktmp-claim" ] \
     || fail "read-only startup mutated a live spawn's root or claim"
-  rm -rf -- "$lock"
+  # The same lock, now abandoned by a dead holder, is a remnant again.
+  kill "$SPAWN_LOCK_HOLDER_PID" 2>/dev/null || true
+  wait "$SPAWN_LOCK_HOLDER_PID" 2>/dev/null || true
+  [ -L "$lock" ] || fail "killing the holder removed the lock this case still needs"
   out=$(fm_tasktmp_startup "$state" read-only); rc=$?
-  [ "$rc" -ne 0 ] || fail "an unowned pending claim was not reported for locked reconciliation"
-  case "$out" in *"TASKTMP_RECONCILE: $id: pending task temporary claim"*) ;; *) fail "an unowned pending claim lost its actionable line: $out" ;; esac
+  [ "$rc" -ne 0 ] || fail "a claim whose spawn already died was not reported for locked reconciliation"
+  case "$out" in *"TASKTMP_RECONCILE: $id: pending task temporary claim"*) ;; *) fail "an abandoned pending claim lost its actionable line: $out" ;; esac
   [ -d "$root/gotmp" ] && [ -f "$state/$id.tasktmp-claim" ] \
-    || fail "read-only startup mutated an unowned root or claim"
+    || fail "read-only startup mutated an abandoned root or claim"
   fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
   rm -rf -- "$root"
-  pass "tasktmp startup: read-only reports a live spawn as an ordinary fact and only an unowned claim as actionable"
+  pass "tasktmp startup: a really-held spawn lock reports as an ordinary fact and an abandoned one stays actionable"
 }
 
 test_teardown_removes_tasktmp_dir
@@ -523,4 +582,5 @@ test_teardown_refuses_unsafe_tasktmp_without_touching_it
 test_unresolvable_trusted_parent_refuses_instead_of_allocating
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root
 test_crash_window_preserves_a_recorded_root_that_no_longer_validates
+test_crash_window_retires_a_claim_whose_recorded_root_already_vanished
 test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact

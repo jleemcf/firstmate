@@ -784,7 +784,7 @@ record_note() {
 }
 
 do_relaunch() {
-  local exit_result state note_line recorded_tasktmp tasktmp_rc
+  local exit_result state note_line recorded_tasktmp
   local -a spawn_args
 
   require_state_verified_backend relaunch
@@ -820,13 +820,9 @@ do_relaunch() {
   # will claim a new random root after the prior worker has stopped.
   recorded_tasktmp=$(fm_meta_get "$META" tasktmp)
   if [ -n "$recorded_tasktmp" ]; then
-    if fm_tasktmp_validate "$ID" "$recorded_tasktmp"; then
-      :
-    else
-      tasktmp_rc=$?
-      if [ "$tasktmp_rc" -ne 2 ]; then
-        die "relaunch refused unsafe task temporary root for $ID before its worker was stopped: $FM_TASKTMP_ERROR"
-      fi
+    fm_tasktmp_trust "$ID" "$recorded_tasktmp"
+    if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
+      die "relaunch refused unsafe task temporary root for $ID before its worker was stopped: $FM_TASKTMP_ERROR"
     fi
   fi
   safe_checkpoint

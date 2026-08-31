@@ -145,6 +145,10 @@
 #     bin/fm-tasktmp-lib.sh revalidates the recorded root and gotmp child before
 #     this scan and immediately before removal; an unsafe path is never scanned,
 #     traversed, changed, or deleted.
+#     That refusal is scoped to the temporary root alone: the path is preserved
+#     and reported on stderr and in the completion line, while the worktree,
+#     backlog close, busy state, endpoint, and state cleanup all still run, so
+#     one untrusted root can never strand a whole task.
 #     Idempotent: nothing left to find is a silent no-op.
 #   Fix 3 - sweep abandoned remote job workers. A remote job worker started
 #     from a worktree's own bin/ outlives that worktree's removal without
@@ -745,18 +749,20 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # treat it as task-owned.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_TMP_SCAN=$TASK_TMP
+TASK_TMP_REFUSED=
 if [ -n "$TASK_TMP" ]; then
-  if fm_tasktmp_validate "$ID" "$TASK_TMP"; then
-    :
-  else
-    TASK_TMP_VALIDATE_RC=$?
-    if [ "$TASK_TMP_VALIDATE_RC" -eq 2 ]; then
+  fm_tasktmp_trust "$ID" "$TASK_TMP"
+  case "$FM_TASKTMP_TRUST" in
+    unsafe)
+      TASK_TMP_REFUSED=$TASK_TMP
+      TASK_TMP=
       TASK_TMP_SCAN=
-    else
-      echo "REFUSED: unsafe task temporary root for $ID: $FM_TASKTMP_ERROR. Nothing under that path was scanned, changed, or removed." >&2
-      exit 1
-    fi
-  fi
+      echo "REFUSED: unsafe task temporary root for $ID: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds and the path is left for an operator." >&2
+      ;;
+    absent)
+      TASK_TMP_SCAN=
+      ;;
+  esac
 fi
 BUSY_GEN=$(fm_meta_get "$META" busy_gen)
 if [ -z "$BUSY_GEN" ]; then
@@ -2747,10 +2753,18 @@ fi
 if [ "$KIND" != secondmate ]; then
   conclude_task_no_mistakes_run "$WT"
   if [ -n "$TASK_TMP_SCAN" ]; then
-    if ! fm_tasktmp_validate "$ID" "$TASK_TMP_SCAN"; then
-      echo "REFUSED: task temporary root for $ID failed validation immediately before process scanning: $FM_TASKTMP_ERROR. Nothing under that path was scanned, changed, or removed." >&2
-      exit 1
-    fi
+    fm_tasktmp_trust "$ID" "$TASK_TMP_SCAN"
+    case "$FM_TASKTMP_TRUST" in
+      unsafe)
+        TASK_TMP_REFUSED=$TASK_TMP_SCAN
+        TASK_TMP=
+        TASK_TMP_SCAN=
+        echo "REFUSED: task temporary root for $ID stopped being trusted immediately before process scanning: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds." >&2
+        ;;
+      absent)
+        TASK_TMP_SCAN=
+        ;;
+    esac
   fi
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP_SCAN"
 fi
@@ -2898,9 +2912,15 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Revalidate immediately before removal.
 # The shared owner preserves absent and already-missing compatibility and
 # refuses every unsafe existing path without traversing or changing it.
-if ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
-  echo "REFUSED: task temporary root for $ID was preserved: $FM_TASKTMP_ERROR" >&2
-  exit 1
+if [ -n "$TASK_TMP" ]; then
+  fm_tasktmp_trust "$ID" "$TASK_TMP"
+  if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
+    TASK_TMP_REFUSED=$TASK_TMP
+    echo "REFUSED: task temporary root for $ID stopped being trusted immediately before removal: $FM_TASKTMP_ERROR. It was preserved untouched; the rest of this teardown proceeds." >&2
+  elif ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
+    echo "error: task temporary root for $ID could not be removed: $FM_TASKTMP_ERROR" >&2
+    exit 1
+  fi
 fi
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
@@ -2951,5 +2971,9 @@ fi
 if [ -d "$STATE" ]; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 fi
-echo "teardown $ID complete (window $T, worktree $WT)"
+if [ -n "$TASK_TMP_REFUSED" ]; then
+  echo "teardown $ID complete (window $T, worktree $WT); its untrusted task temporary root $TASK_TMP_REFUSED was preserved untouched for an operator"
+else
+  echo "teardown $ID complete (window $T, worktree $WT)"
+fi
 backlog_refresh_reminder
