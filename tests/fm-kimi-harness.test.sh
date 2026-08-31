@@ -4,6 +4,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-tasktmp-lib.sh
+. "$ROOT/bin/fm-tasktmp-lib.sh"
 
 # bin/fm-harness.sh checks verified ENV markers before ancestry. A suite run
 # from inside Cursor, Claude, Pi, or Grok inherits those markers, which outrank
@@ -15,14 +17,26 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 KIMI_HOOK="$ROOT/bin/fm-kimi-turnend-hook.sh"
 TMP_ROOT=$(fm_test_tmproot fm-kimi-harness)
-KIMI_RUNTIME_TASK_TMP=
+KIMI_RUNTIME_TASK_TMPS=()
 PYTHON_BIN=$(command -v python3) || fail "test needs python3"
 PYTHON_BIN_DIR=$(dirname "$PYTHON_BIN")
 JQ_BIN=$(command -v jq) || fail "test needs jq"
 BASE_PATH=${FM_TEST_BASE_PATH:-$PYTHON_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin}
 
+kimi_lstat_identity() {  # <path>
+  "$PYTHON_BIN" -c 'import os, sys; s = os.lstat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$1"
+}
+
+kimi_lstat_mode() {  # <path>
+  "$PYTHON_BIN" -c 'import os, stat, sys; print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))' "$1"
+}
+
 cleanup_kimi_harness() {
-  [ -z "$KIMI_RUNTIME_TASK_TMP" ] || rm -rf "$KIMI_RUNTIME_TASK_TMP"
+  local path
+  fm_test_cleanup_tasktmp_roots "$TMP_ROOT"
+  for path in "${KIMI_RUNTIME_TASK_TMPS[@]:-}"; do
+    [ -z "$path" ] || rm -rf -- "$path"
+  done
   rm -rf "$TMP_ROOT"
 }
 trap cleanup_kimi_harness EXIT
@@ -183,11 +197,20 @@ EOF
 }
 
 test_kimi_launch_then_send_is_verified() {
-  local id rec out rc launch pointer brief_real meta task_tmp
+  local id rec out rc launch pointer brief_real meta task_tmp hostile target
+  local hostile_inode hostile_mode hostile_link_inode
   id="kimi-success-z1-$$"
-  task_tmp="/tmp/fm-$id"
-  KIMI_RUNTIME_TASK_TMP=$task_tmp
-  rm -rf "$task_tmp"
+  hostile="/tmp/fm-$id"
+  target="$TMP_ROOT/hostile-target-$id"
+  rm -rf -- "$hostile" "$target"
+  mkdir -p "$target/gotmp"
+  chmod 0777 "$target" "$target/gotmp"
+  printf 'attacker sentinel\n' > "$target/gotmp/attacker-sentinel"
+  ln -s "$target" "$hostile"
+  hostile_inode=$(kimi_lstat_identity "$target")
+  hostile_mode=$(kimi_lstat_mode "$target")
+  hostile_link_inode=$(kimi_lstat_identity "$hostile")
+  KIMI_RUNTIME_TASK_TMPS+=("$hostile" "$target")
   rec=$(make_spawn_case success "$id")
   read_spawn_record "$rec"
   out=$(FM_FAKE_KIMI_SWALLOW_FIRST=yes run_spawn \
@@ -209,17 +232,46 @@ test_kimi_launch_then_send_is_verified() {
   [ "$pointer" = "Read the brief at $brief_real and follow it exactly." ] \
     || fail "kimi pointer was not the exact absolute-path-only instruction: $pointer"
   meta="$HOME_DIR/state/$id.meta"
+  task_tmp=$(grep '^tasktmp=' "$meta" | cut -d= -f2-)
+  KIMI_RUNTIME_TASK_TMPS+=("$task_tmp")
   assert_grep 'model=kimi-code/k3' "$meta" "kimi meta lost the requested model"
   assert_grep 'effort=high' "$meta" "kimi meta did not retain the unsupported effort axis"
+  [ -n "$task_tmp" ] && [ "$task_tmp" != "$hostile" ] \
+    || fail "kimi meta adopted the hostile predictable root"
+  case "$task_tmp" in
+    /tmp/fm-"$id".*|/private/tmp/fm-"$id".*) ;;
+    *) fail "kimi meta did not record the allowed random root form: $task_tmp" ;;
+  esac
+  fm_tasktmp_validate "$id" "$task_tmp" \
+    || fail "kimi task root or gotmp child failed shared trust validation: $FM_TASKTMP_ERROR"
   assert_grep "tasktmp=$task_tmp" "$meta" "kimi meta did not record its task temp root"
   assert_present "$task_tmp/gotmp" "kimi spawn did not create its Go temp directory"
   assert_grep "export GOTMPDIR=$task_tmp/gotmp" "$CASE_DIR/tmux-calls.log" \
     "kimi spawn did not export its Go temp directory into the pane"
+  assert_not_contains "$(cat "$CASE_DIR/tmux-calls.log")" "export GOTMPDIR=$hostile/gotmp" \
+    "kimi spawn exported the hostile predictable root"
+  assert_not_contains "$(cat "$CASE_DIR/tmux-calls.log")" "export PATH=" \
+    "main without the Chrome integration unexpectedly emitted a PATH launcher"
+  [ -L "$hostile" ] && [ "$(readlink "$hostile")" = "$target" ] \
+    || fail "kimi spawn changed the hostile legacy symlink"
+  [ "$(kimi_lstat_identity "$hostile")" = "$hostile_link_inode" ] \
+    || fail "kimi spawn replaced the hostile legacy symlink"
+  [ "$(kimi_lstat_identity "$target")" = "$hostile_inode" ] \
+    || fail "kimi spawn replaced the hostile target directory"
+  [ "$(kimi_lstat_mode "$target")" = "$hostile_mode" ] \
+    || fail "kimi spawn changed hostile target permissions"
+  assert_grep 'attacker sentinel' "$target/gotmp/attacker-sentinel" \
+    "kimi spawn changed the hostile sentinel"
   assert_grep 'BEGIN FIRSTMATE KIMI TURN-END HOOK' "$HOME_DIR/.kimi-code/config.toml" \
     "kimi spawn did not install its guarded global hook region"
   assert_grep 'token=' "$WT_DIR/.fm-kimi-turnend" "kimi spawn did not write its token pointer"
   assert_present "$HOME_DIR/state/$id.kimi-turnend-token" "kimi spawn did not record its token"
-  pass "fm-spawn: kimi launches, delivers its brief, and registers a guarded turn-end token"
+  # Mutation proof: replacing the allocator call in fm-spawn.sh with exactly
+  #   TASK_TMP="/tmp/fm-$ID"
+  #   mkdir -p "$TASK_TMP/gotmp"
+  # makes this case fail at the metadata and export assertions above while the
+  # hostile fixture remains the path the old implementation adopted.
+  pass "fm-spawn: hostile predictable root is untouched and a private random GOTMPDIR is exported"
 }
 
 test_kimi_hook_install_is_surgical_idempotent_and_removable() {

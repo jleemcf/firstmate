@@ -83,14 +83,33 @@ FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
   return 1
 }
 
+fm_test_cleanup_tasktmp_roots() {  # <fixture-root>
+  local fixture=$1 meta id task_tmp
+  [ -d "$fixture" ] || return 0
+  while IFS= read -r meta; do
+    id=${meta##*/}
+    id=${id%.meta}
+    task_tmp=$(awk -F= '$1 == "tasktmp" { value = substr($0, index($0, "=") + 1); found += 1 } END { if (found == 1) print value }' "$meta" 2>/dev/null || true)
+    [ -n "$task_tmp" ] || continue
+    bash -c '. "$1"; fm_tasktmp_remove "$2" "$3"' _ \
+      "$ROOT/bin/fm-tasktmp-lib.sh" "$id" "$task_tmp" 2>/dev/null || true
+  done < <(find "$fixture" -type f -name '*.meta' -print 2>/dev/null)
+}
+
 fm_test_cleanup() {
   local d
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
-    [ -n "$d" ] && rm -rf "$d"
+    if [ -n "$d" ]; then
+      fm_test_cleanup_tasktmp_roots "$d"
+      rm -rf "$d"
+    fi
   done
   if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
     while IFS= read -r d; do
-      [ -n "$d" ] && rm -rf "$d"
+      if [ -n "$d" ]; then
+        fm_test_cleanup_tasktmp_roots "$d"
+        rm -rf "$d"
+      fi
     done < "$FM_TEST_CLEANUP_REGISTRY"
     rm -f "$FM_TEST_CLEANUP_REGISTRY"
   fi

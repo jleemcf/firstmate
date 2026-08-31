@@ -2247,14 +2247,17 @@ test_leaked_worktree_process_is_reaped() {
 }
 
 test_leaked_tasktmp_process_is_reaped() {
-  local case_dir rc pid
+  local case_dir rc pid task_tmp
   case_dir=$(make_case leaked-tasktmp-reap)
+  task_tmp=/tmp/fm-task-x1.teardownnonce123
+  rm -rf "$task_tmp"
+  mkdir -p "$task_tmp/gotmp"
+  chmod 700 "$task_tmp" "$task_tmp/gotmp"
   write_meta "$case_dir" no-mistakes ship
-  printf '%s\n' "tasktmp=$case_dir/tasktmp" >> "$case_dir/state/task-x1.meta"
-  mkdir -p "$case_dir/tasktmp"
+  printf '%s\n' "tasktmp=$task_tmp" >> "$case_dir/state/task-x1.meta"
   land_shippable_commit "$case_dir"
 
-  ( cd "$case_dir/tasktmp" && exec sleep 300 ) &
+  ( cd "$task_tmp" && exec sleep 300 ) &
   pid=$!
   disown
   sleep 0.3

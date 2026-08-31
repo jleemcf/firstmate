@@ -39,6 +39,7 @@ TASK_TMPS=()
 
 relaunch_cleanup() {
   local d
+  fm_test_cleanup_tasktmp_roots "$TMP_ROOT"
   for d in "${TASK_TMPS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
@@ -143,6 +144,9 @@ add_ship_task() {
   fm_git_worktree "$proj" "$wt" "task-$id"
   mkdir -p "$home/data/$id"
   printf '# brief for %s\n\nDo the thing.\n' "$id" > "$home/data/$id/brief.md"
+  rm -rf "/tmp/fm-$id"
+  mkdir -p "/tmp/fm-$id/gotmp"
+  chmod 700 "/tmp/fm-$id" "/tmp/fm-$id/gotmp"
   {
     echo "window=fmses:fm-$id"
     echo "endpoint_task_id=$id"
@@ -283,9 +287,17 @@ SH
 # --- 1. same-harness relaunch -----------------------------------------------
 
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
-  local dir out rc gen_before gen_after
+  local dir out rc gen_before gen_after random_root
   dir=$(new_case same rl1)
   add_ship_task "$dir" rl1 claude
+  random_root=/tmp/fm-rl1.randomroot123
+  rm -rf "$random_root"
+  mkdir -p "$random_root/gotmp"
+  chmod 700 "$random_root" "$random_root/gotmp"
+  TASK_TMPS+=("$random_root")
+  awk -v root="$random_root" 'BEGIN { FS=OFS="=" } $1 == "tasktmp" { $0="tasktmp=" root } { print }' \
+    "$dir/home/state/rl1.meta" > "$dir/home/state/rl1.meta.tmp"
+  mv "$dir/home/state/rl1.meta.tmp" "$dir/home/state/rl1.meta"
   gen_before=$("$ROOT/bin/fm-busy-event.sh" arm "$dir/home/state" rl1)
   printf 'busy_gen=%s\n' "$gen_before" >> "$dir/home/state/rl1.meta"
   out=$(run_control "$dir" rl1 relaunch --note "stopped mid-refactor"); rc=$?
@@ -297,6 +309,10 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
     || fail "the worktree must be reused, not reallocated"
   [ "$(meta_field "$dir" rl1 kind)" = ship ] || fail "kind must survive the relaunch"
   [ "$(meta_field "$dir" rl1 project)" = "$dir/proj" ] || fail "project must survive the relaunch"
+  [ "$(meta_field "$dir" rl1 tasktmp)" = "$random_root" ] \
+    || fail "the exact recorded random task root must survive relaunch"
+  assert_grep "export GOTMPDIR=$random_root/gotmp" "$dir/fake/keys" \
+    "the replacement did not export the exact recorded random root"
   gen_after=$(meta_field "$dir" rl1 busy_gen)
   [ -n "$gen_after" ] && [ "$gen_after" != "$gen_before" ] \
     || fail "a relaunch must arm a fresh busy generation, got '$gen_after'"
@@ -891,6 +907,25 @@ test_cursor_session_binding_is_retired_on_a_harness_switch() {
 }
 
 # --- 3 and 4. refusals before the agent is touched ---------------------------
+
+test_unsafe_tasktmp_refuses_before_stopping_anything() {
+  local dir out rc before
+  dir=$(new_case unsafe-tasktmp rlunsafe)
+  add_ship_task "$dir" rlunsafe claude
+  chmod 0777 /tmp/fm-rlunsafe
+  before=$(git hash-object "$dir/home/state/rlunsafe.meta")
+  out=$(run_control "$dir" rlunsafe relaunch --note "must not stop"); rc=$?
+  [ "$rc" -ne 0 ] || fail "unsafe recorded task root should refuse relaunch"
+  assert_contains "$out" "before its worker was stopped" \
+    "unsafe task root refusal did not name the pre-stop guarantee"
+  [ "$(cat "$dir/fake/command")" = claude ] \
+    || fail "unsafe task root refusal stopped the prior worker"
+  assert_not_contains "$(cat "$dir/fake/literal")" "/exit" \
+    "unsafe task root refusal sent the prior worker an exit command"
+  [ "$(git hash-object "$dir/home/state/rlunsafe.meta")" = "$before" ] \
+    || fail "unsafe task root refusal changed metadata"
+  pass "fm-control relaunch: unsafe recorded root refuses before the prior worker is stopped"
+}
 
 test_missing_worktree_refuses_before_stopping_anything() {
   local dir out rc
@@ -1502,6 +1537,7 @@ test_spawn_relaunch_without_a_harness_reuses_the_recorded_one
 test_prefixed_prior_harness_wiring_is_still_retired
 test_muse_session_binding_is_retired_on_a_harness_switch
 test_cursor_session_binding_is_retired_on_a_harness_switch
+test_unsafe_tasktmp_refuses_before_stopping_anything
 test_missing_worktree_refuses_before_stopping_anything
 test_missing_instructions_refuse_before_stopping_anything
 test_checkpoint_refusal_leaves_the_record_byte_identical

@@ -203,6 +203,11 @@
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
 # success line and state/<id>.meta omit them.
+# Before any endpoint or launcher exists, every fresh spawn claim-then-creates a
+# random private task temporary root through bin/fm-tasktmp-lib.sh and records its
+# exact tasktmp= value.
+# Relaunch reuses an existing trusted recorded root and claims a new random root
+# only when that field or recognized directory is missing.
 # Every fresh spawn or relaunch records a new spawn_gen= incarnation token so durable
 # consumers can distinguish a replacement worker that reuses the same task id.
 # When the home session's frozen trace-context decision is enabled (see
@@ -303,6 +308,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-tasktmp-lib.sh
+. "$SCRIPT_DIR/fm-tasktmp-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -699,6 +706,7 @@ spawn_remote_secondmate() {
 }
 
 BACKEND=
+TASK_TMP=
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
@@ -838,14 +846,36 @@ spawn_abort_cleanup() {
       fi
     fi
   fi
-  if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
-    SPAWN_TASK_LOCK_HELD=0
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-  fi
   if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
     if ! spawn_fresh_commit_rollback; then
       status=1
     fi
+  fi
+  # Orca recovery metadata is intentionally durable even though ordinary
+  # fresh metadata has not reached the spawn commit point.
+  # Mark that exceptional transfer before generic claim reconciliation.
+  if [ -n "${ID:-}" ] \
+     && [ "$(fm_meta_get "$STATE/$ID.meta" cleanup_recovery 2>/dev/null || true)" = orca ] \
+     && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
+    if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID"; then
+      echo "warning: Orca recovery metadata for $ID could not commit its temporary-root claim: $FM_TASKTMP_ERROR" >&2
+      status=1
+    fi
+  fi
+  # Metadata rollback and Orca recovery publication above decide whether the
+  # claim still owns the root.
+  # Reconcile while the same per-task spawn lock is still held, so an aborted
+  # pre-publication spawn cannot leak an unowned root or race startup cleanup.
+  if [ -n "${ID:-}" ] \
+     && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
+    if ! fm_tasktmp_claim_reconcile_one "$STATE" "$ID"; then
+      echo "warning: pending task temporary root for $ID was preserved: $FM_TASKTMP_ERROR" >&2
+      status=1
+    fi
+  fi
+  if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
+    SPAWN_TASK_LOCK_HELD=0
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
   fi
   if [ "$SPAWN_META_LOCK_HELD" = 1 ]; then
     SPAWN_META_LOCK_HELD=0
@@ -2054,6 +2084,25 @@ if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
   exit 1
 fi
 
+# Allocate or adopt the task-owned temporary root before any endpoint,
+# launcher, task metadata, or cleanup path can use it.
+# Fresh and missing-root relaunch paths publish a durable private claim before
+# the random candidate is created under the public temporary parent.
+# Relaunch otherwise reuses the exact recorded trusted root, including a
+# grandfathered legacy root.
+if [ "$RELAUNCH" -eq 1 ]; then
+  RELAUNCH_RECORDED_TASK_TMP=$(fm_meta_get "$RELAUNCH_META" tasktmp)
+  if ! TASK_TMP=$(fm_tasktmp_recorded_prepare "$STATE" "$ID" "$RELAUNCH_RECORDED_TASK_TMP"); then
+    echo "error: relaunch refused unsafe task temporary root for $ID: $FM_TASKTMP_ERROR" >&2
+    exit 1
+  fi
+else
+  if ! TASK_TMP=$(fm_tasktmp_claim_create "$STATE" "$ID"); then
+    echo "error: task temporary root allocation for $ID failed safely: $FM_TASKTMP_ERROR" >&2
+    exit 1
+  fi
+fi
+
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   # Adopt the recorded endpoint instead of creating one. This is what keeps a
@@ -2473,13 +2522,10 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
 fi
 
-# Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
-# create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
-# Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
-# later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
-# targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-TASK_TMP="/tmp/fm-$ID"
-mkdir -p "$TASK_TMP/gotmp"
+# Go does not create GOTMPDIR itself.
+# The claimed and validated gotmp child was created before endpoint allocation;
+# this harness-independent export remains the targeted knob because TMPDIR would
+# affect every child program rather than only Go builds.
 
 # Per-harness turn-end hook where enabled: a file that touches
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
@@ -2931,6 +2977,16 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_REPLACEMENT_PENDING=0
   SPAWN_META_PUBLISH_STARTED=0
   SPAWN_META_TMP=
+  # A missing recorded root minted a claim for this relaunch.
+  # Replacement metadata is intentionally durable from this point even if
+  # launch confirmation later fails, so it can take ownership now.
+  if [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; then
+    if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID" \
+       || ! fm_tasktmp_claim_transfer "$STATE" "$ID" "$STATE/$ID.meta"; then
+      echo "error: replacement task record could not take ownership of its temporary root: $FM_TASKTMP_ERROR" >&2
+      exit 1
+    fi
+  fi
 fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so
@@ -3135,6 +3191,15 @@ fi
 trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
+fi
+if [ "$RELAUNCH" -eq 0 ] \
+   && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
+  if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID" \
+     || ! fm_tasktmp_claim_transfer "$STATE" "$ID" "$STATE/$ID.meta"; then
+    # The published task record still owns the exact root, so retaining the
+    # claim is safe and lets locked startup complete the transfer.
+    echo "warning: task $ID launched, but its temporary-root claim remains for locked startup reconciliation: $FM_TASKTMP_ERROR" >&2
+  fi
 fi
 fm_lock_release "$SPAWN_META_LOCK"
 SPAWN_META_LOCK_HELD=0

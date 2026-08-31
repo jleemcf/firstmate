@@ -141,7 +141,11 @@
 #     grace period to any survivor whose process identity still matches. Both
 #     roots are unique per task and never
 #     shared, so this can never reach another task's or the primary's
-#     processes. Idempotent: nothing left to find is a silent no-op.
+#     processes.
+#     bin/fm-tasktmp-lib.sh revalidates the recorded root and gotmp child before
+#     this scan and immediately before removal; an unsafe path is never scanned,
+#     traversed, changed, or deleted.
+#     Idempotent: nothing left to find is a silent no-op.
 #   Fix 3 - sweep abandoned remote job workers. A remote job worker started
 #     from a worktree's own bin/ outlives that worktree's removal without
 #     being reachable by Fix 2, because its working directory is wherever it
@@ -189,6 +193,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-tasktmp-lib.sh
+. "$SCRIPT_DIR/fm-tasktmp-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -732,9 +738,26 @@ if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
-# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
+# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root.
+# An absent field and a recognized root that is already missing remain
+# compatible no-ops.
+# Any existing unsafe path is refused before process scanning or cleanup can
+# treat it as task-owned.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
+TASK_TMP_SCAN=$TASK_TMP
+if [ -n "$TASK_TMP" ]; then
+  if fm_tasktmp_validate "$ID" "$TASK_TMP"; then
+    :
+  else
+    TASK_TMP_VALIDATE_RC=$?
+    if [ "$TASK_TMP_VALIDATE_RC" -eq 2 ]; then
+      TASK_TMP_SCAN=
+    else
+      echo "REFUSED: unsafe task temporary root for $ID: $FM_TASKTMP_ERROR. Nothing under that path was scanned, changed, or removed." >&2
+      exit 1
+    fi
+  fi
+fi
 BUSY_GEN=$(fm_meta_get "$META" busy_gen)
 if [ -z "$BUSY_GEN" ]; then
   BUSY_GEN=$(cat "$STATE/$ID.busy-gen" 2>/dev/null || true)
@@ -2723,7 +2746,13 @@ fi
 # not by task-worktree cleanup.
 if [ "$KIND" != secondmate ]; then
   conclude_task_no_mistakes_run "$WT"
-  reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
+  if [ -n "$TASK_TMP_SCAN" ]; then
+    if ! fm_tasktmp_validate "$ID" "$TASK_TMP_SCAN"; then
+      echo "REFUSED: task temporary root for $ID failed validation immediately before process scanning: $FM_TASKTMP_ERROR. Nothing under that path was scanned, changed, or removed." >&2
+      exit 1
+    fi
+  fi
+  reap_task_worktree_processes worktree "$WT" "$TASK_TMP_SCAN"
 fi
 
 # Fix 3 (see script header): sweep remote job workers abandoned by an already
@@ -2866,9 +2895,13 @@ fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
 remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
-# Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
-[ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+# Revalidate immediately before removal.
+# The shared owner preserves absent and already-missing compatibility and
+# refuses every unsafe existing path without traversing or changing it.
+if ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
+  echo "REFUSED: task temporary root for $ID was preserved: $FM_TASKTMP_ERROR" >&2
+  exit 1
+fi
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1

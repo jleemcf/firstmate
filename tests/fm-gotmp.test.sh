@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Behavior tests for per-task GOTMPDIR support (fm-gotmp).
 #
-# fm-spawn gives each task a temp root /tmp/fm-<id>/ with Go's build temp nested at
-# gotmp/, exports GOTMPDIR into the crewmate pane, and records tasktmp= in the task's
-# meta. fm-teardown reads tasktmp= and removes the whole root on cleanup.
+# fm-spawn gives each task a claimed unpredictable private root with Go's build
+# temp nested at gotmp/, exports that exact path as GOTMPDIR, and records it in
+# metadata.
+# fm-teardown validates the recorded root and child again before scanning or
+# removing either one.
 #
 # These tests exercise fm-teardown directly as a subprocess against a fake FM_HOME/FM_ROOT
 # built so the real script resolves into it, with stub helper scripts.
@@ -19,6 +21,11 @@ export FM_GATE_REFUSE_BYPASS=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+PYTHON_BIN=$(command -v python3) || { echo 'not ok - test needs python3' >&2; exit 1; }
+# shellcheck source=bin/fm-wake-lib.sh
+. "$ROOT/bin/fm-wake-lib.sh"
+# shellcheck source=bin/fm-tasktmp-lib.sh
+. "$ROOT/bin/fm-tasktmp-lib.sh"
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
@@ -27,6 +34,14 @@ fail() {
 
 pass() {
   printf 'ok - %s\n' "$1"
+}
+
+tasktmp_lstat_identity() {  # <path>
+  "$PYTHON_BIN" -c 'import os, sys; s = os.lstat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$1"
+}
+
+tasktmp_lstat_mode() {  # <path>
+  "$PYTHON_BIN" -c 'import os, stat, sys; print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))' "$1"
 }
 
 TMP_ROOT=
@@ -60,6 +75,7 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  ln -s "$ROOT/bin/fm-tasktmp-lib.sh" "$fake/bin/fm-tasktmp-lib.sh"
   # fm-lock-lib.sh: teardown sources it for the shared lock-staleness proof.
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
@@ -128,8 +144,10 @@ META
 
 test_teardown_removes_tasktmp_dir() {
   local id=td-rm-z2
-  local task_tmp="$TMP_ROOT/fm-$id"
+  local task_tmp="/tmp/fm-$id.trustednonce123"
+  rm -rf "$task_tmp"
   mkdir -p "$task_tmp/gotmp"
+  chmod 700 "$task_tmp" "$task_tmp/gotmp"
   printf 'leftover\n' > "$task_tmp/gotmp/build-artifact"
   local fake
   fake=$(make_fake_root "$id" "$task_tmp")
@@ -156,6 +174,7 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-cursor-lib.sh" "$fake/bin/fm-cursor-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-nm-run-lib.sh" "$fake/bin/fm-nm-run-lib.sh"
+  ln -s "$ROOT/bin/fm-tasktmp-lib.sh" "$fake/bin/fm-tasktmp-lib.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
@@ -214,7 +233,7 @@ META
 test_teardown_skips_gracefully_when_dir_missing() {
   # tasktmp= points to a path that does not exist. Teardown must not error.
   local id=td-missing-z4
-  local task_tmp="$TMP_ROOT/never-created-fm-$id"
+  local task_tmp="/tmp/fm-$id.missingnonce123"
   # Intentionally do NOT create $task_tmp.
   [ ! -e "$task_tmp" ] || fail "precondition: task_tmp should not exist yet"
   local fake
@@ -225,6 +244,189 @@ test_teardown_skips_gracefully_when_dir_missing() {
   pass "fm-teardown skips gracefully when tasktmp= points to a nonexistent dir"
 }
 
+test_two_allocations_differ_and_abort_cleanup_is_complete() {
+  local state="$TMP_ROOT/alloc-state" id=alloc-diff-z5 first second
+  mkdir -p "$state"
+  first=$(fm_tasktmp_claim_create "$state" "$id") \
+    || fail "first claimed allocation failed"
+  assert_private_root "$id" "$first"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" \
+    || fail "pre-publication failure cleanup did not reconcile the first root"
+  [ ! -e "$first" ] && [ ! -L "$first" ] \
+    || fail "pre-publication failure cleanup leaked the first root"
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "pre-publication failure cleanup leaked the claim"
+  second=$(fm_tasktmp_claim_create "$state" "$id") \
+    || fail "second claimed allocation failed"
+  [ "$first" != "$second" ] || fail "two complete allocations reused one root"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" \
+    || fail "second claimed root did not reconcile"
+  pass "tasktmp allocator: complete allocations differ and pre-publication cleanup removes root plus claim"
+}
+
+assert_private_root() {  # <id> <path>
+  local id=$1 path=$2
+  fm_tasktmp_validate "$id" "$path" \
+    || fail "claimed root failed shared validation: $FM_TASKTMP_ERROR"
+  fm_tasktmp_lstat "$path" || fail "claimed root cannot be inspected"
+  [ "$FM_TASKTMP_STAT_UID:$FM_TASKTMP_STAT_MODE" = "$(id -u):700" ] \
+    || fail "claimed root is not private and current-user-owned"
+  case "$FM_TASKTMP_STAT_TYPE" in directory|Directory) ;; *) fail "claimed root is not a real directory" ;; esac
+  fm_tasktmp_lstat "$path/gotmp" || fail "claimed gotmp cannot be inspected"
+  [ "$FM_TASKTMP_STAT_UID:$FM_TASKTMP_STAT_MODE" = "$(id -u):700" ] \
+    || fail "claimed gotmp is not private and current-user-owned"
+  case "$FM_TASKTMP_STAT_TYPE" in directory|Directory) ;; *) fail "claimed gotmp is not a real directory" ;; esac
+}
+
+test_startup_reconciles_only_when_locked() {
+  local home="$TMP_ROOT/startup-home" state id=startup-crash-z6 root out
+  state=$home/state
+  mkdir -p "$state" "$home/data" "$home/config" "$home/projects"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "startup fixture allocation failed"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in *"read-only startup left it untouched"*) ;; *) fail "read-only startup did not report the pending claim" ;; esac
+  [ -d "$root" ] && [ -f "$state/$id.tasktmp-claim" ] \
+    || fail "read-only startup mutated the pending root or claim"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1 \
+    || fail "locked startup did not complete claim reconciliation"
+  [ ! -e "$root" ] && [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "locked startup did not remove the abandoned root and claim"
+  pass "tasktmp startup: real read-only bootstrap reports without mutation and real locked bootstrap cleans a crash remnant"
+}
+
+test_startup_reports_unsafe_recorded_root_without_mutating_task() {
+  local home="$TMP_ROOT/startup-unsafe-home" state id=startup-unsafe-z10
+  local root target meta out inode mode
+  state=$home/state
+  root=/tmp/fm-$id
+  target=$home/hostile-target
+  meta=$state/$id.meta
+  rm -rf -- "$root" "$target"
+  mkdir -p "$state" "$home/data" "$home/config" "$home/projects" "$target/gotmp"
+  chmod 0777 "$target" "$target/gotmp"
+  printf 'startup sentinel\n' > "$target/gotmp/sentinel"
+  ln -s "$target" "$root"
+  printf 'window=fake\nkind=ship\ntasktmp=%s\n' "$root" > "$meta"
+  inode=$(tasktmp_lstat_identity "$root")
+  mode=$(tasktmp_lstat_mode "$target")
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in *"TASKTMP_RECONCILE: $id: unsafe recorded"*) ;; *) fail "startup did not report the unsafe live recorded root" ;; esac
+  [ -f "$meta" ] && [ -L "$root" ] \
+    || fail "startup audit changed the unsafe task or symlink"
+  [ "$(tasktmp_lstat_identity "$root")" = "$inode" ] && [ "$(tasktmp_lstat_mode "$target")" = "$mode" ] \
+    || fail "startup audit changed unsafe path identity or permissions"
+  grep -qx 'startup sentinel' "$target/gotmp/sentinel" \
+    || fail "startup audit changed the unsafe sentinel"
+  rm -f -- "$root"
+  pass "tasktmp startup: an unsafe recorded live root is reported and quarantined without mutation"
+}
+
+test_claim_transfers_to_metadata_without_removing_root() {
+  local state="$TMP_ROOT/transfer-state" id=transfer-z7 root
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "transfer fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
+  fm_tasktmp_claim_mark_committed "$state" "$id" \
+    || fail "transfer fixture could not record its commit point"
+  fm_tasktmp_startup "$state" locked >/dev/null \
+    || fail "locked startup did not transfer a matching claim"
+  [ -d "$root/gotmp" ] || fail "claim transfer deleted the metadata-owned live root"
+  [ ! -e "$state/$id.tasktmp-claim" ] || fail "claim transfer did not retire the claim"
+  fm_tasktmp_remove "$id" "$root" || fail "transferred root cleanup failed"
+  pass "tasktmp claim: matching published metadata takes ownership without deleting the live root"
+}
+
+test_entropy_failure_never_falls_back_to_predictable_root() {
+  local state="$TMP_ROOT/entropy-state" fakebin="$TMP_ROOT/entropy-bin" id=entropy-z11
+  local predictable=/tmp/fm-entropy-z11 out rc
+  mkdir -p "$state" "$fakebin"
+  rm -rf -- "$predictable"
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/mktemp"
+  out=$(PATH="$fakebin:$PATH" fm_tasktmp_claim_create "$state" "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "entropy failure unexpectedly allocated a root"
+  case "$out" in *"failed safely"*) ;; *"could not create a private random"*) ;; *) fail "entropy failure was not loud" ;; esac
+  [ ! -e "$predictable" ] && [ ! -L "$predictable" ] \
+    || fail "entropy failure fell back to the predictable legacy root"
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "entropy failure published a claim without a random candidate"
+  pass "tasktmp allocator: entropy failure refuses and never falls back to the predictable path"
+}
+
+test_collision_is_refused_without_entering_or_deleting_candidate() {
+  local state="$TMP_ROOT/collision-state" fakebin="$TMP_ROOT/collision-bin" id=collision-z8
+  local parent candidate inode mode out rc
+  mkdir -p "$state" "$fakebin"
+  parent=$(fm_tasktmp_parent) || fail "trusted temp parent unavailable"
+  candidate="$parent/fm-$id.collisionnonce"
+  rm -rf -- "$candidate"
+  mkdir -p "$candidate/gotmp"
+  chmod 0777 "$candidate" "$candidate/gotmp"
+  printf 'collision sentinel\n' > "$candidate/gotmp/sentinel"
+  inode=$(tasktmp_lstat_identity "$candidate")
+  mode=$(tasktmp_lstat_mode "$candidate")
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+path=${1%XXXXXXXXXXXX}collisionnonce
+(umask 077; : > "$path")
+printf '%s\n' "$path"
+SH
+  chmod +x "$fakebin/mktemp"
+  out=$(PATH="$fakebin:$PATH" FM_TASKTMP_CLAIM_ATTEMPTS=1 \
+    fm_tasktmp_claim_create "$state" "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "collision candidate was adopted"
+  case "$out" in *"collision-free"*) ;; *) fail "collision refusal was not loud" ;; esac
+  [ "$(tasktmp_lstat_identity "$candidate")" = "$inode" ] \
+    || fail "collision refusal replaced the candidate"
+  [ "$(tasktmp_lstat_mode "$candidate")" = "$mode" ] \
+    || fail "collision refusal changed candidate permissions"
+  grep -qx 'collision sentinel' "$candidate/gotmp/sentinel" \
+    || fail "collision refusal entered or changed the candidate"
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "collision refusal left a claim for a root it never created"
+  rm -rf -- "$candidate"
+  pass "tasktmp allocator: a collided candidate is never entered, changed, adopted, or deleted"
+}
+
+test_teardown_refuses_unsafe_tasktmp_without_touching_it() {
+  local id=td-unsafe-z9 task_tmp target fake out rc inode mode
+  task_tmp="/tmp/fm-$id"
+  target="$TMP_ROOT/unsafe-target"
+  rm -rf -- "$task_tmp" "$target"
+  mkdir -p "$target/gotmp"
+  chmod 0777 "$target" "$target/gotmp"
+  printf 'unsafe sentinel\n' > "$target/gotmp/sentinel"
+  ln -s "$target" "$task_tmp"
+  inode=$(tasktmp_lstat_identity "$target")
+  mode=$(tasktmp_lstat_mode "$target")
+  fake=$(make_fake_root "$id" "$task_tmp")
+  out=$(FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "teardown accepted a symlinked unsafe task root"
+  case "$out" in *"Nothing under that path was scanned, changed, or removed"*) ;; *) fail "unsafe teardown refusal did not state its no-touch result" ;; esac
+  [ -L "$task_tmp" ] && [ "$(readlink "$task_tmp")" = "$target" ] \
+    || fail "unsafe teardown refusal changed the symlink"
+  [ "$(tasktmp_lstat_identity "$target")" = "$inode" ] && [ "$(tasktmp_lstat_mode "$target")" = "$mode" ] \
+    || fail "unsafe teardown refusal changed the target"
+  grep -qx 'unsafe sentinel' "$target/gotmp/sentinel" \
+    || fail "unsafe teardown refusal changed the sentinel"
+  [ -f "$fake/state/$id.meta" ] || fail "unsafe teardown refusal removed task metadata"
+  rm -f -- "$task_tmp"
+  pass "fm-teardown refuses a symlinked unsafe root without scanning, changing, or deleting it"
+}
+
 test_teardown_removes_tasktmp_dir
 test_teardown_skips_gracefully_without_tasktmp
 test_teardown_skips_gracefully_when_dir_missing
+test_two_allocations_differ_and_abort_cleanup_is_complete
+test_startup_reconciles_only_when_locked
+test_startup_reports_unsafe_recorded_root_without_mutating_task
+test_claim_transfers_to_metadata_without_removing_root
+test_entropy_failure_never_falls_back_to_predictable_root
+test_collision_is_refused_without_entering_or_deleting_candidate
+test_teardown_refuses_unsafe_tasktmp_without_touching_it

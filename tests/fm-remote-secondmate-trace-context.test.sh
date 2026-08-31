@@ -33,7 +33,16 @@ TMUX_LOG="$TMP_ROOT/remote-tmux.log"
 TMUX_STATE="$TMP_ROOT/remote-tmux.state"
 CLAIMS="$TMP_ROOT/claims"
 mkdir -p "$PARENT/data" "$PARENT/state" "$PARENT/config" "$PARENT/projects" "$REMOTE_ROOT" "$CLAIMS"
-trap 'FM_HOME="$PARENT" FM_PROCEVENT_CLAIM_ROOT="$CLAIMS" "$ROOT/bin/fm-procevent.sh" sweep-home >/dev/null 2>&1 || true; if [ -f "$TMP_ROOT/remote-jobs/worker.pid" ]; then kill "$(cat "$TMP_ROOT/remote-jobs/worker.pid")" 2>/dev/null || true; fi; rm -rf -- "$TMP_ROOT"' EXIT
+remote_trace_cleanup() {
+  FM_HOME="$PARENT" FM_PROCEVENT_CLAIM_ROOT="$CLAIMS" \
+    "$ROOT/bin/fm-procevent.sh" sweep-home >/dev/null 2>&1 || true
+  if [ -f "$TMP_ROOT/remote-jobs/worker.pid" ]; then
+    kill "$(cat "$TMP_ROOT/remote-jobs/worker.pid")" 2>/dev/null || true
+  fi
+  fm_test_cleanup_tasktmp_roots "$TMP_ROOT"
+  rm -rf -- "$TMP_ROOT"
+}
+trap remote_trace_cleanup EXIT
 
 # The remote host's tracked code root is this branch, as a real git repository:
 # fm-on and the remote entrypoint both require the dispatched command to be
@@ -190,7 +199,9 @@ remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate >/dev/null 2>&1 \
   || fail "enabled remote secondmate spawn failed"
 
 PARENT_TP=$(meta_traceparent "$PARENT/state/ios.meta")
-REMOTE_TP=$(meta_traceparent "$REMOTE_HOME/state/parent-route/ios.meta")
+REMOTE_META="$REMOTE_HOME/state/parent-route/ios.meta"
+REMOTE_TP=$(meta_traceparent "$REMOTE_META")
+REMOTE_TASK_TMP=$(grep '^tasktmp=' "$REMOTE_META" | cut -d= -f2-)
 INJECTED_TP=$(remote_injected_traceparent)
 fm_trace_context_valid "$PARENT_TP" \
   || fail "an enabled remote spawn must record a valid carrier in the parent metadata (got '$PARENT_TP')"
@@ -204,6 +215,10 @@ fm_trace_context_valid "$INJECTED_TP" \
   || fail "an enabled remote spawn must deliver FM_TRACE_CONTEXT=on (got '$(remote_launch_snapshot)')"
 assert_present "$REMOTE_HOME/config/trace-context" \
   "an enabled remote launch did not inherit the enablement flag into the remote home"
+[ -n "$REMOTE_TASK_TMP" ] \
+  || fail "the remote Herdr task metadata omitted its temporary root"
+grep -q "export GOTMPDIR=$REMOTE_TASK_TMP/gotmp" "$HERDR_LOG" \
+  || fail "the remote Herdr pane did not export the exact root recorded in its metadata"
 GOTMP_LINE=$(grep -n 'export GOTMPDIR=' "$HERDR_LOG" | tail -1 | cut -d: -f1)
 TP_LINE=$(grep -n 'export TRACEPARENT=' "$HERDR_LOG" | tail -1 | cut -d: -f1)
 LAUNCH_LINE=$(grep -n 'FM_TRACE_CONTEXT=' "$HERDR_LOG" | tail -1 | cut -d: -f1)
