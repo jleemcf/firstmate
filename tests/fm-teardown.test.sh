@@ -2062,6 +2062,39 @@ EOF
   pass "a restore that gets the claim in and fails on the marker names only the copy that survived"
 }
 
+# The other side of that surviving copy: once an operator has restored the
+# marker by hand and a rerun finally removes the authoritative record, the copy
+# describes a record that no longer exists and must not outlive it in state/.
+test_stale_owner_marker_backup_is_swept_with_the_record() {
+  local case_dir stale rc
+  case_dir=$(make_case stale-marker-backup)
+  write_meta "$case_dir" no-mistakes ship
+  # Exactly what fm_worktree_marker_retire's mktemp leaves behind when an
+  # earlier run's restore put the claim back but could not put the marker back.
+  stale="$case_dir/state/.task-x1.meta.task-owner-backup.AbC123"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=task-x1'
+    printf '%s\n' 'spawn_gen=test-generation-task-x1'
+  } > "$stale"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "stale-marker-backup: teardown should complete"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "stale-marker-backup: the fixture never reached the record removal it is about"
+  assert_absent "$stale" \
+    "stale-marker-backup: the stale owner-marker copy outlived the record it described"
+  pass "a stale owner-marker copy is swept once the task record it described is gone"
+}
+
 # An interrupted relaunch leaves the marker one generation ahead of the record
 # it is compared against. That is the crash the marker was introduced for, and
 # the restamp publishes a handoff naming exactly that transition for exactly
@@ -3971,6 +4004,7 @@ test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
 test_failed_marker_restore_names_the_surviving_copy
+test_stale_owner_marker_backup_is_swept_with_the_record
 test_vanished_worktree_teardown_keeps_the_task_branch
 test_detached_reachable_head_keeps_the_unpushed_task_branch
 test_landed_task_branch_is_still_dropped

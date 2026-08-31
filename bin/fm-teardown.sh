@@ -2164,6 +2164,20 @@ teardown_safe_rm_firstmate_home_claimed() {  # <state> <task-id> <meta> <home> <
     safe_rm_rf "$home" "$label"
 }
 
+# A child's path is released either way, so an unrecorded retirement is a
+# warning over a completed release and not a failed one. Every other nonzero
+# code is the provider itself failing and stays fatal to the sweep.
+teardown_child_release_rc4_tolerant() {  # <warning> <provider-wrapper> [args...]
+  local warning=$1 rc=0
+  shift
+  "$@" || rc=$?
+  if [ "$rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+    echo "warning: $warning" >&2
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return 1
+}
+
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path marker_id conflict child_id child_home
   [ -n "$home" ] || return 0
@@ -2756,14 +2770,10 @@ cleanup_firstmate_home_children() {
           "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       fi
       if ! fm_worktree_retirement_receipt_present "$child_meta" >/dev/null 2>&1; then
-        child_return_rc=0
-        teardown_remove_orca_worktree_claimed \
-          "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || child_return_rc=$?
-        if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-          echo "warning: child $child_id's Orca worktree was removed, but its retirement could not be recorded" >&2
-        elif [ "$child_return_rc" -ne 0 ]; then
-          return 1
-        fi
+        teardown_child_release_rc4_tolerant \
+          "child $child_id's Orca worktree was removed, but its retirement could not be recorded" \
+          teardown_remove_orca_worktree_claimed \
+          "$sub_state" "$child_id" "$child_meta" "$child_orca_worktree_id" "$child_wt" || return 1
       fi
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -2782,25 +2792,17 @@ cleanup_firstmate_home_children() {
           if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
             echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
           else
-            child_return_rc=0
-            teardown_safe_rm_child_worktree_claimed \
-              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || child_return_rc=$?
-            if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-              echo "warning: child worktree $child_wt was removed, but its retirement could not be recorded" >&2
-            elif [ "$child_return_rc" -ne 0 ]; then
-              return 1
-            fi
+            teardown_child_release_rc4_tolerant \
+              "child worktree $child_wt was removed, but its retirement could not be recorded" \
+              teardown_safe_rm_child_worktree_claimed \
+              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
           fi
         fi
       else
-        child_return_rc=0
-        teardown_safe_rm_child_worktree_claimed \
-          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || child_return_rc=$?
-        if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-          echo "warning: child worktree $child_wt was removed, but its retirement could not be recorded" >&2
-        elif [ "$child_return_rc" -ne 0 ]; then
-          return 1
-        fi
+        teardown_child_release_rc4_tolerant \
+          "child worktree $child_wt was removed, but its retirement could not be recorded" \
+          teardown_safe_rm_child_worktree_claimed \
+          "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1

@@ -71,7 +71,9 @@
 # provider outcome is unknown: it never restores, and leaves whichever backup
 # actually survives as the recovery source every later refusal names.
 # fm_worktree_claim_retire_commit discards a retirement's leftovers once the
-# record it describes is gone.
+# record it describes is gone, and fm_worktree_retirement_receipt_clear sweeps
+# whatever an earlier interrupted run left beside that record, except the one
+# marker copy an unfinished retirement still names as its recovery source.
 #
 # fm_worktree_owner_pending_write/_read/_clear carry the durable half of the
 # owner-marker binding across the window in which a spawn holds a slot but has
@@ -312,14 +314,25 @@ fm_worktree_retirement_receipt_write() {  # <meta-file> <released-worktree>
   fi
 }
 
+# Called only once the authoritative task record is gone, so every copy bound to
+# it - the receipt, a superseded claim, quarantined released evidence, and the
+# owner marker's stash - has nothing left to describe. The one exception is a
+# marker copy an unfinished retirement still names as its recovery source: that
+# one is what a later refusal tells an operator to restore from, so it outlives
+# this sweep.
 fm_worktree_retirement_receipt_clear() {  # <meta-file>
   local meta=$1 receipt candidate dir base rc=0
   receipt=$(fm_worktree_retirement_receipt_path "$meta")
   rm -f -- "$receipt" || rc=1
   dir=${meta%/*}
   base=${meta##*/}
-  for candidate in "$dir/.${base}.worktree-claim-backup."* "$dir/.${base}.worktree-released."*; do
+  for candidate in "$dir/.${base}.worktree-claim-backup."* "$dir/.${base}.worktree-released."* \
+    "$dir/.${base}.task-owner-backup."*; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    if [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] \
+      && [ "$candidate" = "$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP" ]; then
+      continue
+    fi
     rm -f -- "$candidate" || rc=1
   done
   return "$rc"
