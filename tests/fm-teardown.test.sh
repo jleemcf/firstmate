@@ -1358,6 +1358,82 @@ EOF
   pass "a marker-era record whose owner marker is gone cannot act on a reissued unbranched slot"
 }
 
+# The same recycled slot, reached through a record that says two things about
+# its generation. Two spawn_gen= lines name no single incarnation, and only the
+# total absence of the key means "written before markers existed", so treating
+# an ambiguous generation as pre-marker would hand the legacy branch and
+# project-membership chain back the reissued slot the marker exists to protect.
+test_duplicate_spawn_gen_refuses_a_reissued_scout_slot() {
+  local case_dir canonical rc
+  case_dir=$(make_case duplicate-spawn-gen)
+  write_pre_marker_meta "$case_dir" no-mistakes ship \
+    "spawn_gen=test-generation-task-x1" "spawn_gen=test-generation-task-x1-again"
+  canonical=$(CDPATH='' cd -- "$case_dir/wt" && pwd -P)
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "duplicate-spawn-gen: the fixture stamped an owner marker the reissued slot would not have"
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  printf '%s\n' "scout live work" > "$case_dir/wt/scout-live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" clean -qfdx >/dev/null 2>&1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "duplicate-spawn-gen: a record naming two spawn generations must refuse"
+  assert_grep "names more than one spawn generation" "$case_dir/stderr" \
+    "duplicate-spawn-gen: the refusal did not name the ambiguous generation"
+  assert_grep "$canonical" "$case_dir/stderr" \
+    "duplicate-spawn-gen: the refusal did not name the canonical worktree"
+  assert_absent "$case_dir/treehouse.log" \
+    "duplicate-spawn-gen: the refusal still reached the destructive pool return"
+  [ "$(cat "$case_dir/wt/scout-live-work")" = "scout live work" ] \
+    || fail "duplicate-spawn-gen: the unbranched scout holding the reissued slot lost its work"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "duplicate-spawn-gen: the refusal removed the task record"
+  pass "a record that names two spawn generations cannot act on a reissued unbranched slot"
+}
+
+# A record that wrote spawn_gen= and left it empty is not a record from before
+# the key existed either: the spawn that wrote the key is the spawn that stamps
+# a marker, so an empty generation refuses on the same rule as a duplicated one.
+test_empty_spawn_gen_refuses_a_reissued_scout_slot() {
+  local case_dir rc
+  case_dir=$(make_case empty-spawn-gen)
+  write_pre_marker_meta "$case_dir" no-mistakes ship "spawn_gen="
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "empty-spawn-gen: the fixture stamped an owner marker the reissued slot would not have"
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  printf '%s\n' "scout live work" > "$case_dir/wt/scout-live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" clean -qfdx >/dev/null 2>&1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "empty-spawn-gen: a record naming an empty spawn generation must refuse"
+  assert_grep "names an empty spawn generation" "$case_dir/stderr" \
+    "empty-spawn-gen: the refusal did not name the empty generation"
+  assert_absent "$case_dir/treehouse.log" \
+    "empty-spawn-gen: the refusal still reached the destructive pool return"
+  [ "$(cat "$case_dir/wt/scout-live-work")" = "scout live work" ] \
+    || fail "empty-spawn-gen: the unbranched scout holding the reissued slot lost its work"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "empty-spawn-gen: the refusal removed the task record"
+  pass "a record that names an empty spawn generation cannot act on a reissued unbranched slot"
+}
+
 # The other half of that rule: a record written before .fm-task-owner existed
 # names no spawn generation at all, so nothing about it implies a marker was
 # ever stamped and the legacy chain stays its proof. An unbranched checkout that
@@ -3880,6 +3956,8 @@ test_unbranched_worktree_marked_for_another_task_refuses
 test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
 test_same_task_id_with_a_different_marker_generation_refuses
 test_marker_era_record_with_no_marker_refuses_a_reissued_scout_slot
+test_duplicate_spawn_gen_refuses_a_reissued_scout_slot
+test_empty_spawn_gen_refuses_a_reissued_scout_slot
 test_pre_marker_record_keeps_the_legacy_project_fallback
 test_retirement_receipt_survives_a_failed_record_removal
 test_owner_marker_carries_a_foreign_branch_checkout

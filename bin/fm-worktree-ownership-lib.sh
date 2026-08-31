@@ -17,10 +17,12 @@
 # marker, so an absent marker on a live path is not a missing proof but the
 # signature of a slot that left this task, and it refuses by name unless the
 # provider's own id-to-path binding already spoke for that path independently.
-# Only a genuinely pre-marker record - one that names no spawn generation at all
-# - keeps the legacy chain: refs/heads/fm/<task-id> proves ownership, another
-# fm/<id> branch refuses, and an unattributed checkout falls back to membership
-# in the task's recorded project.
+# Only a genuinely pre-marker record - one that carries no spawn generation line
+# at all - keeps the legacy chain: refs/heads/fm/<task-id> proves ownership,
+# another fm/<id> branch refuses, and an unattributed checkout falls back to
+# membership in the task's recorded project. A duplicated, empty, or unreadable
+# generation is not that record; it named a generation and then said nothing
+# usable about it, so it refuses by name instead of reopening those fallbacks.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -117,11 +119,13 @@ fm_worktree_meta_exact_value() {  # <meta-file> <key>
   printf '%s' "$value"
 }
 
-# 0 and prints the single value, 2 when the key is absent or empty, 3 when
-# duplicate lines make it ambiguous, and 1 when the file itself could not be
-# read. Ambiguity is deliberately not collapsed into "missing": a record that
-# says two things about ownership says nothing safe, and a caller that cannot
-# tell the two apart ends up acting on a difference it never established.
+# 0 and prints the single value, 2 when the key is absent, 4 when the one line
+# that carries it is empty, 3 when duplicate lines make it ambiguous, and 1 when
+# the file itself could not be read. Neither ambiguity nor emptiness is
+# collapsed into "absent": a record that says two things about ownership says
+# nothing safe, a record that wrote the key and then said nothing is not a
+# record from before the key existed, and a caller that cannot tell those apart
+# ends up acting on a difference it never established.
 fm_worktree_meta_probe() {  # <meta-file> <key>
   local meta=$1 key=$2 count value
   [ -f "$meta" ] && [ ! -L "$meta" ] && [ -r "$meta" ] || return 1
@@ -133,7 +137,7 @@ fm_worktree_meta_probe() {  # <meta-file> <key>
     *) return 3 ;;
   esac
   value=$(grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-)
-  [ -n "$value" ] || return 2
+  [ -n "$value" ] || return 4
   printf '%s' "$value"
 }
 
@@ -717,7 +721,7 @@ fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spa
 fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   local state=$1 id=$2 meta=$3 worktree canonical kind backend project spawn_gen
   local marker worktree_id resolved resolved_canonical provider_proof='' rc=0 claim_rc=0 present=0
-  local backup evidence marker_rc=0
+  local backup evidence marker_rc=0 gen_rc=0 gen_unusable=''
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
   FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
@@ -737,7 +741,19 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   backend=$(fm_worktree_meta_exact_value "$meta" backend 2>/dev/null || true)
   [ -n "$backend" ] || backend=tmux
   project=$(fm_worktree_meta_exact_value "$meta" project 2>/dev/null || true)
-  spawn_gen=$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)
+  # Only the total absence of the key is pre-marker legacy. A duplicated, empty,
+  # or unreadable generation is a record that named one and then said something
+  # unusable about it, and inferring "written before markers existed" from that
+  # is exactly the classification that reopens the branch/project fallback the
+  # marker was introduced to close.
+  spawn_gen=$(fm_worktree_meta_probe "$meta" spawn_gen) || gen_rc=$?
+  case "$gen_rc" in
+    0) ;;
+    2) spawn_gen='' ;;
+    3) spawn_gen=''; gen_unusable='names more than one spawn generation' ;;
+    4) spawn_gen=''; gen_unusable='names an empty spawn generation' ;;
+    *) spawn_gen=''; gen_unusable='could not be read for a spawn generation' ;;
+  esac
 
   worktree=$(fm_worktree_meta_claim "$meta" worktree) || claim_rc=$?
   if [ "$claim_rc" -eq 1 ]; then
@@ -824,6 +840,10 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     fi
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
+    if [ -n "$gen_unusable" ] && [ -z "$provider_proof" ]; then
+      fm_worktree_refuse "task $id's record $meta $gen_unusable, so nothing establishes whether worktree $canonical was ever stamped for this task; an unusable generation is never read as a pre-marker record."
+      return 1
+    fi
     marker_rc=0
     fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" "$state" || marker_rc=$?
     [ "$marker_rc" -ne 1 ] || return 1
