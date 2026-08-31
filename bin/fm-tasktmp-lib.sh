@@ -37,11 +37,16 @@ fm_tasktmp_error() {  # <message>
 
 fm_tasktmp_parent() {
   local parent
-  parent=$(CDPATH='' cd -- /tmp 2>/dev/null && pwd -P) \
-    || fm_tasktmp_error "trusted temporary parent /tmp cannot be resolved"
+  parent=$(CDPATH='' cd -- /tmp 2>/dev/null && pwd -P) || {
+    fm_tasktmp_error "trusted temporary parent /tmp cannot be resolved"
+    return 1
+  }
   case "$parent" in
     /*) ;;
-    *) fm_tasktmp_error "trusted temporary parent resolved to a non-absolute path" ;;
+    *)
+      fm_tasktmp_error "trusted temporary parent resolved to a non-absolute path"
+      return 1
+      ;;
   esac
   printf '%s\n' "$parent"
 }
@@ -342,8 +347,13 @@ fm_tasktmp_claim_reconcile_one() {  # <state> <task-id>
   fi
   if [ -f "$meta" ] && [ ! -L "$meta" ] \
      && [ "$(fm_tasktmp_meta_tasktmp "$meta" 2>/dev/null || true)" = "$FM_TASKTMP_CLAIM_PATH" ]; then
-    if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ]; then
-      fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point; the root and claim were preserved"
+    # Durable metadata naming the identical root is the completed transfer, even
+    # when a crash lost the commit point, but only while that exact root still
+    # passes validation.
+    # Any other spelling, or a root that no longer validates, stays preserved.
+    if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ] \
+       && ! fm_tasktmp_validate "$id" "$FM_TASKTMP_CLAIM_PATH"; then
+      fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point and $FM_TASKTMP_CLAIM_PATH no longer validates: $FM_TASKTMP_ERROR; the root and claim were preserved"
       return 1
     fi
     fm_tasktmp_claim_retire "$state" "$id"
@@ -354,7 +364,7 @@ fm_tasktmp_claim_reconcile_one() {  # <state> <task-id>
 }
 
 fm_tasktmp_claim_create() {  # <state> <task-id>
-  local state=$1 id=$2 parent stable temp nonce candidate attempt max rc
+  local state=$1 id=$2 parent stable temp nonce candidate attempt max created
   parent=$(fm_tasktmp_parent) || return 1
   stable=$(fm_tasktmp_claim_path "$state" "$id")
   max=${FM_TASKTMP_CLAIM_ATTEMPTS:-8}
@@ -375,19 +385,17 @@ fm_tasktmp_claim_create() {  # <state> <task-id>
         ;;
     esac
     candidate=$parent/fm-$id.$nonce
-    if ! {
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ) || created=
+    # One subshell so the private umask cannot outlive this publication, and one
+    # && chain so a short write, a failed chmod, or a failed rename never
+    # publishes a partial claim at the stable path.
+    if [ -z "$created" ] || ! (
       umask 077
-      {
-        printf 'version=1\n'
-        printf 'id=%s\n' "$id"
-        printf 'nonce=%s\n' "$nonce"
-        printf 'path=%s\n' "$candidate"
-        printf 'phase=pending\n'
-        printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      } > "$temp"
-      chmod 600 -- "$temp"
-      mv -- "$temp" "$stable"
-    }; then
+      printf 'version=1\nid=%s\nnonce=%s\npath=%s\nphase=pending\ncreated=%s\n' \
+        "$id" "$nonce" "$candidate" "$created" > "$temp" \
+        && chmod 600 -- "$temp" \
+        && mv -- "$temp" "$stable"
+    ); then
       rm -f -- "$temp"
       fm_tasktmp_error "could not publish the private task temporary claim for $id"
       return 1
@@ -431,6 +439,18 @@ fm_tasktmp_audit_meta() {  # <meta>
   return 1
 }
 
+# Read-only liveness answer for the same per-task spawn lock the locked branch
+# takes, without creating, stealing, or removing anything.
+# Self-contained on purpose: a read-only startup must not have to load the wake
+# queue's lock machinery to tell an ordinary in-flight spawn from a remnant.
+fm_tasktmp_spawn_lock_live() {  # <state> <task-id>
+  local lock=$1/.spawn-$2.lock pid
+  [ -e "$lock" ] || [ -L "$lock" ] || return 1
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
 fm_tasktmp_startup() {  # <state> <locked|read-only>
   local state=$1 mode=$2 claim id lock meta rc result=0
   [ -d "$state" ] || return 0
@@ -446,6 +466,12 @@ fm_tasktmp_startup() {  # <state> <locked|read-only>
     esac
     if [ "$mode" = read-only ]; then
       if fm_tasktmp_claim_read "$state" "$id"; then
+        if fm_tasktmp_spawn_lock_live "$state" "$id"; then
+          # An ordinary in-flight spawn owns its own claim, so this is a fact
+          # about live work rather than a remnant anyone must reconcile.
+          printf 'BOOTSTRAP_INFO: %s: pending task temporary claim for %s is still owned by an active spawn; read-only startup left it untouched\n' "$id" "$FM_TASKTMP_CLAIM_PATH"
+          continue
+        fi
         printf 'TASKTMP_RECONCILE: %s: pending task temporary claim for %s requires locked reconciliation; read-only startup left it untouched\n' "$id" "$FM_TASKTMP_CLAIM_PATH"
       else
         printf 'TASKTMP_RECONCILE: %s: unsafe pending task temporary claim refused: %s; read-only startup left it untouched\n' "$id" "$FM_TASKTMP_ERROR"

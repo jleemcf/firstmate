@@ -44,6 +44,11 @@ tasktmp_lstat_mode() {  # <path>
   "$PYTHON_BIN" -c 'import os, stat, sys; print(format(stat.S_IMODE(os.lstat(sys.argv[1]).st_mode), "o"))' "$1"
 }
 
+# Fixture roots under the shared temporary parent carry a per-process nonce, and
+# every fixture whose spelling must be the predictable legacy form carries it in
+# the task id instead, so concurrent runs never collide on one /tmp name.
+GOTMP_TMP_NONCE="gt$$gotmpfixture"
+
 TMP_ROOT=
 
 cleanup() {
@@ -143,8 +148,8 @@ META
 # --- fm-teardown side (real subprocess) ---
 
 test_teardown_removes_tasktmp_dir() {
-  local id=td-rm-z2
-  local task_tmp="/tmp/fm-$id.trustednonce123"
+  local id="td-rm-z2-$$"
+  local task_tmp="/tmp/fm-$id.$GOTMP_TMP_NONCE"
   rm -rf "$task_tmp"
   mkdir -p "$task_tmp/gotmp"
   chmod 700 "$task_tmp" "$task_tmp/gotmp"
@@ -232,8 +237,8 @@ META
 
 test_teardown_skips_gracefully_when_dir_missing() {
   # tasktmp= points to a path that does not exist. Teardown must not error.
-  local id=td-missing-z4
-  local task_tmp="/tmp/fm-$id.missingnonce123"
+  local id="td-missing-z4-$$"
+  local task_tmp="/tmp/fm-$id.$GOTMP_TMP_NONCE"
   # Intentionally do NOT create $task_tmp.
   [ ! -e "$task_tmp" ] || fail "precondition: task_tmp should not exist yet"
   local fake
@@ -245,7 +250,7 @@ test_teardown_skips_gracefully_when_dir_missing() {
 }
 
 test_two_allocations_differ_and_abort_cleanup_is_complete() {
-  local state="$TMP_ROOT/alloc-state" id=alloc-diff-z5 first second
+  local state="$TMP_ROOT/alloc-state" id="alloc-diff-z5-$$" first second
   mkdir -p "$state"
   first=$(fm_tasktmp_claim_create "$state" "$id") \
     || fail "first claimed allocation failed"
@@ -279,7 +284,7 @@ assert_private_root() {  # <id> <path>
 }
 
 test_startup_reconciles_only_when_locked() {
-  local home="$TMP_ROOT/startup-home" state id=startup-crash-z6 root out
+  local home="$TMP_ROOT/startup-home" state id="startup-crash-z6-$$" root out
   state=$home/state
   mkdir -p "$state" "$home/data" "$home/config" "$home/projects"
   root=$(fm_tasktmp_claim_create "$state" "$id") || fail "startup fixture allocation failed"
@@ -297,7 +302,7 @@ test_startup_reconciles_only_when_locked() {
 }
 
 test_startup_reports_unsafe_recorded_root_without_mutating_task() {
-  local home="$TMP_ROOT/startup-unsafe-home" state id=startup-unsafe-z10
+  local home="$TMP_ROOT/startup-unsafe-home" state id="startup-unsafe-z10-$$"
   local root target meta out inode mode
   state=$home/state
   root=/tmp/fm-$id
@@ -325,7 +330,7 @@ test_startup_reports_unsafe_recorded_root_without_mutating_task() {
 }
 
 test_claim_transfers_to_metadata_without_removing_root() {
-  local state="$TMP_ROOT/transfer-state" id=transfer-z7 root
+  local state="$TMP_ROOT/transfer-state" id="transfer-z7-$$" root
   mkdir -p "$state"
   root=$(fm_tasktmp_claim_create "$state" "$id") || fail "transfer fixture allocation failed"
   printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
@@ -340,8 +345,9 @@ test_claim_transfers_to_metadata_without_removing_root() {
 }
 
 test_entropy_failure_never_falls_back_to_predictable_root() {
-  local state="$TMP_ROOT/entropy-state" fakebin="$TMP_ROOT/entropy-bin" id=entropy-z11
-  local predictable=/tmp/fm-entropy-z11 out rc
+  local state="$TMP_ROOT/entropy-state" fakebin="$TMP_ROOT/entropy-bin" out rc
+  local id="entropy-z11-$$"
+  local predictable="/tmp/fm-$id"
   mkdir -p "$state" "$fakebin"
   rm -rf -- "$predictable"
   cat > "$fakebin/mktemp" <<'SH'
@@ -360,22 +366,22 @@ SH
 }
 
 test_collision_is_refused_without_entering_or_deleting_candidate() {
-  local state="$TMP_ROOT/collision-state" fakebin="$TMP_ROOT/collision-bin" id=collision-z8
+  local state="$TMP_ROOT/collision-state" fakebin="$TMP_ROOT/collision-bin" id="collision-z8-$$"
   local parent candidate inode mode out rc
   mkdir -p "$state" "$fakebin"
   parent=$(fm_tasktmp_parent) || fail "trusted temp parent unavailable"
-  candidate="$parent/fm-$id.collisionnonce"
+  candidate="$parent/fm-$id.$GOTMP_TMP_NONCE"
   rm -rf -- "$candidate"
   mkdir -p "$candidate/gotmp"
   chmod 0777 "$candidate" "$candidate/gotmp"
   printf 'collision sentinel\n' > "$candidate/gotmp/sentinel"
   inode=$(tasktmp_lstat_identity "$candidate")
   mode=$(tasktmp_lstat_mode "$candidate")
-  cat > "$fakebin/mktemp" <<'SH'
+  cat > "$fakebin/mktemp" <<SH
 #!/usr/bin/env bash
-path=${1%XXXXXXXXXXXX}collisionnonce
-(umask 077; : > "$path")
-printf '%s\n' "$path"
+path=\${1%XXXXXXXXXXXX}$GOTMP_TMP_NONCE
+(umask 077; : > "\$path")
+printf '%s\\n' "\$path"
 SH
   chmod +x "$fakebin/mktemp"
   out=$(PATH="$fakebin:$PATH" FM_TASKTMP_CLAIM_ATTEMPTS=1 \
@@ -395,7 +401,7 @@ SH
 }
 
 test_teardown_refuses_unsafe_tasktmp_without_touching_it() {
-  local id=td-unsafe-z9 task_tmp target fake out rc inode mode
+  local id="td-unsafe-z9-$$" task_tmp target fake out rc inode mode
   task_tmp="/tmp/fm-$id"
   target="$TMP_ROOT/unsafe-target"
   rm -rf -- "$task_tmp" "$target"
@@ -420,6 +426,90 @@ test_teardown_refuses_unsafe_tasktmp_without_touching_it() {
   pass "fm-teardown refuses a symlinked unsafe root without scanning, changing, or deleting it"
 }
 
+test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
+  local state="$TMP_ROOT/parent-state" id="parent-refuse-z12-$$" out rc
+  mkdir -p "$state"
+  # An overriding cd makes the trusted temporary parent unresolvable, which is
+  # the one trust check that must never fall through to an empty parent.
+  # shellcheck disable=SC2329 # Invoked indirectly: it overrides the cd builtin.
+  out=$( cd() { return 1; }; fm_tasktmp_claim_create "$state" "$id" 2>&1 ); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unresolvable trusted temporary parent still allocated a root"
+  case "$out" in
+    *"trusted temporary parent"*) ;;
+    *) fail "an unresolvable trusted temporary parent did not refuse loudly: $out" ;;
+  esac
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "a refused allocation published a claim anyway"
+  pass "tasktmp allocator: an unresolvable trusted temporary parent refuses loudly instead of allocating"
+}
+
+test_crash_before_the_commit_point_transfers_an_identical_recorded_root() {
+  local state="$TMP_ROOT/crashwindow-state" id="crash-window-z13-$$" root second
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "crash-window fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
+  # No mark-committed: this is the SIGKILL window between metadata publication
+  # and the spawn's commit point.
+  fm_tasktmp_startup "$state" locked >/dev/null \
+    || fail "locked startup did not retire a claim its metadata already owns"
+  [ -d "$root/gotmp" ] || fail "the completed transfer deleted the metadata-owned live root"
+  [ ! -e "$state/$id.tasktmp-claim" ] \
+    || fail "the crash window left the task id permanently unspawnable"
+  second=$(fm_tasktmp_claim_create "$state" "$id") \
+    || fail "the task id could not allocate again after the crash window"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
+  rm -rf -- "$second"
+  fm_tasktmp_remove "$id" "$root" || fail "transferred crash-window root cleanup failed"
+  pass "tasktmp claim: a crash before the commit point is retired as a completed transfer, not a permanent wedge"
+}
+
+test_crash_window_preserves_a_recorded_root_that_no_longer_validates() {
+  local state="$TMP_ROOT/crashunsafe-state" id="crash-unsafe-z14-$$" root out rc
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "crash-window fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
+  chmod 0777 "$root"
+  out=$(fm_tasktmp_startup "$state" locked); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unsafe claimed root was retired as a completed transfer"
+  case "$out" in
+    *"TASKTMP_RECONCILE: $id: pending task temporary claim was preserved"*) ;;
+    *) fail "the preserved claim was not reported: $out" ;;
+  esac
+  [ -f "$state/$id.tasktmp-claim" ] || fail "an unsafe claimed root retired its claim"
+  [ -d "$root/gotmp" ] || fail "an unsafe claimed root was removed"
+  chmod 700 "$root"
+  rm -rf -- "$root"
+  pass "tasktmp claim: identical metadata never retires a claimed root that stopped validating"
+}
+
+test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact() {
+  local state="$TMP_ROOT/readonly-live-state" id="readonly-live-z15-$$" root lock pid out rc
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "read-only fixture allocation failed"
+  lock=$state/.spawn-$id.lock
+  sleep 300 &
+  pid=$!
+  mkdir -p "$lock"
+  printf '%s\n' "$pid" > "$lock/pid"
+  out=$(fm_tasktmp_startup "$state" read-only); rc=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "an in-flight spawn made read-only startup report an unreconciled remnant"
+  case "$out" in *"BOOTSTRAP_INFO: $id: pending task temporary claim"*) ;; *) fail "a live spawn's claim was not reported as an ordinary fact: $out" ;; esac
+  case "$out" in *TASKTMP_RECONCILE*) fail "an ordinary in-flight spawn raised an actionable reconcile diagnostic" ;; esac
+  [ -d "$root/gotmp" ] && [ -f "$state/$id.tasktmp-claim" ] \
+    || fail "read-only startup mutated a live spawn's root or claim"
+  rm -rf -- "$lock"
+  out=$(fm_tasktmp_startup "$state" read-only); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unowned pending claim was not reported for locked reconciliation"
+  case "$out" in *"TASKTMP_RECONCILE: $id: pending task temporary claim"*) ;; *) fail "an unowned pending claim lost its actionable line: $out" ;; esac
+  [ -d "$root/gotmp" ] && [ -f "$state/$id.tasktmp-claim" ] \
+    || fail "read-only startup mutated an unowned root or claim"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
+  rm -rf -- "$root"
+  pass "tasktmp startup: read-only reports a live spawn as an ordinary fact and only an unowned claim as actionable"
+}
+
 test_teardown_removes_tasktmp_dir
 test_teardown_skips_gracefully_without_tasktmp
 test_teardown_skips_gracefully_when_dir_missing
@@ -430,3 +520,7 @@ test_claim_transfers_to_metadata_without_removing_root
 test_entropy_failure_never_falls_back_to_predictable_root
 test_collision_is_refused_without_entering_or_deleting_candidate
 test_teardown_refuses_unsafe_tasktmp_without_touching_it
+test_unresolvable_trusted_parent_refuses_instead_of_allocating
+test_crash_before_the_commit_point_transfers_an_identical_recorded_root
+test_crash_window_preserves_a_recorded_root_that_no_longer_validates
+test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact

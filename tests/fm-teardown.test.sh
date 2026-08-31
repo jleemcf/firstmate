@@ -2249,7 +2249,7 @@ test_leaked_worktree_process_is_reaped() {
 test_leaked_tasktmp_process_is_reaped() {
   local case_dir rc pid task_tmp
   case_dir=$(make_case leaked-tasktmp-reap)
-  task_tmp=/tmp/fm-task-x1.teardownnonce123
+  task_tmp="/tmp/fm-task-x1.td$$teardownfixture"
   rm -rf "$task_tmp"
   mkdir -p "$task_tmp/gotmp"
   chmod 700 "$task_tmp" "$task_tmp/gotmp"

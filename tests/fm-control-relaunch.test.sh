@@ -36,6 +36,10 @@ TMP_ROOT=$(fm_test_tmproot fm-control-relaunch)
 mkdir -p "$TMP_ROOT"
 TMP_ROOT=$(cd "$TMP_ROOT" && pwd)
 TASK_TMPS=()
+# Every fixture root this file creates carries a per-process nonce, so two
+# concurrent suite runs - or a host where another user already owns a
+# predictable /tmp name - never collide on one shared path.
+RL_TMP_NONCE="rl$$rlfixture"
 
 relaunch_cleanup() {
   local d
@@ -144,9 +148,10 @@ add_ship_task() {
   fm_git_worktree "$proj" "$wt" "task-$id"
   mkdir -p "$home/data/$id"
   printf '# brief for %s\n\nDo the thing.\n' "$id" > "$home/data/$id/brief.md"
-  rm -rf "/tmp/fm-$id"
-  mkdir -p "/tmp/fm-$id/gotmp"
-  chmod 700 "/tmp/fm-$id" "/tmp/fm-$id/gotmp"
+  local task_tmp="/tmp/fm-$id.$RL_TMP_NONCE"
+  rm -rf -- "$task_tmp"
+  mkdir -p "$task_tmp/gotmp"
+  chmod 700 "$task_tmp" "$task_tmp/gotmp"
   {
     echo "window=fmses:fm-$id"
     echo "endpoint_task_id=$id"
@@ -156,13 +161,13 @@ add_ship_task() {
     echo "kind=ship"
     echo "mode=no-mistakes"
     echo "yolo=off"
-    echo "tasktmp=/tmp/fm-$id"
+    echo "tasktmp=$task_tmp"
     echo "model=default"
     echo "effort=default"
   } > "$home/state/$id.meta"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$wt" > "$dir/fake/cwd"
-  TASK_TMPS+=("/tmp/fm-$id")
+  TASK_TMPS+=("$task_tmp")
 }
 
 run_control() {  # <case-dir> <args...>
@@ -290,7 +295,7 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
   local dir out rc gen_before gen_after random_root
   dir=$(new_case same rl1)
   add_ship_task "$dir" rl1 claude
-  random_root=/tmp/fm-rl1.randomroot123
+  random_root=/tmp/fm-rl1.random$RL_TMP_NONCE
   rm -rf "$random_root"
   mkdir -p "$random_root/gotmp"
   chmod 700 "$random_root" "$random_root/gotmp"
@@ -321,6 +326,31 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
   assert_grep "/exit" "$dir/fake/literal" "the previous agent should have been exited"
   assert_grep "encode launch-brief" "$dir/fake/literal" "the replacement should have been launched"
   pass "fm-control relaunch: a same-harness relaunch replaces the agent in the same endpoint and worktree"
+}
+
+test_legacy_tasktmp_relaunch_reuses_the_grandfathered_root() {
+  local dir id out rc legacy_root
+  # A grandfathered legacy root is spelled /tmp/fm-<id> exactly, so the task id
+  # itself carries this run's uniqueness.
+  id="rllegacy$$"
+  dir=$(new_case legacy "$id")
+  add_ship_task "$dir" "$id" claude
+  legacy_root=/tmp/fm-$id
+  rm -rf -- "$legacy_root"
+  mkdir -p "$legacy_root/gotmp"
+  chmod 700 "$legacy_root" "$legacy_root/gotmp"
+  TASK_TMPS+=("$legacy_root")
+  awk -v root="$legacy_root" '/^tasktmp=/ { print "tasktmp=" root; next } { print }' \
+    "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.tmp"
+  mv "$dir/home/state/$id.meta.tmp" "$dir/home/state/$id.meta"
+  out=$(run_control "$dir" "$id" relaunch --note "keep the legacy root"); rc=$?
+  expect_code 0 "$rc" "a relaunch over a trusted legacy root should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" tasktmp)" = "$legacy_root" ] \
+    || fail "the exact recorded trusted legacy task root must survive relaunch"
+  assert_grep "export GOTMPDIR=$legacy_root/gotmp" "$dir/fake/keys" \
+    "the replacement did not export the exact recorded legacy root"
+  [ -d "$legacy_root/gotmp" ] || fail "relaunch removed the reused legacy root"
+  pass "fm-control relaunch: a trusted grandfathered legacy root is reused, not reallocated"
 }
 
 test_relaunch_preserves_durable_task_metadata() {
@@ -912,7 +942,9 @@ test_unsafe_tasktmp_refuses_before_stopping_anything() {
   local dir out rc before
   dir=$(new_case unsafe-tasktmp rlunsafe)
   add_ship_task "$dir" rlunsafe claude
-  chmod 0777 /tmp/fm-rlunsafe
+  # The fixture's own unpredictable root is what becomes group/world-writable;
+  # this suite never creates or chmods a predictable shared /tmp name.
+  chmod 0777 "$(meta_field "$dir" rlunsafe tasktmp)"
   before=$(git hash-object "$dir/home/state/rlunsafe.meta")
   out=$(run_control "$dir" rlunsafe relaunch --note "must not stop"); rc=$?
   [ "$rc" -ne 0 ] || fail "unsafe recorded task root should refuse relaunch"
@@ -1513,6 +1545,7 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
 }
 
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
+test_legacy_tasktmp_relaunch_reuses_the_grandfathered_root
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
 test_disabled_relaunch_clears_prior_trace_context

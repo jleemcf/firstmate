@@ -2093,12 +2093,14 @@ fi
 if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_RECORDED_TASK_TMP=$(fm_meta_get "$RELAUNCH_META" tasktmp)
   if ! TASK_TMP=$(fm_tasktmp_recorded_prepare "$STATE" "$ID" "$RELAUNCH_RECORDED_TASK_TMP"); then
-    echo "error: relaunch refused unsafe task temporary root for $ID: $FM_TASKTMP_ERROR" >&2
+    # fm_tasktmp_recorded_prepare runs in a command substitution, so its refusal
+    # detail reaches stderr directly rather than through FM_TASKTMP_ERROR here.
+    echo "error: relaunch refused unsafe task temporary root for $ID; see the tasktmp refusal above" >&2
     exit 1
   fi
 else
   if ! TASK_TMP=$(fm_tasktmp_claim_create "$STATE" "$ID"); then
-    echo "error: task temporary root allocation for $ID failed safely: $FM_TASKTMP_ERROR" >&2
+    echo "error: task temporary root allocation for $ID failed safely; see the tasktmp refusal above" >&2
     exit 1
   fi
 fi
