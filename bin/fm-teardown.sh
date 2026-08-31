@@ -1435,27 +1435,48 @@ teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-
   return 1
 }
 
-teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <state> <task-id> <meta> [detach-branch]
-  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
-  local claim_state=$5 claim_id=$6 claim_meta=$7 detach_branch=${8:-} rc
-  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
-  fm_worktree_claim_retire_begin "$claim_meta" "$dir" || return 1
-  # The branch is no longer anyone's ownership evidence once the proof has run
-  # and the claim is retired, and the slot has to leave it before the shared
-  # repo can drop the ref.
-  if [ -n "$detach_branch" ] && [ "$detach_branch" != HEAD ] && [ -d "$dir" ]; then
-    git -C "$dir" checkout --detach -q 2>/dev/null || true
+# Every claim-retiring provider operation has one shape: prove ownership unless
+# the caller already did under the same locks, retire the exact claim the
+# operation is about to make reusable, run the provider operation, then release
+# the retirement on success or restore it on failure with the provider's own
+# return code preserved. FM_WORKTREE_RETIREMENT_UNRECORDED from the release
+# reaches the caller unchanged, because a released path with an unrecorded
+# retirement is not a failed operation.
+teardown_claimed_provider_op() {  # <state> <task-id> <meta> <expected-path> <prove:0|1> <command...>
+  local claim_state=$1 claim_id=$2 claim_meta=$3 expected=$4 prove=$5 rc
+  shift 5
+  if [ "$prove" = 1 ]; then
+    fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
+  else
+    [ -n "$claim_state" ] && [ -n "$claim_id" ] || return 1
   fi
-  if teardown_treehouse_return_raw "$dir" "$cd_dir" "$label" "$post_cleanup_check"; then
+  fm_worktree_claim_retire_begin "$claim_meta" "$expected" || return 1
+  if "$@"; then
     fm_worktree_claim_retire_release
     return $?
   else
     rc=$?
   fi
-  if ! fm_worktree_claim_retire_restore; then
-    return 1
-  fi
+  fm_worktree_claim_retire_restore || return 1
   return "$rc"
+}
+
+# The branch is no longer anyone's ownership evidence once the proof has run and
+# the claim is retired, and the slot has to leave it before the shared repo can
+# drop the ref, so the detach belongs inside the retired window.
+teardown_treehouse_return_detached() {  # <worktree> <project> <label> <post-check> <detach-branch>
+  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=$4 detach_branch=$5
+  if [ -n "$detach_branch" ] && [ "$detach_branch" != HEAD ] && [ -d "$dir" ]; then
+    git -C "$dir" checkout --detach -q 2>/dev/null || true
+  fi
+  teardown_treehouse_return_raw "$dir" "$cd_dir" "$label" "$post_cleanup_check"
+}
+
+teardown_treehouse_return() {  # <worktree> <project> <label> <post-check> <state> <task-id> <meta> [detach-branch]
+  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
+  local claim_state=$5 claim_id=$6 claim_meta=$7 detach_branch=${8:-}
+  teardown_claimed_provider_op "$claim_state" "$claim_id" "$claim_meta" "$dir" 1 \
+    teardown_treehouse_return_detached "$dir" "$cd_dir" "$label" "$post_cleanup_check" "$detach_branch"
 }
 
 # The task branch this slot is on, or was on before an earlier attempt detached
@@ -2066,45 +2087,21 @@ safe_rm_rf_child_worktree() {
 # The caller must have run fm_worktree_ownership_prove while holding this
 # task's lifecycle and metadata locks before calling this provider wrapper.
 teardown_remove_orca_worktree_claimed() {  # <state> <task-id> <meta> <worktree-id> <worktree>
-  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree_id=$4 worktree=$5 rc
-  [ -n "$claim_state" ] && [ -n "$claim_id" ] || return 1
-  fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
-  if fm_backend_remove_worktree orca "$worktree_id"; then
-    fm_worktree_claim_retire_release
-    return $?
-  else
-    rc=$?
-  fi
-  fm_worktree_claim_retire_restore || return 1
-  return "$rc"
+  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree_id=$4 worktree=$5
+  teardown_claimed_provider_op "$claim_state" "$claim_id" "$claim_meta" "$worktree" 0 \
+    fm_backend_remove_worktree orca "$worktree_id"
 }
 
 teardown_safe_rm_child_worktree_claimed() {  # <state> <task-id> <meta> <worktree> <project>
-  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree=$4 project=$5 rc
-  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
-  fm_worktree_claim_retire_begin "$claim_meta" "$worktree" || return 1
-  if safe_rm_rf_child_worktree "$worktree" "$project"; then
-    fm_worktree_claim_retire_release
-    return $?
-  else
-    rc=$?
-  fi
-  fm_worktree_claim_retire_restore || return 1
-  return "$rc"
+  local claim_state=$1 claim_id=$2 claim_meta=$3 worktree=$4 project=$5
+  teardown_claimed_provider_op "$claim_state" "$claim_id" "$claim_meta" "$worktree" 1 \
+    safe_rm_rf_child_worktree "$worktree" "$project"
 }
 
 teardown_safe_rm_firstmate_home_claimed() {  # <state> <task-id> <meta> <home> <label>
-  local claim_state=$1 claim_id=$2 claim_meta=$3 home=$4 label=$5 rc
-  fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
-  fm_worktree_claim_retire_begin "$claim_meta" "$home" || return 1
-  if safe_rm_rf "$home" "$label"; then
-    fm_worktree_claim_retire_release
-    return $?
-  else
-    rc=$?
-  fi
-  fm_worktree_claim_retire_restore || return 1
-  return "$rc"
+  local claim_state=$1 claim_id=$2 claim_meta=$3 home=$4 label=$5
+  teardown_claimed_provider_op "$claim_state" "$claim_id" "$claim_meta" "$home" 1 \
+    safe_rm_rf "$home" "$label"
 }
 
 validate_firstmate_home_for_removal() {
@@ -2725,8 +2722,14 @@ cleanup_firstmate_home_children() {
           if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
             echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
           else
+            child_return_rc=0
             teardown_safe_rm_child_worktree_claimed \
-              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
+              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || child_return_rc=$?
+            if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+              echo "warning: child worktree $child_wt was removed, but its retirement could not be recorded" >&2
+            elif [ "$child_return_rc" -ne 0 ]; then
+              return 1
+            fi
           fi
         fi
       else
@@ -3154,11 +3157,6 @@ rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
-fm_worktree_claim_retire_commit || true
-fm_worktree_retirement_receipt_clear "$META" || {
-  echo "error: task $ID's records were removed, but its retirement receipt at $(fm_worktree_retirement_receipt_path "$META") could not be deleted; remove it before this task id is reused" >&2
-  exit 1
-}
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
@@ -3188,6 +3186,15 @@ else
     exit 1
   fi
 fi
+# Only now is the record this retirement certifies actually gone. Until it is,
+# the receipt and the quarantined released evidence are the only proof that the
+# provider step already ran, and a rerun after a failed close or remove needs
+# them to finish the cleanup instead of refusing a record with no worktree.
+fm_worktree_claim_retire_commit || true
+fm_worktree_retirement_receipt_clear "$META" || {
+  echo "error: task $ID's records were removed, but its retirement receipt at $(fm_worktree_retirement_receipt_path "$META") could not be deleted; remove it before this task id is reused" >&2
+  exit 1
+}
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

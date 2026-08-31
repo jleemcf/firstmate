@@ -136,6 +136,25 @@ new_case() {
   printf '%s\n' "$dir"
 }
 
+# The positive ownership binding bin/fm-spawn.sh stamps into a slot it owns,
+# written the same way: excluded from git first, so it never reads as
+# uncommitted work. A record naming a spawn generation always has one.
+# stamp_task_owner_marker <worktree> <task-id> <spawn-generation>
+stamp_task_owner_marker() {
+  local wt=$1 id=$2 generation=$3 excl
+  excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  # A non-linked clone reports this relative to the worktree, not absolutely.
+  case "$excl" in /*) ;; *) excl="$wt/$excl" ;; esac
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
+    || printf '%s\n' '.fm-task-owner' >> "$excl"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf 'task_id=%s\n' "$id"
+    printf 'spawn_gen=%s\n' "$generation"
+  } > "$wt/.fm-task-owner"
+}
+
 # add_ship_task <case-dir> <id> [harness]
 add_ship_task() {
   local dir=$1 id=$2 harness=${3:-claude}
@@ -157,6 +176,7 @@ add_ship_task() {
     echo "effort=default"
     echo "spawn_gen=prior-$id"
   } > "$home/state/$id.meta"
+  stamp_task_owner_marker "$wt" "$id" "prior-$id"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$wt" > "$dir/fake/cwd"
   TASK_TMPS+=("/tmp/fm-$id")
@@ -1496,7 +1516,11 @@ test_spawn_relaunch_refuses_a_pending_authoritative_close() {
   dir=$(new_case pending-close rl36)
   add_ship_task "$dir" rl36 claude
   meta="$dir/home/state/rl36.meta"
-  printf 'spawn_gen=spawn-pending\n' >> "$meta"
+  # One exact incarnation, named identically by the record, its owner marker,
+  # and the pending close below.
+  sed -i.bak 's#^spawn_gen=.*#spawn_gen=spawn-pending#' "$meta"
+  rm -f "$meta.bak"
+  stamp_task_owner_marker "$dir/wt" rl36 spawn-pending
   cp "$meta" "$dir/meta.before"
   mkdir -p "$dir/wt/.claude"
   printf 'prior wiring\n' > "$dir/wt/.claude/settings.local.json"

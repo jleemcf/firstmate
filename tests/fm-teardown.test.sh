@@ -175,9 +175,24 @@ SH
   printf '%s\n' "$case_dir"
 }
 
-# Write a meta file for the task. Args: case_dir mode kind
+# Write a meta file for the task, exactly as a marker-era spawn publishes it:
+# the record names one spawn generation AND the slot carries the matching
+# .fm-task-owner marker. A record with a generation but no marker is not a
+# fixture shortcut, it is the recycled-slot state teardown must refuse, so it
+# only ever appears in the tests that are about that.
+# Args: case_dir mode kind
 write_meta() {
   local case_dir=$1 mode=$2 kind=$3
+  write_pre_marker_meta "$case_dir" "$mode" "$kind" "spawn_gen=test-generation-task-x1"
+  [ ! -d "$case_dir/wt" ] || stamp_owner_marker "$case_dir/wt" task-x1
+}
+
+# The same record as it looked before .fm-task-owner existed: no spawn
+# generation at all, so the legacy branch and project-membership fallbacks are
+# the only proof available. Args: case_dir mode kind [extra-line...]
+write_pre_marker_meta() {
+  local case_dir=$1 mode=$2 kind=$3
+  shift 3
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -185,7 +200,7 @@ write_meta() {
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode" \
-    "spawn_gen=test-generation-task-x1"
+    "$@"
 }
 
 # Stamp a worktree's owner marker exactly as bin/fm-spawn.sh does: excluded
@@ -194,6 +209,8 @@ write_meta() {
 stamp_owner_marker() {
   local wt=$1 id=$2 generation=${3:-test-generation-$2} excl
   excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  # A non-linked clone reports this relative to the worktree, not absolutely.
+  case "$excl" in /*) ;; *) excl="$wt/$excl" ;; esac
   mkdir -p "$(dirname "$excl")"
   grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
     || printf '%s\n' '.fm-task-owner' >> "$excl"
@@ -1018,7 +1035,9 @@ EOF
 test_task_branch_mismatch_refuses_without_an_owner_marker() {
   local case_dir rc
   case_dir=$(make_case branch-owner-refusal)
-  write_meta "$case_dir" no-mistakes ship
+  # A genuinely pre-marker record: it names no spawn generation, so the task
+  # branch is still the strongest proof available and a foreign one refuses.
+  write_pre_marker_meta "$case_dir" no-mistakes ship
   git -C "$case_dir/wt" branch -m fm/task-b
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
@@ -1102,7 +1121,8 @@ test_unbranched_worktree_outside_its_project_still_refuses() {
   git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
   git -C "$foreign" worktree add -q --detach "$case_dir/wt" HEAD
   : > "$case_dir/wt/foreign-work"
-  write_meta "$case_dir" no-mistakes ship
+  # Pre-marker, so the project-membership fallback is the proof under test.
+  write_pre_marker_meta "$case_dir" no-mistakes ship
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
@@ -1295,6 +1315,133 @@ EOF
   [ "$(cat "$case_dir/wt/live-work")" = "later spawn live work" ] \
     || fail "same-id-recycled-generation: later spawn work was destroyed"
   pass "a recycled slot reusing the same task id is distinguished by spawn generation"
+}
+
+# The residual recycled-slot path the owner marker exists to close. The record
+# still names its spawn generation, but the slot's .fm-task-owner is gone: the
+# slot went back to the pool out of band, or a crewmate's `git clean -fdx`
+# removed the marker, which it can because the marker is only info/exclude'd.
+# The slot is a detached scout's now, so it leaves no fm/<id> branch to
+# contradict this record and it is still a registered worktree of the same
+# project - the two legacy fallbacks both say yes to a live worker's slot.
+test_marker_era_record_with_no_marker_refuses_a_reissued_scout_slot() {
+  local case_dir canonical rc
+  case_dir=$(make_case marker-era-no-marker)
+  write_meta "$case_dir" no-mistakes ship
+  canonical=$(CDPATH='' cd -- "$case_dir/wt" && pwd -P)
+  rm -f "$case_dir/wt/.fm-task-owner"
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  printf '%s\n' "scout live work" > "$case_dir/wt/scout-live-work"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+"$REAL_GIT_FOR_TEST" -C "$case_dir/wt" clean -qfdx >/dev/null 2>&1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "marker-era-no-marker: a marker-era record whose marker is gone must refuse"
+  assert_grep "task task-x1 records spawn generation test-generation-task-x1" "$case_dir/stderr" \
+    "marker-era-no-marker: the refusal did not name the task and the generation it records"
+  assert_grep "$canonical/.fm-task-owner is absent" "$case_dir/stderr" \
+    "marker-era-no-marker: the refusal did not name the canonical path and its absent owner marker"
+  assert_absent "$case_dir/treehouse.log" \
+    "marker-era-no-marker: the refusal still reached the destructive pool return"
+  [ "$(cat "$case_dir/wt/scout-live-work")" = "scout live work" ] \
+    || fail "marker-era-no-marker: the unbranched scout holding the reissued slot lost its work"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "marker-era-no-marker: the refusal removed the task record"
+  pass "a marker-era record whose owner marker is gone cannot act on a reissued unbranched slot"
+}
+
+# The other half of that rule: a record written before .fm-task-owner existed
+# names no spawn generation at all, so nothing about it implies a marker was
+# ever stamped and the legacy chain stays its proof. An unbranched checkout that
+# is still a registered worktree of its own project is proved by that alone.
+test_pre_marker_record_keeps_the_legacy_project_fallback() {
+  local case_dir rc
+  case_dir=$(make_case pre-marker-legacy)
+  write_pre_marker_meta "$case_dir" no-mistakes ship
+  git -C "$case_dir/wt" checkout -q --detach
+  git -C "$case_dir/wt" branch -q -D fm/task-x1
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "pre-marker-legacy: the fixture is not a pre-marker slot"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "pre-marker-legacy: a pre-marker record must keep its legacy proof"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "pre-marker-legacy: the pool slot was never returned"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "pre-marker-legacy: teardown left the pre-marker record behind"
+  pass "a pre-marker record with no spawn generation keeps the legacy ownership fallback"
+}
+
+# The receipt is the only durable proof that the provider step already ran, so
+# it has to outlive every failure up to and including the record removal it
+# certifies. Discarded any earlier, a failed removal leaves a record with no
+# worktree= and no evidence, which every rerun then refuses forever.
+test_retirement_receipt_survives_a_failed_record_removal() {
+  local case_dir real_rm rc
+  case_dir=$(make_case receipt-outlives-remove)
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  # Fail exactly the task record's unlink, the way an unwritable state directory
+  # would, after every step before it has already succeeded.
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+if [ -e "$case_dir/record-removal-fails" ]; then
+  for arg; do
+    [ "\$arg" != "$case_dir/state/task-x1.meta" ] || exit 1
+  done
+fi
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+  : > "$case_dir/record-removal-fails"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "receipt-outlives-remove: a failing record removal must stop the teardown"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "receipt-outlives-remove: the fixture never reached the pool return it is about"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "receipt-outlives-remove: the fixture did not actually block the record removal"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "receipt-outlives-remove: the record regained a claim on a slot the pool can reissue"
+  assert_present "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "receipt-outlives-remove: the receipt was discarded before the record it certifies"
+
+  rm -f "$case_dir/record-removal-fails"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "receipt-outlives-remove: the rerun should finish the teardown"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "receipt-outlives-remove: the rerun left the task record behind"
+  assert_absent "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "receipt-outlives-remove: the receipt outlived the record it describes"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "receipt-outlives-remove: the rerun returned the pool slot a second time"
+  pass "a retirement receipt outlives a failed record removal so the rerun can finish"
 }
 
 test_owner_marker_carries_a_foreign_branch_checkout() {
@@ -2562,6 +2709,9 @@ configure_secondmate_with_herdr_child() {  # <case-dir>
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
+  # The parent's record has moved to its home, so the slot it used to claim is
+  # a child's now and must not keep the parent's owner marker.
+  rm -f "$case_dir/wt/.fm-task-owner"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   git -C "$case_dir/wt" branch -m fm/child-herdr
   fm_write_meta "$home/state/child-herdr.meta" \
@@ -2645,6 +2795,9 @@ configure_secondmate_with_tmux_children() {  # <case-dir>
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
+  # The parent's record has moved to its home, so the slot it used to claim is
+  # a child's now and must not keep the parent's owner marker.
+  rm -f "$case_dir/wt/.fm-task-owner"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   for child in child-a child-b; do
     child_wt="$case_dir/$child-wt"
@@ -2763,6 +2916,9 @@ configure_nested_secondmate_with_herdr_grandchild() {  # <case-dir>
   printf '%s\n' nested-sm > "$nested_home/.fm-secondmate-home"
   sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
+  # The parent's record has moved to its home, so the slot it used to claim is
+  # a child's now and must not keep the parent's owner marker.
+  rm -f "$case_dir/wt/.fm-task-owner"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   fm_write_meta "$home/state/nested-sm.meta" \
     "window=firstmate:fm-nested-sm" \
@@ -3610,6 +3766,9 @@ test_unbranched_worktree_with_uninspectable_project_refuses
 test_unbranched_worktree_marked_for_another_task_refuses
 test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
 test_same_task_id_with_a_different_marker_generation_refuses
+test_marker_era_record_with_no_marker_refuses_a_reissued_scout_slot
+test_pre_marker_record_keeps_the_legacy_project_fallback
+test_retirement_receipt_survives_a_failed_record_removal
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_late_teardown_failure_leaves_a_rerunnable_record

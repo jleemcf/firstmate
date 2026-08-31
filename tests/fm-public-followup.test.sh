@@ -25,6 +25,25 @@ SESSION_START="$ROOT/bin/fm-session-start.sh"
 TMP_ROOT=$(fm_test_tmproot fm-public-followup)
 PF_TEST_NOW=1787539200
 
+# The positive ownership binding bin/fm-spawn.sh stamps into a slot it owns,
+# written the same way: excluded from git first, so it never reads as
+# uncommitted work. A record naming a spawn generation always has one.
+# stamp_fixture_owner_marker <worktree> <task-id> <spawn-generation>
+stamp_fixture_owner_marker() {
+  local wt=$1 id=$2 generation=$3 excl
+  excl=$(git -C "$wt" rev-parse --git-path info/exclude)
+  case "$excl" in /*) ;; *) excl="$wt/$excl" ;; esac
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF '.fm-task-owner' "$excl" 2>/dev/null \
+    || printf '%s\n' '.fm-task-owner' >> "$excl"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf 'task_id=%s\n' "$id"
+    printf 'spawn_gen=%s\n' "$generation"
+  } > "$wt/.fm-task-owner"
+}
+
+
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found"; exit 0; }
 
@@ -841,6 +860,7 @@ test_secondmate_teardown_durable_record_with_unknown_field_succeeds() {
     "window=firstmate:fm-work-clean" "endpoint_task_id=work-clean" \
     "worktree=$child/projects/worktree" "project=$child/projects/worktree" \
     "kind=ship" "mode=local-only" "spawn_gen=public-followup-fixture"
+  stamp_fixture_owner_marker "$child/projects/worktree" work-clean public-followup-fixture
 
   rc=0
   out=$(PATH="$child/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$child" \
@@ -873,6 +893,7 @@ test_secondmate_teardown_rejects_conflicting_live_and_durable_parent_bindings() 
     "window=firstmate:fm-work-conflict" "endpoint_task_id=work-conflict" \
     "worktree=$child/projects/worktree" "project=$child/projects/worktree" \
     "kind=ship" "mode=local-only" "spawn_gen=public-followup-fixture"
+  stamp_fixture_owner_marker "$child/projects/worktree" work-conflict public-followup-fixture
 
   PATH="$child/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$child" \
     FM_STATE_OVERRIDE="$child/state" FM_DATA_OVERRIDE="$child/data" \
@@ -967,6 +988,7 @@ test_secondmate_teardown_rejects_nul_bearing_durable_parent_record() {
     "window=firstmate:fm-work-child" "endpoint_task_id=work-child" \
     "worktree=$child/projects/worktree" "project=$child/projects/worktree" \
     "kind=ship" "mode=local-only" "spawn_gen=public-followup-fixture"
+  stamp_fixture_owner_marker "$child/projects/worktree" work-child public-followup-fixture
   pre=${parent_resolved%??????}
   suf=${parent_resolved#"$pre"}
   record="$child/.fm-secondmate-parent"
@@ -1005,6 +1027,7 @@ SH
     "window=firstmate:fm-work-disabled" "endpoint_task_id=work-disabled" \
     "worktree=$home/projects/worktree" "project=$home/projects/worktree" \
     "kind=ship" "mode=local-only" "spawn_gen=public-followup-fixture"
+  stamp_fixture_owner_marker "$home/projects/worktree" work-disabled public-followup-fixture
 
   rc=0
   out=$(PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
@@ -1041,6 +1064,7 @@ SH
     "window=firstmate:fm-work-disabled" "endpoint_task_id=work-disabled" \
     "worktree=$child/projects/worktree" "project=$child/projects/worktree" \
     "kind=ship" "mode=local-only" "spawn_gen=public-followup-fixture"
+  stamp_fixture_owner_marker "$child/projects/worktree" work-disabled public-followup-fixture
 
   rc=0
   out=$(PATH="$child/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$child" \

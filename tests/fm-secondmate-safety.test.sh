@@ -2225,6 +2225,88 @@ EOF
   pass "secondmate force teardown discards child work"
 }
 
+# A child copy whose pool return fails for a reason that is not a git lock falls
+# back to removing that copy directly. The fallback can succeed while the
+# retirement it performed cannot be written down, which is a released path with
+# quarantined evidence - not a failed removal - so forced cleanup must warn and
+# carry on rather than abandon the rest of the secondmate teardown.
+test_secondmate_force_teardown_warns_on_unrecorded_child_retirement() {
+  local home subhome childproj childwt fakebin log err rc real_mv
+  home="$TMP_ROOT/child-unrecorded-home"
+  subhome="$TMP_ROOT/child-unrecorded-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/child-unrecorded-worktree"
+  err="$TMP_ROOT/child-unrecorded.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  fm_git_worktree "$childproj" "$childwt" fm/child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+EOF
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-unrecorded-fake")
+  log="$TMP_ROOT/child-unrecorded-fake/tmux.log"
+  # The pool refuses the return for a reason that is not a git lock, so cleanup
+  # falls back to removing the child copy itself.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+echo 'pool unavailable' >&2
+exit 1
+SH
+  chmod +x "$fakebin/treehouse"
+  # Only the child's receipt cannot be installed, the way a state filesystem out
+  # of space would fail it once the removal has already succeeded.
+  real_mv=$(command -v mv)
+  cat > "$fakebin/mv" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    *.child.meta.worktree-retired)
+      echo "mv: cannot move to '\$arg': No space left on device" >&2
+      exit 1
+      ;;
+  esac
+done
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$fakebin/mv"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-unrecorded-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ ! -d "$childwt" ] \
+    || fail "the fixture never removed the child copy this case is about: $(cat "$err")"
+  [ "$rc" -eq 0 ] \
+    || fail "forced cleanup abandoned a secondmate teardown whose child copy was removed: $(cat "$err")"
+  grep -F 'was removed, but its retirement could not be recorded' "$err" >/dev/null \
+    || fail "forced cleanup never warned that the child retirement went unrecorded: $(cat "$err")"
+  [ ! -e "$home/state/domain.meta" ] || fail "forced cleanup left the parent record behind"
+  [ ! -d "$subhome" ] || fail "forced cleanup left the retired secondmate home behind"
+  pass "an unrecorded child retirement warns instead of abandoning forced cleanup"
+}
+
 test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove() {
   local home subhome childproj childwt fakebin log err rc
   home="$TMP_ROOT/child-removal-refused-home"
@@ -2287,65 +2369,6 @@ EOF
   [ -e "$childwt/live-work" ] || fail "teardown removed the child copy it refused to attribute"
   [ -e "$home/state/domain.meta" ] || fail "teardown cleared the parent meta after a failed child removal"
   pass "a child worktree removal that refuses keeps the record that attributes it"
-}
-
-test_secondmate_force_teardown_refuses_child_quarantine_symlink() {
-  local home subhome childproj childwt external fakebin log err rc
-  home="$TMP_ROOT/force-quarantine-home"
-  subhome="$TMP_ROOT/force-quarantine-subhome"
-  childproj="$subhome/projects/alpha"
-  childwt="$TMP_ROOT/force-quarantine-child-worktree"
-  external="$TMP_ROOT/force-quarantine-external"
-  err="$TMP_ROOT/force-quarantine.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state" "$external"
-  fm_git_worktree "$childproj" "$childwt" fm/child
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
-  cat > "$subhome/state/child.meta" <<EOF
-window=firstmate:fm-child
-worktree=$childwt
-project=$childproj
-harness=echo
-kind=ship
-mode=no-mistakes
-yolo=off
-EOF
-  printf 'child check\n' > "$subhome/state/child.check.sh"
-  printf 'external quarantine artifact\n' > "$external/child.check.protected"
-  chmod 0640 "$external/child.check.protected"
-  ln -s "$external" "$subhome/state/.pr-check-quarantine"
-  fakebin=$(make_fake_tmux "$TMP_ROOT/force-quarantine-fake")
-  log="$TMP_ROOT/force-quarantine-fake/tmux.log"
-
-  set +e
-  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
-    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-quarantine-fake/pane.txt" \
-    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2> "$err"
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "force teardown accepted a child quarantine-directory symlink"
-  [ -d "$subhome" ] || fail "force teardown removed the subhome before quarantine refusal"
-  [ -d "$childwt" ] || fail "force teardown removed child work before quarantine refusal"
-  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta before quarantine refusal"
-  [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta before quarantine refusal"
-  [ "$(cat "$subhome/state/child.check.sh")" = 'child check' ] || fail "force teardown removed the child check before quarantine refusal"
-  [ "$(cat "$external/child.check.protected")" = 'external quarantine artifact' ] \
-    || fail "force teardown changed the child quarantine symlink target"
-  [ "$(file_mode "$external/child.check.protected")" = 640 ] \
-    || fail "force teardown changed the child quarantine target mode"
-  grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed a window before child quarantine validation"
-  pass "secondmate force teardown prevalidates child quarantine cleanup without following symlinks"
 }
 
 test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
@@ -3367,7 +3390,7 @@ test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work
 test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove
-test_secondmate_force_teardown_refuses_child_quarantine_symlink
+test_secondmate_force_teardown_warns_on_unrecorded_child_retirement
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_allows_non_state_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home

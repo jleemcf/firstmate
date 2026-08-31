@@ -13,9 +13,14 @@
 # to a later spawn of the same task id.
 # A matching owner marker proves an ordinary ship or scout without requiring a
 # branch, which covers every unbranched scout and ship before its first action.
-# When no marker exists for a pre-marker task, refs/heads/fm/<task-id> proves
-# ownership, another fm/<id> branch refuses, and an unattributed checkout falls
-# back to membership in the task's recorded project.
+# A record that names a spawn generation was written by a spawn that stamps a
+# marker, so an absent marker on a live path is not a missing proof but the
+# signature of a slot that left this task, and it refuses by name unless the
+# provider's own id-to-path binding already spoke for that path independently.
+# Only a genuinely pre-marker record - one that names no spawn generation at all
+# - keeps the legacy chain: refs/heads/fm/<task-id> proves ownership, another
+# fm/<id> branch refuses, and an unattributed checkout falls back to membership
+# in the task's recorded project.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -654,13 +659,23 @@ EOF
 
 # The per-task ownership marker bin/fm-spawn.sh stamps into every crewmate
 # worktree once it owns the slot. 0 when task id and spawn generation match this
-# task's metadata, 1 when either differs or the marker cannot be read, and 2
-# when no marker has been stamped there yet (a pre-marker task or a returned
-# slot). A generation mismatch refuses even when the task id was reused.
+# task's metadata, 1 when either differs or the marker cannot be read, 2 when no
+# marker has been stamped there yet and the record is genuinely pre-marker, and
+# 3 when a marker-era record - one that names an exact spawn generation, so the
+# spawn that wrote it also stamped a marker - finds none. A generation mismatch
+# refuses even when the task id was reused.
+# Absence is only inconclusive for the pre-marker record, because for every
+# other one it is the signature of a slot that left this task: a pool return, a
+# reaper, or the `git clean -fdx` this marker is only info/exclude'd against.
+# The caller decides what an absent marker costs a marker-era record, since the
+# provider's own id-to-path binding can still speak for a path no marker does.
 fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation> [state-dir]
   local canonical=$1 id=$2 expected_gen=$3 state=${4:-} marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
   local schema owner generation
-  [ -e "$marker" ] || [ -L "$marker" ] || return 2
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    [ -z "$expected_gen" ] || return 3
+    return 2
+  fi
   if [ ! -f "$marker" ] || [ -L "$marker" ]; then
     fm_worktree_refuse "worktree $canonical has a $FM_WORKTREE_TASK_OWNER_MARKER that is not a regular ownership marker, so task $id cannot be proved to own it."
     return 1
@@ -809,6 +824,15 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     marker_rc=0
     fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" "$state" || marker_rc=$?
     [ "$marker_rc" -ne 1 ] || return 1
+    if [ "$marker_rc" -eq 3 ] && [ -z "$provider_proof" ]; then
+      # A marker-era record with no marker has already lost the only binding
+      # that distinguishes its slot from one reissued to another task, and the
+      # remaining fallbacks cannot tell them apart: an unbranched scout leaves
+      # no fm/<id> branch to contradict this record, and a reissued pool slot is
+      # still a registered worktree of the same project.
+      fm_worktree_refuse "task $id records spawn generation $spawn_gen for worktree $canonical, but $canonical/$FM_WORKTREE_TASK_OWNER_MARKER is absent, so nothing proves task $id still owns that path."
+      return 1
+    fi
     if [ "$marker_rc" -eq 0 ]; then
       provider_proof=task-owner-marker
     elif [ -n "$provider_proof" ]; then
