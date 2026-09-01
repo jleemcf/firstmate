@@ -8,6 +8,7 @@ set -u
 
 SNAPSHOT="$ROOT/bin/fm-fleet-snapshot.sh"
 VIEW="$ROOT/bin/fm-fleet-view.sh"
+SUMMARY_REFRESH="$ROOT/bin/fm-home-summary-refresh.sh"
 TMP_ROOT=$(fm_test_tmproot fm-fleet-snapshot)
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
@@ -149,6 +150,61 @@ test_empty_fleet_json() {
   view=$(FM_HOME="$home" "$VIEW")
   assert_contains "$view" "No live task metadata found." "empty fleet view should say no live metadata"
   pass "empty fleet snapshot and view use explicit absence markers"
+}
+
+test_large_backlog_snapshot_view_and_summary_publication() {
+  local home backlog_size out
+  home=$(make_home large-backlog)
+  python3 - "$home/data/backlog.md" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+rows = [
+    "## In flight\n",
+    "\n",
+    "## Queued\n",
+    "\n",
+    "## Done\n",
+]
+for index in range(2400):
+    rows.append(
+        f"- [x] archived-{index:04d} - Accumulated completed work {index:04d} "
+        "(repo: firstmate) (kind: ship) (done 2026-08-31)\n"
+    )
+path.write_text("".join(rows))
+PY
+  backlog_size=$(wc -c < "$home/data/backlog.md" | tr -d '[:space:]')
+  [ "$backlog_size" -ge 204800 ] \
+    || fail "large-backlog fixture was only $backlog_size bytes"
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    "$SNAPSHOT" --json) \
+    || fail "snapshot failed on a $backlog_size-byte backlog"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and (.backlog.records | length) == 2400
+      and .main_inventory.valid == true
+      and (.tasks | length) == 0
+  ' >/dev/null || fail "large-backlog snapshot shape was wrong"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    "$VIEW" > "$home/fleet-view.txt" \
+    || fail "fleet view failed on a $backlog_size-byte backlog"
+  assert_contains "$(cat "$home/fleet-view.txt")" "| archived-2399 |" \
+    "fleet view omitted the tail of the large backlog"
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    "$SUMMARY_REFRESH" \
+    || fail "home-summary publication failed on a $backlog_size-byte backlog"
+  jq -e '
+    .schema == "fm-secondmate-home-summary.v1"
+      and .valid == true
+      and .counts.landed == 2400
+      and (.landed | length) == 10
+  ' "$home/state/home-summary.json" >/dev/null \
+    || fail "large-backlog home summary was not published with the expected shape"
+  pass "snapshot, fleet view, and home-summary publication survive a large backlog"
 }
 
 test_fixture_snapshot_json() {
@@ -897,6 +953,7 @@ EOF
 }
 
 test_empty_fleet_json
+test_large_backlog_snapshot_view_and_summary_publication
 test_fixture_snapshot_json
 test_home_summary_excludes_secondmate_from_child_inventory
 test_main_inventory_orphan_and_unstructured_disclosure

@@ -137,7 +137,7 @@ home_summary_refresh_once() {
     producer_rc=$?
   fi
   if [ "$producer_rc" -ne 0 ]; then
-    producer_error=$(tail -n 1 "$HOME_SUMMARY_ERR_TMP" 2>/dev/null \
+    producer_error=$(LC_ALL=C head -c 2000 "$HOME_SUMMARY_ERR_TMP" 2>/dev/null \
       | tr '\t\r\n' '   ' | cut -c1-500)
     if [ -n "$producer_error" ]; then
       home_summary_fail "summary producer failed with exit $producer_rc: $producer_error"
