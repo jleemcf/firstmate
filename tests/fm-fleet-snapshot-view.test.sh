@@ -282,6 +282,10 @@ for arg in "\$@"; do
       exec "$real_env" "\$@"
       ;;
     empty) exit 0 ;;
+    duplicate)
+      "$real_env" "\$@" || exit \$?
+      exec "$real_env" "\$@"
+      ;;
     document)
       printf '%s' "\${FM_TEST_SUMMARY_OUTPUT:-}"
       exit 0
@@ -294,7 +298,7 @@ SH
 }
 
 test_unusable_secondmate_summary_degrades_that_home_only() {
-  local home mate fakebin out mode oversized
+  local home mate fakebin out mode oversized doubled
   home=$(make_home degraded-mate-parent)
   mate="$TMP_ROOT/degraded-mate-home"
   seed_secondmate_home "$mate" degraded-mate 3
@@ -317,7 +321,17 @@ test_unusable_secondmate_summary_degrades_that_home_only() {
       and .secondmate_current.records[0].counts.landed == 3
   ' >/dev/null || fail "the secondmate fixture did not sample cleanly: $out"
 
-  for mode in banner empty document; do
+  doubled=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$mate" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    FM_TEST_SUMMARY_MODE=duplicate \
+    env "$SNAPSHOT" --secondmate-home-summary) \
+    || fail "the duplicate-producer shim did not run"
+  printf '%s' "$doubled" | jq -e -s '
+    length == 2 and all(.[]; .schema == "fm-secondmate-home-summary.v1"
+      and (.counts | type) == "object" and (.landed | type) == "array")
+  ' >/dev/null || fail "the duplicate shim did not emit two shape-valid summaries: $doubled"
+
+  for mode in banner empty duplicate document; do
     out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
       FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
       FM_TEST_SUMMARY_MODE="$mode" FM_TEST_SUMMARY_OUTPUT='["not an object"]' \
