@@ -149,6 +149,9 @@
 #     and reported on stderr and in the completion line, while the worktree,
 #     backlog close, busy state, endpoint, and state cleanup all still run, so
 #     one untrusted root can never strand a whole task.
+#     Because this teardown also removes the task record that carried tasktmp=,
+#     the refusal is recorded durably at state/<id>.tasktmp-refused, which every
+#     later startup re-reports until the refused path is gone.
 #     Idempotent: nothing left to find is a silent no-op.
 #   Fix 3 - sweep abandoned remote job workers. A remote job worker started
 #     from a worktree's own bin/ outlives that worktree's removal without
@@ -750,14 +753,25 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_TMP_SCAN=$TASK_TMP
 TASK_TMP_REFUSED=
+# This teardown removes state/<id>.meta, the only durable carrier of tasktmp=,
+# so a refusal has to leave its own record behind or the untouched path would
+# never be nameable again.
+# state/<id>.tasktmp-refused survives teardown and every later startup
+# re-reports it until the refused path is gone.
+refuse_task_tmp() {  # <path> <sentence>
+  local path=$1 sentence=$2 reason=$FM_TASKTMP_ERROR
+  TASK_TMP_REFUSED=$path
+  TASK_TMP=
+  TASK_TMP_SCAN=
+  echo "REFUSED: $sentence" >&2
+  fm_tasktmp_refusal_record "$STATE" "$ID" "$path" "$reason" \
+    || echo "error: the refused task temporary root $path for $ID could not be recorded for re-reporting, so only this run reports it" >&2
+}
 if [ -n "$TASK_TMP" ]; then
   fm_tasktmp_trust "$ID" "$TASK_TMP"
   case "$FM_TASKTMP_TRUST" in
     unsafe)
-      TASK_TMP_REFUSED=$TASK_TMP
-      TASK_TMP=
-      TASK_TMP_SCAN=
-      echo "REFUSED: unsafe task temporary root for $ID: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds and the path is left for an operator." >&2
+      refuse_task_tmp "$TASK_TMP" "unsafe task temporary root for $ID: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds and the path is left for an operator."
       ;;
     absent)
       TASK_TMP_SCAN=
@@ -2756,10 +2770,7 @@ if [ "$KIND" != secondmate ]; then
     fm_tasktmp_trust "$ID" "$TASK_TMP_SCAN"
     case "$FM_TASKTMP_TRUST" in
       unsafe)
-        TASK_TMP_REFUSED=$TASK_TMP_SCAN
-        TASK_TMP=
-        TASK_TMP_SCAN=
-        echo "REFUSED: task temporary root for $ID stopped being trusted immediately before process scanning: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds." >&2
+        refuse_task_tmp "$TASK_TMP_SCAN" "task temporary root for $ID stopped being trusted immediately before process scanning: $FM_TASKTMP_ERROR. Nothing under that path is scanned, changed, or removed; the rest of this teardown proceeds."
         ;;
       absent)
         TASK_TMP_SCAN=
@@ -2914,8 +2925,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # refuses every unsafe existing path without traversing or changing it.
 if [ -n "$TASK_TMP" ] && ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
   if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
-    TASK_TMP_REFUSED=$TASK_TMP
-    echo "REFUSED: task temporary root for $ID stopped being trusted immediately before removal: $FM_TASKTMP_ERROR. It was preserved untouched; the rest of this teardown proceeds." >&2
+    refuse_task_tmp "$TASK_TMP" "task temporary root for $ID stopped being trusted immediately before removal: $FM_TASKTMP_ERROR. It was preserved untouched; the rest of this teardown proceeds."
   else
     echo "error: task temporary root for $ID could not be removed: $FM_TASKTMP_ERROR" >&2
     exit 1
@@ -2971,7 +2981,7 @@ if [ -d "$STATE" ]; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 fi
 if [ -n "$TASK_TMP_REFUSED" ]; then
-  echo "teardown $ID complete (window $T, worktree $WT); its untrusted task temporary root $TASK_TMP_REFUSED was preserved untouched for an operator"
+  echo "teardown $ID complete (window $T, worktree $WT); its untrusted task temporary root $TASK_TMP_REFUSED was preserved untouched for an operator and recorded at $(fm_tasktmp_refusal_path "$STATE" "$ID") for re-reporting"
 else
   echo "teardown $ID complete (window $T, worktree $WT)"
 fi

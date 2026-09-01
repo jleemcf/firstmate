@@ -2090,6 +2090,16 @@ fi
 # the random candidate is created under the public temporary parent.
 # Relaunch otherwise reuses the exact recorded trusted root, including a
 # grandfathered legacy root.
+# True only when a pending claim exists AND names the exact root this spawn is
+# using, which is the one case where this spawn is the claim's owner.
+# A leftover claim for any other path is a crash remnant that locked startup
+# reconciles; adopting it here would transfer or delete a root this spawn never
+# allocated.
+spawn_tasktmp_claim_is_ours() {
+  fm_tasktmp_claim_read "$STATE" "$ID" || return 1
+  [ -n "$TASK_TMP" ] && [ "$FM_TASKTMP_CLAIM_PATH" = "$TASK_TMP" ]
+}
+
 if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_RECORDED_TASK_TMP=$(fm_meta_get "$RELAUNCH_META" tasktmp)
   if ! TASK_TMP=$(fm_tasktmp_recorded_prepare "$STATE" "$ID" "$RELAUNCH_RECORDED_TASK_TMP"); then
@@ -2977,11 +2987,17 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # A missing recorded root minted a claim for this relaunch.
   # Replacement metadata is intentionally durable from this point even if
   # launch confirmation later fails, so it can take ownership now.
-  if [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; then
+  # Only a claim naming this spawn's exact root is this spawn's claim: a
+  # relaunch that reused a trusted recorded root minted nothing, so a leftover
+  # claim naming some other path belongs to locked startup, not to this
+  # transfer.
+  if spawn_tasktmp_claim_is_ours; then
     if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID" \
        || ! fm_tasktmp_claim_transfer "$STATE" "$ID" "$STATE/$ID.meta"; then
-      echo "error: replacement task record could not take ownership of its temporary root: $FM_TASKTMP_ERROR" >&2
-      exit 1
+      # The replacement record published above owns the exact root, so retaining
+      # the claim is safe and lets locked startup complete the transfer. Failing
+      # here instead would leave a stopped worker with no replacement.
+      echo "warning: task $ID was relaunched, but its temporary-root claim remains for locked startup reconciliation: $FM_TASKTMP_ERROR" >&2
     fi
   fi
 fi
@@ -3193,8 +3209,7 @@ trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
-if [ "$RELAUNCH" -eq 0 ] \
-   && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
+if [ "$RELAUNCH" -eq 0 ] && spawn_tasktmp_claim_is_ours; then
   if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID" \
      || ! fm_tasktmp_claim_transfer "$STATE" "$ID" "$STATE/$ID.meta"; then
     # The published task record still owns the exact root, so retaining the

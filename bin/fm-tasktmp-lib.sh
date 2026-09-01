@@ -18,6 +18,9 @@
 # canonicalizes, traverses, or removes an untrusted task root.
 # Missing tasktmp fields and recognized roots that are already absent remain
 # compatible no-ops for lifecycle cleanup.
+# A refusal outlives the task record that named the path: teardown writes
+# state/<id>.tasktmp-refused, and every later startup re-reports it until the
+# refused path is gone.
 #
 # Trust is a FOUR-state answer, so no caller may reduce it to a boolean.
 # fm_tasktmp_trust is the only interface call sites use; it sets
@@ -44,6 +47,7 @@
 FM_TASKTMP_ERROR=
 FM_TASKTMP_TRUST=
 FM_TASKTMP_KIND=
+FM_TASKTMP_EUID=
 FM_TASKTMP_STAT_UID=
 FM_TASKTMP_STAT_MODE=
 FM_TASKTMP_STAT_TYPE=
@@ -51,11 +55,31 @@ FM_TASKTMP_CLAIM_ID=
 FM_TASKTMP_CLAIM_NONCE=
 FM_TASKTMP_CLAIM_PATH=
 FM_TASKTMP_CLAIM_PHASE=
+FM_TASKTMP_REFUSED_PATH=
+FM_TASKTMP_REFUSED_REASON=
 
 fm_tasktmp_error() {  # <message>
   FM_TASKTMP_ERROR=$1
   printf 'tasktmp: %s\n' "$FM_TASKTMP_ERROR" >&2
   return 1
+}
+
+# The effective uid cannot change inside one process, so resolve it once and
+# reuse it for every ownership check in this shell.
+fm_tasktmp_euid() {
+  [ -z "$FM_TASKTMP_EUID" ] || return 0
+  local euid
+  euid=$(id -u) || {
+    fm_tasktmp_error "effective uid cannot be determined"
+    return 1
+  }
+  case "$euid" in
+    ''|*[!0-9]*)
+      fm_tasktmp_error "effective uid could not be read as a number"
+      return 1
+      ;;
+  esac
+  FM_TASKTMP_EUID=$euid
 }
 
 fm_tasktmp_parent() {
@@ -108,18 +132,15 @@ fm_tasktmp_mode_exact_private() {  # <octal-mode>
 }
 
 fm_tasktmp_directory_stat_valid() {  # <path> <new|legacy>
-  local path=$1 kind=$2 euid
+  local path=$1 kind=$2
   fm_tasktmp_lstat "$path" || return 1
   case "$FM_TASKTMP_STAT_TYPE" in
     directory|Directory) ;;
     *) fm_tasktmp_error "$path is not a real directory"; return 1 ;;
   esac
-  euid=$(id -u) || {
-    fm_tasktmp_error "effective uid cannot be determined"
-    return 1
-  }
-  [ "$FM_TASKTMP_STAT_UID" = "$euid" ] || {
-    fm_tasktmp_error "$path is owned by uid $FM_TASKTMP_STAT_UID, not effective uid $euid"
+  fm_tasktmp_euid || return 1
+  [ "$FM_TASKTMP_STAT_UID" = "$FM_TASKTMP_EUID" ] || {
+    fm_tasktmp_error "$path is owned by uid $FM_TASKTMP_STAT_UID, not effective uid $FM_TASKTMP_EUID"
     return 1
   }
   fm_tasktmp_mode_private "$FM_TASKTMP_STAT_MODE" || {
@@ -255,7 +276,8 @@ fm_tasktmp_claim_read() {  # <state> <task-id>
     regular\ file|Regular\ File|regular) ;;
     *) fm_tasktmp_error "task temporary claim $claim is not a regular file"; return 1 ;;
   esac
-  [ "$FM_TASKTMP_STAT_UID" = "$(id -u)" ] || {
+  fm_tasktmp_euid || return 1
+  [ "$FM_TASKTMP_STAT_UID" = "$FM_TASKTMP_EUID" ] || {
     fm_tasktmp_error "task temporary claim $claim is not owned by the effective uid"
     return 1
   }
@@ -508,6 +530,86 @@ fm_tasktmp_audit_meta() {  # <meta>
   return 1
 }
 
+# A refused root outlives the task record that named it, so the refusal itself
+# must be durable: teardown removes state/<id>.meta, and without this record no
+# later session could name the path it left untouched.
+# The record is version=1, id, path, reason, and refused, one key per line, mode
+# 0600, and is retired only once the refused path is gone.
+fm_tasktmp_refusal_path() {  # <state> <task-id>
+  printf '%s/%s.tasktmp-refused\n' "$1" "$2"
+}
+
+fm_tasktmp_refusal_record() {  # <state> <task-id> <refused-path> <reason>
+  local state=$1 id=$2 path=$3 reason=$4 record temp refused
+  record=$(fm_tasktmp_refusal_path "$state" "$id")
+  temp=$state/.$id.tasktmp-refused.${BASHPID:-$$}
+  reason=${reason//$'\n'/ }
+  [ -n "$reason" ] || reason="no detail was recorded"
+  refused=$(date -u +%Y-%m-%dT%H:%M:%SZ) || refused=
+  if [ -z "$refused" ] || ! (
+    umask 077
+    printf 'version=1\nid=%s\npath=%s\nreason=%s\nrefused=%s\n' \
+      "$id" "$path" "$reason" "$refused" > "$temp" \
+      && chmod 600 -- "$temp" \
+      && mv -- "$temp" "$record"
+  ); then
+    rm -f -- "$temp" 2>/dev/null || true
+    fm_tasktmp_error "refused task temporary root $path for $id could not be recorded for re-reporting"
+    return 1
+  fi
+}
+
+fm_tasktmp_refusal_read() {  # <state> <task-id>
+  local state=$1 id=$2 record line key value seen_version=0 seen_id=0 seen_path=0 seen_reason=0 seen_refused=0 recorded_id=
+  record=$(fm_tasktmp_refusal_path "$state" "$id")
+  if fm_tasktmp_path_absent "$record"; then
+    FM_TASKTMP_ERROR="no refused task temporary root recorded for $id"
+    return 2
+  fi
+  fm_tasktmp_lstat "$record" || return 1
+  case "$FM_TASKTMP_STAT_TYPE" in
+    regular\ file|Regular\ File|regular) ;;
+    *) fm_tasktmp_error "refused-root record $record is not a regular file"; return 1 ;;
+  esac
+  fm_tasktmp_euid || return 1
+  [ "$FM_TASKTMP_STAT_UID" = "$FM_TASKTMP_EUID" ] || {
+    fm_tasktmp_error "refused-root record $record is not owned by the effective uid"
+    return 1
+  }
+  fm_tasktmp_mode_private "$FM_TASKTMP_STAT_MODE" || {
+    fm_tasktmp_error "refused-root record $record has unsafe mode $FM_TASKTMP_STAT_MODE"
+    return 1
+  }
+  FM_TASKTMP_REFUSED_PATH=
+  FM_TASKTMP_REFUSED_REASON=
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *=*) key=${line%%=*}; value=${line#*=} ;;
+      *) fm_tasktmp_error "refused-root record $record is malformed"; return 1 ;;
+    esac
+    case "$key" in
+      version) [ "$seen_version" -eq 0 ] && [ "$value" = 1 ] || { fm_tasktmp_error "refused-root record $record has an invalid version"; return 1; }; seen_version=1 ;;
+      id) [ "$seen_id" -eq 0 ] || { fm_tasktmp_error "refused-root record $record repeats id"; return 1; }; recorded_id=$value; seen_id=1 ;;
+      path) [ "$seen_path" -eq 0 ] || { fm_tasktmp_error "refused-root record $record repeats path"; return 1; }; FM_TASKTMP_REFUSED_PATH=$value; seen_path=1 ;;
+      reason) [ "$seen_reason" -eq 0 ] || { fm_tasktmp_error "refused-root record $record repeats reason"; return 1; }; FM_TASKTMP_REFUSED_REASON=$value; seen_reason=1 ;;
+      refused) [ "$seen_refused" -eq 0 ] || { fm_tasktmp_error "refused-root record $record repeats refused"; return 1; }; seen_refused=1 ;;
+      *) fm_tasktmp_error "refused-root record $record has unknown field '$key'"; return 1 ;;
+    esac
+  done < "$record"
+  [ "$seen_version$seen_id$seen_path$seen_reason$seen_refused" = 11111 ] || {
+    fm_tasktmp_error "refused-root record $record is incomplete"
+    return 1
+  }
+  [ "$recorded_id" = "$id" ] || {
+    fm_tasktmp_error "refused-root record $record belongs to '$recorded_id', not '$id'"
+    return 1
+  }
+  [ -n "$FM_TASKTMP_REFUSED_PATH" ] || {
+    fm_tasktmp_error "refused-root record $record names no path"
+    return 1
+  }
+}
+
 # Read-only liveness answer for the same per-task spawn lock the locked branch
 # takes, without creating, stealing, or removing anything.
 # Self-contained on purpose: a read-only startup must not have to load the wake
@@ -521,7 +623,7 @@ fm_tasktmp_spawn_lock_live() {  # <state> <task-id>
 }
 
 fm_tasktmp_startup() {  # <state> <locked|read-only>
-  local state=$1 mode=$2 claim id lock meta rc result=0
+  local state=$1 mode=$2 claim id lock meta record rc result=0
   [ -d "$state" ] || return 0
   for claim in "$state"/*.tasktmp-claim; do
     [ -e "$claim" ] || [ -L "$claim" ] || continue
@@ -562,6 +664,41 @@ fm_tasktmp_startup() {  # <state> <locked|read-only>
       printf 'TASKTMP_RECONCILE: %s: task temporary reconciliation lock could not be released\n' "$id"
       result=1
     }
+  done
+  # A teardown that refused an unsafe root left this record behind precisely so
+  # a later session can name the path again after the task record is gone.
+  # It is re-reported for as long as the refused path still exists, and only a
+  # locked startup retires it once that path is gone.
+  for record in "$state"/*.tasktmp-refused; do
+    [ -e "$record" ] || [ -L "$record" ] || continue
+    id=${record##*/}
+    id=${id%.tasktmp-refused}
+    case "$id" in ''|*[!A-Za-z0-9._-]*)
+      printf 'TASKTMP_RECONCILE: unknown: malformed refused-root record name %s; nothing was touched\n' "$record"
+      result=1
+      continue
+      ;;
+    esac
+    if ! fm_tasktmp_refusal_read "$state" "$id"; then
+      printf 'TASKTMP_RECONCILE: %s: refused task temporary root recorded at %s could not be read: %s; nothing was touched\n' "$id" "$record" "$FM_TASKTMP_ERROR"
+      result=1
+      continue
+    fi
+    if fm_tasktmp_path_absent "$FM_TASKTMP_REFUSED_PATH"; then
+      if [ "$mode" = read-only ]; then
+        printf 'BOOTSTRAP_INFO: %s: previously refused task temporary root %s is gone; a locked startup will retire its record\n' "$id" "$FM_TASKTMP_REFUSED_PATH"
+        continue
+      fi
+      if rm -f -- "$record"; then
+        printf 'BOOTSTRAP_INFO: %s: previously refused task temporary root %s is gone; its refusal record was retired\n' "$id" "$FM_TASKTMP_REFUSED_PATH"
+      else
+        printf 'TASKTMP_RECONCILE: %s: refusal record %s could not be retired\n' "$id" "$record"
+        result=1
+      fi
+      continue
+    fi
+    printf 'TASKTMP_RECONCILE: %s: refused task temporary root %s is still present and still untouched: %s\n' "$id" "$FM_TASKTMP_REFUSED_PATH" "$FM_TASKTMP_REFUSED_REASON"
+    result=1
   done
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue

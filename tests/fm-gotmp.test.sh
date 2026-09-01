@@ -427,6 +427,64 @@ test_teardown_refuses_unsafe_tasktmp_without_touching_it() {
   pass "fm-teardown preserves an unsafe root untouched and still completes the rest of the teardown"
 }
 
+test_teardown_refusal_is_durably_re_reported_after_the_task_record_is_gone() {
+  local id="td-durable-z20-$$" task_tmp target fake state record out rc inode mode
+  task_tmp="/tmp/fm-$id"
+  target="$TMP_ROOT/durable-target"
+  rm -rf -- "$task_tmp" "$target"
+  mkdir -p "$target/gotmp"
+  chmod 0777 "$target" "$target/gotmp"
+  printf 'durable sentinel\n' > "$target/gotmp/sentinel"
+  ln -s "$target" "$task_tmp"
+  inode=$(tasktmp_lstat_identity "$target")
+  mode=$(tasktmp_lstat_mode "$target")
+  fake=$(make_fake_root "$id" "$task_tmp")
+  state=$fake/state
+  mkdir -p "$fake/config" "$fake/projects"
+  record=$state/$id.tasktmp-refused
+  out=$(FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "the refusing teardown did not complete the rest of its work: $out"
+  [ ! -e "$state/$id.meta" ] \
+    || fail "the fixture no longer exercises the case where the only tasktmp= carrier is removed"
+  [ -f "$record" ] || fail "teardown left no durable record of the refused root"
+  [ "$(tasktmp_lstat_mode "$record")" = 600 ] \
+    || fail "the durable refusal record is not private"
+  # A later session has no task record left to scan, so the refused path can only
+  # be named again from the durable record teardown wrote.
+  out=$(FM_HOME="$fake" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in
+    *"TASKTMP_RECONCILE: $id: refused task temporary root $task_tmp is still present"*) ;;
+    *) fail "read-only startup did not re-report the refused root: $out" ;;
+  esac
+  [ -f "$record" ] || fail "read-only startup retired the refusal record"
+  out=$(FM_HOME="$fake" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in
+    *"TASKTMP_RECONCILE: $id: refused task temporary root $task_tmp is still present"*) ;;
+    *) fail "locked startup did not re-report the still-present refused root: $out" ;;
+  esac
+  [ -f "$record" ] \
+    || fail "locked startup retired a record whose refused path is still on disk"
+  [ -L "$task_tmp" ] && [ "$(readlink "$task_tmp")" = "$target" ] \
+    || fail "re-reporting changed the refused symlink"
+  [ "$(tasktmp_lstat_identity "$target")" = "$inode" ] && [ "$(tasktmp_lstat_mode "$target")" = "$mode" ] \
+    || fail "re-reporting changed the refused path's identity or permissions"
+  grep -qx 'durable sentinel' "$target/gotmp/sentinel" \
+    || fail "re-reporting changed the refused path's contents"
+  # An operator resolving the path is what ends the report.
+  rm -f -- "$task_tmp"
+  out=$(FM_HOME="$fake" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in
+    *"BOOTSTRAP_INFO: $id: previously refused task temporary root $task_tmp is gone"*) ;;
+    *) fail "locked startup did not retire the record once the refused path was gone: $out" ;;
+  esac
+  [ ! -e "$record" ] || fail "the resolved refusal record was not retired"
+  rm -f -- "$task_tmp"
+  pass "fm-teardown records a refused root durably and every later startup re-reports it until it is gone"
+}
+
 test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
   local state="$TMP_ROOT/parent-state" id="parent-refuse-z12-$$" out rc
   mkdir -p "$state"
@@ -670,6 +728,7 @@ test_claim_transfers_to_metadata_without_removing_root
 test_entropy_failure_never_falls_back_to_predictable_root
 test_collision_is_refused_without_entering_or_deleting_candidate
 test_teardown_refuses_unsafe_tasktmp_without_touching_it
+test_teardown_refusal_is_durably_re_reported_after_the_task_record_is_gone
 test_unresolvable_trusted_parent_refuses_instead_of_allocating
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root
 test_crash_window_preserves_a_recorded_root_that_no_longer_validates

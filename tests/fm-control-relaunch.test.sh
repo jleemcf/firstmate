@@ -370,6 +370,41 @@ test_relaunch_restores_a_vanished_gotmp_child_and_keeps_the_root() {
   pass "fm-control relaunch: a vanished gotmp child is restored rather than refused"
 }
 
+test_relaunch_over_a_foreign_leftover_claim_still_replaces_the_agent() {
+  local dir out rc recorded_root claim stale_root
+  dir=$(new_case stale-claim rlstale)
+  add_ship_task "$dir" rlstale claude
+  recorded_root=$(meta_field "$dir" rlstale tasktmp)
+  # A crashed earlier spawn of this id left a valid claim naming a root this
+  # relaunch never allocated and metadata never owned. Reusing the trusted
+  # recorded root mints no claim of its own, so this leftover must not be
+  # mistaken for one and must not cost the task its replacement agent.
+  stale_root=/tmp/fm-rlstale.stale$RL_TMP_NONCE
+  claim=$dir/home/state/rlstale.tasktmp-claim
+  printf 'version=1\nid=rlstale\nnonce=stale%s\npath=%s\nphase=pending\ncreated=%s\n' \
+    "$RL_TMP_NONCE" "$stale_root" '2026-01-01T00:00:00Z' > "$claim"
+  chmod 600 "$claim"
+  out=$(run_control "$dir" rlstale relaunch --note "a stale claim must not strand this task"); rc=$?
+  expect_code 0 "$rc" "a leftover claim for another root must not block the replacement"$'\n'"$out"
+  assert_contains "$out" "relaunched rlstale harness=claude from=claude" "the replacement should still be reported"
+  [ "$(meta_field "$dir" rlstale tasktmp)" = "$recorded_root" ] \
+    || fail "the leftover claim displaced the recorded trusted root"
+  assert_grep "export GOTMPDIR=$recorded_root/gotmp" "$dir/fake/keys" \
+    "the replacement did not export the recorded trusted root"
+  assert_grep "encode launch-brief" "$dir/fake/literal" "the replacement should have been launched"
+  case "$out" in
+    *"could not take ownership"*) fail "the leftover claim was mistaken for this relaunch's own claim" ;;
+  esac
+  [ ! -e "$stale_root" ] && [ ! -L "$stale_root" ] \
+    || fail "the relaunch created the leftover claim's root"
+  # Ordinary crash-remnant reconciliation under the spawn lock, not an ownership
+  # transfer, is what clears a claim no metadata owns.
+  [ ! -e "$claim" ] \
+    || fail "the leftover claim was left to wedge the next allocation for this id"
+  [ -d "$recorded_root/gotmp" ] || fail "the relaunch removed the reused recorded root"
+  pass "fm-control relaunch: a leftover claim naming another root is left to startup, not fatal"
+}
+
 test_relaunch_preserves_durable_task_metadata() {
   local dir out rc
   dir=$(new_case durable-meta rl19)
@@ -1564,6 +1599,7 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_legacy_tasktmp_relaunch_reuses_the_grandfathered_root
 test_relaunch_restores_a_vanished_gotmp_child_and_keeps_the_root
+test_relaunch_over_a_foreign_leftover_claim_still_replaces_the_agent
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
 test_disabled_relaunch_clears_prior_trace_context
