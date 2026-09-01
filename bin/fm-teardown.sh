@@ -91,8 +91,12 @@
 # before preserving the route for retry. Teardown then discards child work, kills
 # child runtime endpoints, and removes the retired home. Removing a leased home
 # releases its durable treehouse lease so the pool slot is freed,
-# never left leased forever. If the treehouse return fails, teardown leaves the
-# leased home and state in place instead of hiding a still-held lease.
+# never left leased forever. A return that does not confirm the release leaves
+# the leased home and its records in place instead of hiding a still-held lease,
+# and parks that home's claim retirement like every other unconfirmed outcome
+# above, so a rerun refuses until the manual drill reconciles it. An unconfirmed
+# child worktree return stops the forced cleanup the same way, with that child's
+# records retained and no second destructive path allowed to retry its removal.
 # Usage: fm-teardown.sh <task-id> [--force]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
