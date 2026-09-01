@@ -31,7 +31,8 @@
 #   2. bootstrap      - home-local stale Herdr projection cleanup runs only
 #                       when this session actually holds the lock. Detect-only
 #                       diagnostics always run. Bootstrap's seven MUTATING sweeps
-#                       (same-home backlog reconciliation,
+#                       (task temporary-root reconciliation, same-home backlog
+#                       reconciliation,
 #                       secondmate convergence, secondmate liveness, pending remote
 #                       handoff retry, X-mode artifact writes, fleet sync) also run only when
 #                       locked; the four network sweeps run in the deferred
@@ -112,7 +113,9 @@
 # go dark. So on refusal, bootstrap still runs (in FM_BOOTSTRAP_DETECT_ONLY=1
 # mode) for its local read-only detect lines - missing tools, the worktree-tangle
 # check, the harness override, crew-dispatch validation, tasks-axi and quota-axi
-# tool checks, and tasks-axi availability - none of which mutate shared state
+# tool checks, tasks-axi availability, and the report-only pass over pending
+# task temporary-root claims and unsafe recorded roots - none of which mutate
+# shared state
 # and all of which are safe to compute without verified lock ownership.
 # It deliberately skips the network-only GitHub-auth probe because a read-only
 # session has no dispatch, spawn, steer, or merge action for that verdict to gate.

@@ -2524,11 +2524,6 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
 fi
 
-# Go does not create GOTMPDIR itself.
-# The claimed and validated gotmp child was created before endpoint allocation;
-# this harness-independent export remains the targeted knob because TMPDIR would
-# affect every child program rather than only Go builds.
-
 # Per-harness turn-end hook where enabled: a file that touches
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
 # and token pointers stay out of git's view so they never block teardown's dirty
@@ -3095,6 +3090,10 @@ spawn_record_traceparent() {
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
+# Go does not create GOTMPDIR itself, so the claimed root's gotmp child was
+# created and validated above, before any endpoint existed. GOTMPDIR (not
+# TMPDIR) stays the targeted knob: TMPDIR would redirect every child program's
+# temp, not just Go's.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped

@@ -26,8 +26,8 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `BACKEND_INVALID: <name> (known: <names>)` - the resolved runtime backend has no verified dependency or lifecycle contract, so do not dispatch work until the invalid `FM_BACKEND` or `config/backend` value is corrected to one of the listed backends.
 - `TASKTMP_RECONCILE: <id>: <detail>` - a pending temporary-root claim or an unsafe recorded root could not be reconciled automatically.
   Do not relaunch or clean up that task until the named path is inspected outside Firstmate and made safe or removed by the operator; never chmod, traverse, adopt, or delete a path the diagnostic reports as unsafe.
-  A read-only session's pending-claim line means only the session holding the fleet lock may run the reconciliation; do not mutate it from the read-only session.
-  A claim an active spawn still owns is reported as an ordinary `BOOTSTRAP_INFO:` fact instead and needs no handling at all.
+  A read-only session's pending-claim line means only the session holding the fleet lock may run the reconciliation; do not mutate it from the read-only session, and a claim an active spawn still owns is reported there as an ordinary `BOOTSTRAP_INFO:` fact that needs no handling at all.
+  A locked session instead reports a claim an active spawn still holds as `TASKTMP_RECONCILE: <id>: pending task temporary claim is still owned by an active spawn`, which names no unsafe path and needs no operator: another spawn holds that task's lock right now, so leave it and let a later session start reconcile anything it leaves behind.
 - `NEEDS_GH_AUTH` - ask the captain to run `! gh auth login` (interactive; you cannot run it for them).
   This probe now arrives from the deferred network stage, so it is also how an unreachable network shows up: `gh` cannot validate its token offline and reports the same failure. Confirm reachability before asking the captain to re-authenticate a credential that may be fine.
 - `NETWORK_CHECKS: <what did not complete>; rerun <command>` - the deferred network stage itself could not finish, so the checks it names are simply unknown, not failed.
