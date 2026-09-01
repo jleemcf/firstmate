@@ -1363,8 +1363,9 @@ cleanup_stale_lock_for_safety_check() {
 
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
 # stale git index.lock left by a killed crew process. See the script header.
-# The wrapper proves ownership again at the provider boundary, clears the claim
-# before Treehouse can recycle the slot, and restores it on every failed return.
+# The wrapper proves ownership again at the provider boundary and clears the
+# claim before Treehouse can recycle the slot. Any unconfirmed return parks the
+# retirement for deliberate manual recovery; nothing restores automatically.
 treehouse_return_once() {  # <worktree> <project>
   local dir=$1 cd_dir=$2
   (CDPATH='' cd -- "$cd_dir" && treehouse return --force "$dir")
@@ -1449,12 +1450,13 @@ teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-
 # Every claim-retiring provider operation has one shape: prove ownership unless
 # the caller already did under the same locks, retire the exact claim the
 # operation is about to make reusable, run the provider operation, then release
-# the retirement on success or restore it on failure with the provider's own
-# return code preserved. FM_WORKTREE_RETIREMENT_UNRECORDED from the release
-# reaches the caller unchanged, because a released path with an unrecorded
-# retirement is not a failed operation.
+# only on confirmed success. Every other outcome parks the retirement, refuses
+# further destructive action, and requires deliberate manual recovery.
+# FM_WORKTREE_RETIREMENT_UNRECORDED from a confirmed release reaches the caller
+# unchanged, because a released path with an unrecorded retirement is not a
+# failed provider operation.
 teardown_claimed_provider_op() {  # <state> <task-id> <meta> <expected-path> <prove:0|1> <command...>
-  local claim_state=$1 claim_id=$2 claim_meta=$3 expected=$4 prove=$5 rc
+  local claim_state=$1 claim_id=$2 claim_meta=$3 expected=$4 prove=$5
   shift 5
   if [ "$prove" = 1 ]; then
     fm_worktree_ownership_prove "$claim_state" "$claim_id" "$claim_meta" || return 1
@@ -1465,11 +1467,12 @@ teardown_claimed_provider_op() {  # <state> <task-id> <meta> <expected-path> <pr
   if "$@"; then
     fm_worktree_claim_retire_release
     return $?
-  else
-    rc=$?
   fi
-  fm_worktree_claim_retire_restore || return 1
-  return "$rc"
+  fm_worktree_claim_retire_abandon || true
+  # The provider's detailed error is already printed, but no caller may treat a
+  # special provider rc as permission to try a different destructive fallback
+  # after the ownership retirement has parked.
+  return 1
 }
 
 # The branch is no longer anyone's ownership evidence once the proof has run and

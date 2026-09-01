@@ -1791,7 +1791,7 @@ EOF
 }
 
 test_secondmate_teardown_refuses_failed_leased_home_return() {
-  local home subhome subhome_abs fakebin log fmroot err rc sweep_log rearm_log backup
+  local home subhome subhome_abs fakebin log fmroot err rc sweep_log rearm_log
   home="$TMP_ROOT/teardown-return-fail-home"
   subhome="$TMP_ROOT/teardown-return-fail-subhome"
   fmroot="$TMP_ROOT/teardown-return-fail-fmroot"
@@ -1837,21 +1837,11 @@ EOF
   grep -Fx "$subhome_abs" "$rearm_log" >/dev/null || fail "failed leased-home return did not rearm restored process-event sources"
   [ -e "$home/state/domain.meta" ] || fail "teardown cleared meta after leased home return failed"
   grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null || fail "teardown removed registry route after leased home return failed"
-
-  set +e
-  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-return-fail-fake/pane.txt" \
-    FM_FAKE_PROCEVENT_SWEEP_LOG="$sweep_log" FM_FAKE_PROCEVENT_REARM_LOG="$rearm_log" \
-    FM_FAKE_TREEHOUSE_RETURN_FAIL=1 FM_FAKE_PROCEVENT_REARM_FAIL=1 \
-    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"
-  rc=$?
-  set -e
-
-  [ "$rc" -eq 4 ] || fail "failed process-event restoration did not return its distinct recoverable status"
-  grep -F 'active waits may remain retired; recover registrations from ' "$err" >/dev/null || fail "failed process-event restoration did not report its recovery backup"
-  backup=$(find "$TMP_ROOT" -maxdepth 1 -type d -name '.fm-procevent-restore.*' \
-    -exec test -e '{}/source.source' \; -print -quit)
-  [ -n "$backup" ] && [ -e "$backup/source.source" ] || fail "failed process-event restoration did not retain its registration backup"
-  pass "secondmate teardown refuses to hide failed leased-home return"
+  grep -F 'Manual recovery drill:' "$err" >/dev/null \
+    || fail "failed leased-home return did not park ownership with deliberate recovery"
+  ! grep -q '^worktree=' "$home/state/domain.meta" \
+    || fail "failed leased-home return automatically restored the home claim"
+  pass "secondmate teardown restores process events but parks ownership after a failed leased-home return"
 }
 
 # Returning a leased home hands the slot back, so the record loses its claim on
@@ -2223,88 +2213,6 @@ EOF
   grep -F 'kill-window -t =firstmate:=fm-child' "$log" >/dev/null || fail "force teardown did not kill child window"
   grep -F 'kill-window -t =firstmate:=fm-domain' "$log" >/dev/null || fail "force teardown did not kill parent window"
   pass "secondmate force teardown discards child work"
-}
-
-# A child copy whose pool return fails for a reason that is not a git lock falls
-# back to removing that copy directly. The fallback can succeed while the
-# retirement it performed cannot be written down, which is a released path with
-# quarantined evidence - not a failed removal - so forced cleanup must warn and
-# carry on rather than abandon the rest of the secondmate teardown.
-test_secondmate_force_teardown_warns_on_unrecorded_child_retirement() {
-  local home subhome childproj childwt fakebin log err rc real_mv
-  home="$TMP_ROOT/child-unrecorded-home"
-  subhome="$TMP_ROOT/child-unrecorded-subhome"
-  childproj="$subhome/projects/alpha"
-  childwt="$TMP_ROOT/child-unrecorded-worktree"
-  err="$TMP_ROOT/child-unrecorded.err"
-  mkdir -p "$home/state" "$home/data" "$subhome/state"
-  fm_git_worktree "$childproj" "$childwt" fm/child
-  printf 'domain\n' > "$subhome/.fm-secondmate-home"
-  cat > "$home/state/domain.meta" <<EOF
-window=firstmate:fm-domain
-worktree=$subhome
-project=$subhome
-harness=echo
-kind=secondmate
-mode=secondmate
-yolo=off
-home=$subhome
-projects=alpha
-EOF
-  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
-  cat > "$subhome/state/child.meta" <<EOF
-window=firstmate:fm-child
-worktree=$childwt
-project=$childproj
-harness=echo
-kind=ship
-mode=no-mistakes
-yolo=off
-EOF
-  fakebin=$(make_fake_tmux "$TMP_ROOT/child-unrecorded-fake")
-  log="$TMP_ROOT/child-unrecorded-fake/tmux.log"
-  # The pool refuses the return for a reason that is not a git lock, so cleanup
-  # falls back to removing the child copy itself.
-  cat > "$fakebin/treehouse" <<'SH'
-#!/usr/bin/env bash
-set -u
-if [ "${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
-echo 'pool unavailable' >&2
-exit 1
-SH
-  chmod +x "$fakebin/treehouse"
-  # Only the child's receipt cannot be installed, the way a state filesystem out
-  # of space would fail it once the removal has already succeeded.
-  real_mv=$(command -v mv)
-  cat > "$fakebin/mv" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    *.child.meta.worktree-retired)
-      echo "mv: cannot move to '\$arg': No space left on device" >&2
-      exit 1
-      ;;
-  esac
-done
-exec "$real_mv" "\$@"
-EOF
-  chmod +x "$fakebin/mv"
-
-  set +e
-  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
-    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-unrecorded-fake/pane.txt" \
-    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
-  rc=$?
-  set -e
-  [ ! -d "$childwt" ] \
-    || fail "the fixture never removed the child copy this case is about: $(cat "$err")"
-  [ "$rc" -eq 0 ] \
-    || fail "forced cleanup abandoned a secondmate teardown whose child copy was removed: $(cat "$err")"
-  grep -F 'was removed, but its retirement could not be recorded' "$err" >/dev/null \
-    || fail "forced cleanup never warned that the child retirement went unrecorded: $(cat "$err")"
-  [ ! -e "$home/state/domain.meta" ] || fail "forced cleanup left the parent record behind"
-  [ ! -d "$subhome" ] || fail "forced cleanup left the retired secondmate home behind"
-  pass "an unrecorded child retirement warns instead of abandoning forced cleanup"
 }
 
 test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove() {
@@ -3390,7 +3298,6 @@ test_secondmate_teardown_removes_plain_clone_home_without_treehouse_return
 test_secondmate_teardown_refuses_a_home_its_proof_never_covered
 test_secondmate_force_teardown_discards_child_work
 test_secondmate_force_teardown_keeps_a_child_record_it_could_not_remove
-test_secondmate_force_teardown_warns_on_unrecorded_child_retirement
 test_secondmate_force_teardown_preserves_child_on_unproven_lock
 test_secondmate_force_teardown_allows_non_state_operational_dir_symlinks_inside_home
 test_secondmate_force_teardown_refuses_operational_dir_symlink_outside_home

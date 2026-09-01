@@ -389,12 +389,12 @@ fm_backend_endpoint_atom_valid() {  # <value>
 # the retirement is RECORDED decides the story, not which namespace the copy
 # happens to sit in: a recorded retirement - by receipt, by quarantined released
 # evidence, or because the slot proved it had moved on - means this record holds
-# no path at all and every surviving copy is evidence only. Only an unrecorded
-# retirement leaves the provider outcome open, and even then the copy is never
-# advertised as a claim to put back unexamined, because a released path can
-# already belong to another task.
+# no path at all and every surviving copy is evidence only. An unrecorded
+# retirement parks instead: no runtime path restores it, and the same manual
+# drill printed by ownership proof names the preserved state and deliberate
+# reconciliation steps.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
-  local meta=$1 backup evidence pair= retired=1
+  local meta=$1 backup evidence retired=1
   if declare -F fm_worktree_retirement_receipt_present >/dev/null 2>&1 \
     && fm_worktree_retirement_receipt_present "$meta" >/dev/null 2>&1; then
     retired=0
@@ -412,10 +412,11 @@ fm_backend_report_worktree_claim_backup() {  # <meta-file>
     echo "This record's retirement is recorded, so it holds no worktree and the superseded copy at $backup names a path it no longer owns; it is evidence only and must never be restored over the record." >&2
     return 0
   fi
-  if declare -F fm_worktree_marker_backup_clause >/dev/null 2>&1; then
-    pair=$(fm_worktree_marker_backup_clause "$meta" 2>/dev/null) || pair=
+  if declare -F fm_worktree_interrupted_retirement_manual_drill >/dev/null 2>&1; then
+    echo "An interrupted worktree retirement is parked.$(fm_worktree_interrupted_retirement_manual_drill "$meta")" >&2
+  else
+    echo "An interrupted worktree retirement is parked at $backup; automatic restoration is disabled, so preserve the copy and reconcile the provider outcome manually before any lifecycle action." >&2
   fi
-  echo "An interrupted worktree claim retirement left the recorded claim at $backup; confirm the provider did NOT release that path before restoring it, since a released path may already belong to another task.$pair" >&2
 }
 
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id> [allow-retired]
