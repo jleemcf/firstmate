@@ -852,8 +852,13 @@ spawn_abort_cleanup() {
             echo "effort=${EFFORT:-default}"
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-            [ -z "${SPAWN_GEN:-}" ] || echo "spawn_gen=$SPAWN_GEN"
-            [ "$KIND" = secondmate ] || echo "task_owner_marker=1"
+            # The awareness bit is only ever emitted with the generation it
+            # binds: a record promising a marker but naming no generation can
+            # never prove which stamp it means.
+            if [ -n "${SPAWN_GEN:-}" ]; then
+              echo "spawn_gen=$SPAWN_GEN"
+              [ "$KIND" = secondmate ] || echo "task_owner_marker=1"
+            fi
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
           } > "$SPAWN_META_TMP" 2>/dev/null \
             && fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE" \

@@ -2788,22 +2788,17 @@ cleanup_firstmate_home_children() {
         "$child_wt/.opencode/plugins/fm-busy-state.js" \
         "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       if [ -n "$child_proj" ] && [ -d "$child_proj" ] && command -v treehouse >/dev/null 2>&1; then
-        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" "" \
-            "$sub_state" "$child_id" "$child_meta"; then
-          :
-        else
-          child_return_rc=$?
-          if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
-            return "$child_return_rc"
-          fi
-          if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
-            echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
-          else
-            teardown_child_release_rc4_tolerant \
-              "child worktree $child_wt was removed, but its retirement could not be recorded" \
-              teardown_safe_rm_child_worktree_claimed \
-              "$sub_state" "$child_id" "$child_meta" "$child_wt" "$child_proj" || return 1
-          fi
+        child_return_rc=0
+        teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" "" \
+          "$sub_state" "$child_id" "$child_meta" || child_return_rc=$?
+        if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
+          echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
+        elif [ "$child_return_rc" -ne 0 ]; then
+          # A return that did not confirm the release parked this child's
+          # retirement, so no second destructive path may retry it - the lock
+          # may belong to a live process and the claim is no longer provable.
+          echo "error: treehouse return failed for child worktree $child_wt; its retirement is parked and no other removal may retry it" >&2
+          return 1
         fi
       else
         teardown_child_release_rc4_tolerant \

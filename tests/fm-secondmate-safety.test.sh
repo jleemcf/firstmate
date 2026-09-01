@@ -2361,6 +2361,8 @@ SH
   [ -d "$subhome" ] || fail "force teardown removed subhome after child lock refusal"
   [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta after child lock refusal"
   grep -F 'not provably stale' "$err" >/dev/null || fail "force teardown did not explain unproven child lock refusal"
+  grep -F 'no other removal may retry it' "$err" >/dev/null \
+    || fail "force teardown did not refuse every destructive retry after the child lock refusal"
   pass "secondmate force teardown preserves child worktree after unproven lock refusal"
 }
 
