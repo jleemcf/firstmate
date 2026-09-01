@@ -222,6 +222,29 @@ stamp_owner_marker() {
   } > "$wt/.fm-task-owner"
 }
 
+# A pool return that hands the slot to another task and then reports failure:
+# task-b's marker is in the slot before the failure surfaces, which is the only
+# state a completed handover can produce. Records the exact bytes task-b wrote
+# at $case_dir/task-b-marker.expected so a caller can prove they were untouched.
+# Args: case_dir
+reissue_slot_to_task_b_then_fail() {
+  local case_dir=$1
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=task-b'
+    printf '%s\n' 'spawn_gen=test-generation-task-b'
+  } > "$case_dir/task-b-marker.expected"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'return called\n' >> "$case_dir/treehouse.log"
+cp -- "$case_dir/task-b-marker.expected" "$case_dir/wt/.fm-task-owner"
+echo 'return failed after the pool handed the slot on' >&2
+exit 1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
 # The durable ownership record fm-spawn publishes before it stamps a slot's
 # owner marker; bin/fm-worktree-ownership-lib.sh owns this path and its format.
 # A prior generation makes it a generation handoff: the record of one exact
@@ -1852,37 +1875,89 @@ EOF
 # must never put this task's marker over the marker of whoever holds it now.
 test_failed_return_never_overwrites_a_reissued_slots_marker() {
   local case_dir rc
-  local -a claim_backups
+  local -a claim_evidence
   case_dir=$(make_case failed-return-foreign-marker)
   write_meta "$case_dir" no-mistakes ship
   stamp_owner_marker "$case_dir/wt" task-x1
-  cat > "$case_dir/fakebin/treehouse" <<EOF
-#!/usr/bin/env bash
-if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
-{
-  printf '%s\n' 'schema=fm-task-owner.v1'
-  printf '%s\n' 'task_id=task-b'
-  printf '%s\n' 'spawn_gen=test-generation-task-b'
-} > "$case_dir/wt/.fm-task-owner"
-echo 'return failed after the pool handed the slot on' >&2
-exit 1
-EOF
-  chmod +x "$case_dir/fakebin/treehouse"
+  reissue_slot_to_task_b_then_fail "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "failed-return-foreign-marker: a failed return must stop teardown"
-  assert_grep "task_id=task-b" "$case_dir/wt/.fm-task-owner" \
-    "failed-return-foreign-marker: the rollback overwrote the marker of the task now holding the slot"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "failed-return-foreign-marker: the rollback rewrote the marker of the task now holding the slot"
   assert_present "$case_dir/state/task-x1.meta" \
     "failed-return-foreign-marker: a failed return discarded the task record"
   assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
     "failed-return-foreign-marker: the record was pointed back at a slot another task now marks"
-  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
-  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
-    "failed-return-foreign-marker: the refused rollback left no recoverable copy of the claim"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_evidence[0]}" \
+    "failed-return-foreign-marker: the refused rollback kept no evidence of what the record held"
   pass "a failed pool return never restores this task's marker over another task's"
+}
+
+# The provider's own call failed, but the slot's marker positively names another
+# task, which only a completed handover can produce. That proof outranks the
+# failure: this record's authority over the path is retired rather than left
+# open, and neither copy may be offered as something to put back - restoring
+# them would stamp task-x1 over the task live in the slot and let its next
+# teardown hard-reset that worktree.
+test_reissued_slot_retires_the_record_as_inert_evidence() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence marker_evidence
+  case_dir=$(make_case reissued-slot-evidence)
+  write_meta "$case_dir" no-mistakes ship
+  stamp_owner_marker "$case_dir/wt" task-x1
+  reissue_slot_to_task_b_then_fail "$case_dir"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "reissued-slot-evidence: a failed return must stop teardown"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "reissued-slot-evidence: a slot that moved on still offers its claim as restorable"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "reissued-slot-evidence: a slot that moved on still offers its owner marker as restorable"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_evidence[0]}" \
+    "reissued-slot-evidence: the claim was not kept as evidence of what the record held"
+  marker_evidence=("$case_dir/state"/.task-x1.meta.task-owner-released.*)
+  assert_grep "task_id=task-x1" "${marker_evidence[0]}" \
+    "reissued-slot-evidence: the retired owner marker was not kept as evidence"
+  assert_grep "no restore was attempted" "$case_dir/stderr" \
+    "reissued-slot-evidence: the refusal never said restoration was not attempted"
+  assert_grep "task task-b" "$case_dir/stderr" \
+    "reissued-slot-evidence: the refusal never named the task the slot moved to"
+  assert_no_grep "put both halves back" "$case_dir/stderr" \
+    "reissued-slot-evidence: the run still advertised restoring the pair over the new owner"
+
+  # The rerun is where the bad advice used to be repeated. The record's
+  # authority is retired, so it finishes its own cleanup without ever resolving
+  # a path - and never re-offers either copy.
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "reissued-slot-evidence: the retired record's rerun should finish"$'\n'"$(cat "$case_dir/stderr2")"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "reissued-slot-evidence: the rerun rewrote the marker of the task holding the slot"
+  assert_grep "must never be restored" "$case_dir/stderr2" \
+    "reissued-slot-evidence: the rerun did not say the surviving copy may never be restored"
+  assert_no_grep "recoverable" "$case_dir/stderr2" \
+    "reissued-slot-evidence: the rerun re-offered a copy of a moved-on slot as recoverable"
+  assert_no_grep "put both halves back" "$case_dir/stderr2" \
+    "reissued-slot-evidence: the rerun re-advertised restoring the pair over the new owner"
+  [ "$(grep -c 'return called' "$case_dir/treehouse.log")" = 1 ] \
+    || fail "reissued-slot-evidence: the rerun returned a slot the pool had already reissued"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "reissued-slot-evidence: the rerun left the retired record behind"
+  assert_absent "${claim_evidence[0]}" \
+    "reissued-slot-evidence: the claim evidence outlived the record it described"
+  assert_absent "${marker_evidence[0]}" \
+    "reissued-slot-evidence: the marker evidence outlived the record it described"
+  pass "a slot proved reissued retires the record and keeps both copies non-restorable"
 }
 
 # The task branch is the record's own ref, not the slot's, so a rerun that skips
@@ -2124,6 +2199,40 @@ EOF
   assert_absent "$stale" \
     "stale-marker-backup: the stale owner-marker copy outlived the record it described"
   pass "a stale owner-marker copy is swept once the task record it described is gone"
+}
+
+# The relaunch side of the same rule. An aborted relaunch that could not put the
+# superseded marker back deliberately keeps its copy and names it, but that copy
+# describes one task record; once that record is gone it is inert clutter with
+# nothing left to recover, and it must not outlive the id it is named for.
+test_aborted_relaunch_prior_marker_copy_is_swept_with_the_record() {
+  local case_dir stale rc
+  case_dir=$(make_case stale-prior-marker)
+  write_meta "$case_dir" no-mistakes ship
+  # Exactly what bin/fm-spawn.sh's stamp rollback leaves behind when the slot's
+  # marker vanished before the aborted relaunch could restore it.
+  stale="$case_dir/state/.task-x1.task-owner-prior.AbC123"
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=task-x1'
+    printf '%s\n' 'spawn_gen=test-generation-task-x1-prior'
+  } > "$stale"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "stale-prior-marker: teardown should complete"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "stale-prior-marker: the fixture never reached the record removal it is about"
+  assert_absent "$stale" \
+    "stale-prior-marker: the aborted relaunch's prior-marker copy outlived its record"
+  pass "an aborted relaunch's prior-marker copy is swept with the record it described"
 }
 
 # Reproduces the operator's remedy for a hung pool return: kill the teardown.
@@ -4157,8 +4266,10 @@ test_pool_return_drops_the_task_branch_from_the_project
 test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
+test_reissued_slot_retires_the_record_as_inert_evidence
 test_failed_marker_restore_names_the_surviving_copy
 test_stale_owner_marker_backup_is_swept_with_the_record
+test_aborted_relaunch_prior_marker_copy_is_swept_with_the_record
 test_interrupted_retirement_keeps_and_names_both_recovery_halves
 test_restored_recovery_pair_lets_the_rerun_finish
 test_vanished_worktree_teardown_keeps_the_task_branch
