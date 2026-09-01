@@ -263,6 +263,98 @@ test_registered_secondmate_summary_survives_argv_ceiling() {
   pass "an oversized registered secondmate summary still aggregates into the fleet snapshot"
 }
 
+# A registered secondmate is sampled by running an external producer - fm-on.sh
+# over ssh for a remote home - whose stdout carries whatever the remote login
+# shell prints. The shim reproduces that at the sampling boundary: the producer
+# still exits 0 while its stdout is prefixed with rc-file noise, is empty, or is
+# a non-object document.
+install_secondmate_summary_shim() {  # <fakebin>
+  local fakebin=$1 real_env
+  real_env=$(command -v env)
+  cat > "$fakebin/env" <<SH
+#!/usr/bin/env bash
+set -u
+for arg in "\$@"; do
+  [ "\$arg" = --secondmate-home-summary ] || continue
+  case "\${FM_TEST_SUMMARY_MODE:-}" in
+    banner)
+      printf 'bash: /etc/bashrc: line 1: warning\\n'
+      exec "$real_env" "\$@"
+      ;;
+    empty) exit 0 ;;
+    document)
+      printf '%s' "\${FM_TEST_SUMMARY_OUTPUT:-}"
+      exit 0
+      ;;
+  esac
+done
+exec "$real_env" "\$@"
+SH
+  chmod +x "$fakebin/env"
+}
+
+test_unusable_secondmate_summary_degrades_that_home_only() {
+  local home mate fakebin out mode oversized
+  home=$(make_home degraded-mate-parent)
+  mate="$TMP_ROOT/degraded-mate-home"
+  seed_secondmate_home "$mate" degraded-mate 3
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$home/data/backlog.md"
+  printf -- '- degraded-mate - synthetic scope (home: %s; scope: sample reviews; projects: sample; added 2026-07-14)\n' \
+    "$mate" > "$home/data/secondmates.md"
+  fm_write_secondmate_meta "$home/state/degraded-mate.meta" "$mate"
+  printf 'working: watching delegated scope\n' > "$home/state/degraded-mate.status"
+  fakebin=$(make_fakebin "$home")
+  install_secondmate_summary_shim "$fakebin"
+
+  out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    "$SNAPSHOT" --json) \
+    || fail "snapshot failed sampling a clean secondmate summary"
+  printf '%s' "$out" | jq -e '
+    (.secondmate_current.records | length) == 1
+      and .secondmate_current.records[0].provenance.selected == "structured-home"
+      and .secondmate_current.records[0].current.state != "unknown"
+      and .secondmate_current.records[0].counts.landed == 3
+  ' >/dev/null || fail "the secondmate fixture did not sample cleanly: $out"
+
+  for mode in banner empty document; do
+    out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+      FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+      FM_TEST_SUMMARY_MODE="$mode" FM_TEST_SUMMARY_OUTPUT='["not an object"]' \
+      "$SNAPSHOT" --json) \
+      || fail "snapshot aborted the whole fleet on a $mode secondmate summary"
+    printf '%s' "$out" | jq -e '
+      .schema == "fm-fleet-snapshot.v1"
+        and (.backlog | type) == "object"
+        and (.secondmate_current.records | length) == 1
+        and .secondmate_current.records[0].id == "degraded-mate"
+        and .secondmate_current.records[0].current.state == "unknown"
+        and (.secondmate_current.records[0].current.reason | type) == "string"
+        and .secondmate_current.records[0].provenance.selected != "structured-home"
+        and .secondmate_current.records[0].invalidity == null
+        and .secondmate_current.records[0].reconcile_inventory == null
+        and .secondmate_current.records[0].counts.landed == 0
+        and (.secondmate_landed.records | length) == 0
+    ' >/dev/null || fail "a $mode secondmate summary did not degrade to an unknown record: $out"
+  done
+
+  oversized=$(printf '["%s"]' "$(printf 'x%.0s' $(seq 1 200))")
+  out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    FM_SNAPSHOT_SECONDMATE_MAX_BYTES=64 \
+    FM_TEST_SUMMARY_MODE=document FM_TEST_SUMMARY_OUTPUT="$oversized" \
+    "$SNAPSHOT" --json) \
+    || fail "snapshot aborted the whole fleet on an oversized secondmate summary"
+  printf '%s' "$out" | jq -e '
+    (.secondmate_current.records | length) == 1
+      and .secondmate_current.records[0].current.state == "unknown"
+      and .secondmate_current.records[0].current.reason == "structured home snapshot exceeded byte limit"
+      and .secondmate_current.records[0].reconcile_inventory == null
+      and (.secondmate_landed.unreadable | length) == 1
+  ' >/dev/null || fail "an oversized secondmate summary did not degrade to an unknown record: $out"
+  pass "an unusable secondmate summary degrades that home instead of the whole fleet snapshot"
+}
+
 # Scout reports accumulate monotonically and carry no FM_SNAPSHOT_* bound, so
 # their projection has to reach the final assembly without argv.
 test_many_scout_reports_survive_argv_ceiling() {
@@ -1115,6 +1207,7 @@ EOF
 test_empty_fleet_json
 test_large_backlog_snapshot_view_and_summary_publication
 test_registered_secondmate_summary_survives_argv_ceiling
+test_unusable_secondmate_summary_degrades_that_home_only
 test_many_scout_reports_survive_argv_ceiling
 test_lost_producer_output_fails_loudly_and_cleans_up
 test_fixture_snapshot_json

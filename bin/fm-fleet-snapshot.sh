@@ -1554,6 +1554,7 @@ secondmate_current_json() {  # <parent-tasks-json-file>
       fi
     fi
 
+    [ "$summary_sampled" = true ] || summary='{}'
     printf '%s' "$summary" > "$summary_file" || return 1
 
     if [ -z "$reason" ]; then
