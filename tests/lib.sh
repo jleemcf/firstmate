@@ -86,10 +86,14 @@ FM_TEST_OWNER_IDENTITY=$(fm_test_pid_identity "$$") || {
 fm_test_cleanup_tasktmp_roots() {  # <fixture-root>
   local fixture=$1
   [ -d "$fixture" ] || return 0
-  # Task roots are recorded only in a home's state/<id>.meta, so prune the walk
-  # to those directories rather than crawling fixtures that hold real clones and
+  # Task roots are recorded only in a home's task metadata, so prune the walk to
+  # state directories rather than crawling fixtures that hold real clones and
   # worktrees, and source the shared owner once for the whole sweep.
-  find "$fixture" -type d -name state -prune -exec find {} -maxdepth 1 -type f -name '*.meta' -print \; 2>/dev/null \
+  # The inner walk stays unbounded inside each state directory because a
+  # remote-routed second mate records its metadata one level down at
+  # state/<route>/<id>.meta, and an unswept record leaks a fresh unpredictable
+  # /tmp/fm-<id>.<nonce> root on every run.
+  find "$fixture" -type d -name state -prune -exec find {} -type f -name '*.meta' -print \; 2>/dev/null \
     | (
         local_meta=
         . "$ROOT/bin/fm-tasktmp-lib.sh"
