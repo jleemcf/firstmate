@@ -854,7 +854,13 @@ spawn_abort_cleanup() {
   # Orca recovery metadata is intentionally durable even though ordinary
   # fresh metadata has not reached the spawn commit point.
   # Mark that exceptional transfer before generic claim reconciliation.
-  if [ -n "${ID:-}" ] \
+  # Both blocks below require this process to still hold the per-task spawn
+  # lock: bin/fm-tasktmp-lib.sh makes that lock the sole authority over a
+  # claim, so an exit that never took it - a refused concurrent spawn, a
+  # backend refusal - must leave another spawn's live claim and root alone and
+  # let locked startup own any genuinely unowned leftover.
+  if [ "$SPAWN_TASK_LOCK_HELD" = 1 ] \
+     && [ -n "${ID:-}" ] \
      && [ "$(fm_meta_get "$STATE/$ID.meta" cleanup_recovery 2>/dev/null || true)" = orca ] \
      && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
     if ! fm_tasktmp_claim_mark_committed "$STATE" "$ID"; then
@@ -866,7 +872,8 @@ spawn_abort_cleanup() {
   # claim still owns the root.
   # Reconcile while the same per-task spawn lock is still held, so an aborted
   # pre-publication spawn cannot leak an unowned root or race startup cleanup.
-  if [ -n "${ID:-}" ] \
+  if [ "$SPAWN_TASK_LOCK_HELD" = 1 ] \
+     && [ -n "${ID:-}" ] \
      && { [ -e "$STATE/$ID.tasktmp-claim" ] || [ -L "$STATE/$ID.tasktmp-claim" ]; }; then
     if ! fm_tasktmp_claim_reconcile_one "$STATE" "$ID"; then
       echo "warning: pending task temporary root for $ID was preserved: $FM_TASKTMP_ERROR" >&2

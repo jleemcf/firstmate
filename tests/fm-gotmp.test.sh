@@ -485,6 +485,52 @@ test_teardown_refusal_is_durably_re_reported_after_the_task_record_is_gone() {
   pass "fm-teardown records a refused root durably and every later startup re-reports it until it is gone"
 }
 
+test_teardown_reports_a_refusal_record_it_could_not_write() {
+  local id="td-norecord-z21-$$" task_tmp target fake state fakebin real_mv out rc inode
+  task_tmp="/tmp/fm-$id"
+  target="$TMP_ROOT/norecord-target"
+  rm -rf -- "$task_tmp" "$target"
+  mkdir -p "$target/gotmp"
+  chmod 0777 "$target" "$target/gotmp"
+  printf 'norecord sentinel\n' > "$target/gotmp/sentinel"
+  ln -s "$target" "$task_tmp"
+  inode=$(tasktmp_lstat_identity "$target")
+  fake=$(make_fake_root "$id" "$task_tmp")
+  state=$fake/state
+  # A full or read-only state directory fails the record's publication rename.
+  fakebin="$TMP_ROOT/norecord-bin"
+  mkdir -p "$fakebin"
+  real_mv=$(command -v mv) || fail "the fixture needs a real mv"
+  cat > "$fakebin/mv" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in *.tasktmp-refused) exit 1 ;; esac
+done
+exec "$real_mv" "\$@"
+SH
+  chmod +x "$fakebin/mv"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "an unrecordable refusal stranded the rest of the teardown: $out"
+  [ ! -e "$state/$id.meta" ] \
+    || fail "the rest of the teardown did not complete"
+  [ ! -e "$state/$id.tasktmp-refused" ] \
+    || fail "the fixture did not actually block the durable record"
+  case "$out" in
+    *"could NOT be recorded for re-reporting"*) ;;
+    *) fail "teardown did not say the refusal is unrecorded: $out" ;;
+  esac
+  case "$out" in
+    *"recorded at $state/$id.tasktmp-refused for re-reporting"*)
+      fail "the completion line promised a record teardown never wrote" ;;
+  esac
+  [ -L "$task_tmp" ] && [ "$(tasktmp_lstat_identity "$target")" = "$inode" ] \
+    || fail "the unrecorded refusal still changed the refused path"
+  grep -qx 'norecord sentinel' "$target/gotmp/sentinel" \
+    || fail "the unrecorded refusal changed the refused path's contents"
+  rm -f -- "$task_tmp"
+  pass "fm-teardown says the refusal is unrecorded rather than promising a record it could not write"
+}
+
 test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
   local state="$TMP_ROOT/parent-state" id="parent-refuse-z12-$$" out rc
   mkdir -p "$state"
@@ -729,6 +775,7 @@ test_entropy_failure_never_falls_back_to_predictable_root
 test_collision_is_refused_without_entering_or_deleting_candidate
 test_teardown_refuses_unsafe_tasktmp_without_touching_it
 test_teardown_refusal_is_durably_re_reported_after_the_task_record_is_gone
+test_teardown_reports_a_refusal_record_it_could_not_write
 test_unresolvable_trusted_parent_refuses_instead_of_allocating
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root
 test_crash_window_preserves_a_recorded_root_that_no_longer_validates

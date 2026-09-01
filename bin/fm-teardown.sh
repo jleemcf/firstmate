@@ -753,6 +753,7 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_TMP_SCAN=$TASK_TMP
 TASK_TMP_REFUSED=
+TASK_TMP_REFUSED_RECORDED=0
 # This teardown removes state/<id>.meta, the only durable carrier of tasktmp=,
 # so a refusal has to leave its own record behind or the untouched path would
 # never be nameable again.
@@ -764,8 +765,12 @@ refuse_task_tmp() {  # <path> <sentence>
   TASK_TMP=
   TASK_TMP_SCAN=
   echo "REFUSED: $sentence" >&2
-  fm_tasktmp_refusal_record "$STATE" "$ID" "$path" "$reason" \
-    || echo "error: the refused task temporary root $path for $ID could not be recorded for re-reporting, so only this run reports it" >&2
+  if fm_tasktmp_refusal_record "$STATE" "$ID" "$path" "$reason"; then
+    TASK_TMP_REFUSED_RECORDED=1
+  else
+    TASK_TMP_REFUSED_RECORDED=0
+    echo "error: the refused task temporary root $path for $ID could not be recorded for re-reporting, so only this run reports it" >&2
+  fi
 }
 if [ -n "$TASK_TMP" ]; then
   fm_tasktmp_trust "$ID" "$TASK_TMP"
@@ -2980,8 +2985,10 @@ fi
 if [ -d "$STATE" ]; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 fi
-if [ -n "$TASK_TMP_REFUSED" ]; then
+if [ -n "$TASK_TMP_REFUSED" ] && [ "$TASK_TMP_REFUSED_RECORDED" = 1 ]; then
   echo "teardown $ID complete (window $T, worktree $WT); its untrusted task temporary root $TASK_TMP_REFUSED was preserved untouched for an operator and recorded at $(fm_tasktmp_refusal_path "$STATE" "$ID") for re-reporting"
+elif [ -n "$TASK_TMP_REFUSED" ]; then
+  echo "teardown $ID complete (window $T, worktree $WT); its untrusted task temporary root $TASK_TMP_REFUSED was preserved untouched for an operator, but that refusal could NOT be recorded for re-reporting, so no later session start will name it again - deal with $TASK_TMP_REFUSED now"
 else
   echo "teardown $ID complete (window $T, worktree $WT)"
 fi
