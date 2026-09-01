@@ -2301,6 +2301,76 @@ EOF
   pass "an unattributable slot leaves both rollback halves exactly where recovery needs them"
 }
 
+# A pre-marker record has no owner marker to retire, so its rollback is the one
+# exit where the restore succeeds having put back the claim alone. That is
+# intentional - there was never a second half - and it has to stay
+# distinguishable from a marker-aware record whose marker went missing, which is
+# the state every other exit exists to refuse. Nothing here may stamp a marker
+# this record never promised, and nothing may add the awareness bit that would
+# make the absent marker fatal to the retry.
+test_legacy_record_rollback_restores_the_claim_without_a_marker() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence marker_evidence
+  case_dir=$(make_case legacy-rollback)
+  write_pre_marker_meta "$case_dir" no-mistakes ship "spawn_gen=pre-upgrade-generation"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "legacy-rollback: the fixture stamped an owner marker a pre-marker slot never had"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+n=\$(cat "$case_dir/treehouse.count" 2>/dev/null || echo 0)
+n=\$((n + 1))
+printf '%s\n' "\$n" > "$case_dir/treehouse.count"
+if [ "\$n" = 1 ]; then
+  echo 'pool busy' >&2
+  exit 1
+fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "legacy-rollback: a failed return must stop teardown"
+  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
+    "legacy-rollback: the rollback did not put the claim back, so the retry lost its path"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "legacy-rollback: the rollback fabricated an owner marker this record never had"
+  assert_no_grep "task_owner_marker" "$case_dir/state/task-x1.meta" \
+    "legacy-rollback: the rollback migrated a pre-marker record onto the marker-aware path"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "legacy-rollback: a marker copy was stashed for a slot that carried no marker"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "legacy-rollback: the claim copy outlived the restore that consumed it"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  [ ! -e "${claim_evidence[0]}" ] \
+    || fail "legacy-rollback: a failed return was recorded as a completed release"
+  marker_evidence=("$case_dir/state"/.task-x1.meta.task-owner-released.*)
+  [ ! -e "${marker_evidence[0]}" ] \
+    || fail "legacy-rollback: a failed return retired a marker that never existed"
+  assert_absent "$case_dir/state/.task-x1.meta.worktree-retired" \
+    "legacy-rollback: a failed return left a retirement receipt behind"
+  assert_no_grep "owner marker could not be" "$case_dir/stderr" \
+    "legacy-rollback: the rollback reported a marker half this record never had"
+
+  # The record came back whole and still legacy, so the retry proves ownership
+  # through the pre-marker chain and finishes normally.
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "legacy-rollback: the retry should complete"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "legacy-rollback: the retry never returned the slot"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "legacy-rollback: the retry stamped an owner marker onto a returned slot"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "legacy-rollback: the retry left the task record behind"
+  pass "a pre-marker record's rollback restores its claim alone and stays usable"
+}
+
 # The other side of that surviving copy: once an operator has restored the
 # marker by hand and a rerun finally removes the authoritative record, the copy
 # describes a record that no longer exists and must not outlive it in state/.
@@ -4496,6 +4566,7 @@ test_reissued_slot_retires_the_record_as_inert_evidence
 test_failed_marker_restore_takes_the_claim_back_out
 test_failed_marker_restore_over_a_reissued_slot_retires_the_record
 test_unattributable_slot_leaves_the_rollback_pair_untouched
+test_legacy_record_rollback_restores_the_claim_without_a_marker
 test_stale_owner_marker_backup_is_swept_with_the_record
 test_aborted_relaunch_prior_marker_copy_is_swept_with_the_record
 test_interrupted_retirement_keeps_and_names_both_recovery_halves
