@@ -65,10 +65,11 @@
 # receipt is, so a rerun still finishes the remaining cleanup, and no consumer
 # can read it as a claim to put back over a path the provider owns again.
 # fm_worktree_claim_retire_restore is therefore reachable only while the
-# provider operation is known to have failed, and puts back both halves. Each
-# half stops being recoverable the moment it is back in place, so a restore that
-# gets the claim in and then fails on the marker leaves exactly one surviving
-# copy - the marker's - and nothing may still name the consumed one.
+# provider operation is known to have failed, and puts back both halves. It
+# never succeeds with one half: a restore that gets the claim in and then fails
+# on the marker takes that claim back out, so the record returns to the exact
+# retirement it came from, with both copies recoverable again, rather than
+# naming a path it can no longer prove.
 # A failed provider call is not the last word on who owns the slot. When the
 # slot's own marker positively names another task or generation, that proof
 # outranks the failure: the provider handed the path on, so nothing is written
@@ -981,8 +982,34 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   return 0
 }
 
+# Takes the worktree= claim out of a record and leaves a byte-for-byte copy of
+# what it said beside it, in the namespace an interrupted retirement's recovery
+# reads back. Prints the copy's path. The record is rewritten by rename, so no
+# reader ever sees one that neither claims a path nor has a copy naming it.
+# Both the start of a retirement and the undo of a half-completed restore need
+# exactly this, and they must produce the same shape or recovery could tell them
+# apart.
+fm_worktree_claim_strip_into_backup() {  # <meta-file>
+  local meta=$1 dir base backup tmp
+  dir=${meta%/*}
+  base=${meta##*/}
+  backup=$(umask 077; mktemp "$dir/.${base}.worktree-claim-backup.XXXXXX") || return 1
+  tmp=$(umask 077; mktemp "$dir/.${base}.worktree-claim-next.XXXXXX") || {
+    rm -f -- "$backup"
+    return 1
+  }
+  if ! cp -p -- "$meta" "$backup" \
+    || ! awk '!/^worktree=/' "$meta" > "$tmp" \
+    || ! chmod 0600 "$tmp" \
+    || ! mv -f -- "$tmp" "$meta"; then
+    rm -f -- "$tmp" "$backup"
+    return 1
+  fi
+  printf '%s' "$backup"
+}
+
 fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
-  local meta=$1 expected=$2 recorded expected_canonical recorded_canonical dir base backup tmp
+  local meta=$1 expected=$2 recorded expected_canonical recorded_canonical dir base backup
   local claim_rc=0 hint released receipt_rc=1
   if [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ]; then
     fm_worktree_refuse "cannot retire worktree claim in $meta because another claim retirement is already active on $FM_WORKTREE_CLAIM_RETIRE_META."
@@ -1031,20 +1058,11 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
     return 1
   fi
   dir=${meta%/*}
-  base=${meta##*/}
-  backup=$(umask 077; mktemp "$dir/.${base}.worktree-claim-backup.XXXXXX") || return 1
-  tmp=$(umask 077; mktemp "$dir/.${base}.worktree-claim-next.XXXXXX") || {
-    rm -f -- "$backup"
-    return 1
-  }
-  if ! cp -p -- "$meta" "$backup" \
-    || ! awk '!/^worktree=/' "$meta" > "$tmp" \
-    || ! chmod 0600 "$tmp" \
-    || ! mv -f -- "$tmp" "$meta"; then
-    rm -f -- "$tmp" "$backup"
+  backup=$(fm_worktree_claim_strip_into_backup "$meta") || {
     fm_worktree_refuse "could not atomically clear task worktree claim in $meta before provider return."
     return 1
-  fi
+  }
+  base=${meta##*/}
   FM_WORKTREE_CLAIM_RETIRE_META=$meta
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=$backup
   FM_WORKTREE_CLAIM_RETIRE_PATH=$expected
@@ -1204,17 +1222,14 @@ fm_worktree_claim_retire_abandon() {
     fi
     return 0
   fi
-  # The claim went back and only its marker did not: the record is whole, so the
-  # marker's copy is the one surviving half and the state that refuses every
-  # later proof is the absent marker, not a claim anyone has to recover.
+  # The claim went back, its marker did not, and the restore could not take the
+  # claim out again either - the only way one authoritative half survives a
+  # restore. The record names a path it cannot prove, so the remedy is to put it
+  # back into a recoverable retirement, never to stamp the slot from this copy.
   if [ -z "$backup" ] && [ -n "$marker_backup" ] && [ -f "$marker_backup" ]; then
     if fm_worktree_marker_names_another_owner "$marker" "$marker_backup"; then
-      # The restored claim now names a slot another task marks, so the one half
-      # still on disk may never go back over it either. Every proof of this
-      # record refuses on that foreign marker, and the copy stops being
-      # something any later diagnostic can offer.
       stash=$(fm_worktree_marker_released_evidence_quarantine "$meta" "$marker_backup") || stash=
-      echo "warning: the worktree claim in $meta was restored, but $marker now marks that slot for another task, so its retired $FM_WORKTREE_TASK_OWNER_MARKER was not put back and never may be; the copy is kept only as evidence at ${stash:-$marker_backup}." >&2
+      echo "warning: the worktree claim in $meta was restored, but $marker now marks that slot for another task, so its retired $FM_WORKTREE_TASK_OWNER_MARKER was not put back and never may be; the copy is kept only as evidence at ${stash:-$marker_backup}. Remove the worktree= line from $meta so the record stops naming a path it cannot own." >&2
       return 0
     fi
     echo "warning: the worktree claim in $meta was restored, but its $FM_WORKTREE_TASK_OWNER_MARKER could not be put back at ${marker:-the recorded worktree}; every lifecycle verb refuses this record until that marker is restored from $marker_backup." >&2
@@ -1257,6 +1272,7 @@ fm_worktree_claim_retire_restore() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
   local marker=$FM_WORKTREE_CLAIM_RETIRE_MARKER
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
+  local path=$FM_WORKTREE_CLAIM_RETIRE_PATH undo
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   # Eligibility is settled before either half moves, so a path that has moved on
   # leaves the retirement whole and open rather than half put back.
@@ -1286,7 +1302,24 @@ fm_worktree_claim_retire_restore() {
   if [ -n "$marker_backup" ]; then
     if [ -d "${marker%/*}" ]; then
       if ! mv -f -- "$marker_backup" "$marker"; then
-        fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker; recover it from $marker_backup."
+        # The claim is already back, so stopping here would publish a record
+        # whose only authoritative half is that claim: it would name a path it
+        # cannot prove, and no verb could ever finish it. Take the claim out
+        # again so the outcome is one whole state - the original pair, still
+        # recoverable, or a retirement of both halves if the slot moved on.
+        undo=$(fm_worktree_claim_strip_into_backup "$meta") || undo=
+        if [ -z "$undo" ]; then
+          fm_worktree_refuse "provider return failed, the worktree owner marker could not be restored to $marker, and the claim this restore had already put back into $meta could not be taken out again; that record now names a path whose $FM_WORKTREE_TASK_OWNER_MARKER exists only at $marker_backup, and nothing may act on it until the two agree - remove the worktree= line from $meta by hand to put it back into a recoverable retirement."
+          return 1
+        fi
+        FM_WORKTREE_CLAIM_RETIRE_BACKUP=$undo
+        if fm_worktree_marker_names_another_owner "$marker" "$marker_backup"; then
+          fm_worktree_claim_retire_moved_on \
+            "provider return failed and the worktree owner marker could not be put back" \
+            "$meta" "$path" "$undo" "$marker" "$marker_backup"
+          return 1
+        fi
+        fm_worktree_refuse "provider return failed and the worktree owner marker could not be restored to $marker, so the claim was taken back out of $meta rather than left there without it; the recoverable pair is the claim at $undo and the $FM_WORKTREE_TASK_OWNER_MARKER at $marker_backup, and both go back together or neither."
         return 1
       fi
     else

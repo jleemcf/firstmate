@@ -1179,12 +1179,17 @@ families_for_changed_path() {
       ;;
     bin/fm-worktree-ownership-lib.sh)
       # The shared proof guards teardown across every provider, both relaunch
-      # entry points, and recursive secondmate cleanup.
+      # entry points, and recursive secondmate cleanup. The last two suites
+      # drive bin/fm-teardown.sh end to end and had to stamp owner markers into
+      # their own fixtures to keep passing, so the proof is load-bearing for
+      # them even though neither is about worktree ownership.
       printf '%s\n' pr-forge
       printf '%s\n' backend-dispatch
       printf '%s\n' orca
       printf '%s\n' zellij
       printf '%s\n' secondmate
+      printf '%s\n' session-bootstrap
+      printf '%s\n' "__script__:fm-public-followup.test.sh"
       ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)

@@ -2131,15 +2131,18 @@ EOF
 # A restore puts the claim back first and the marker second. Once the claim is
 # in, its copy is consumed, so a marker restore that then fails must leave the
 # operator pointed at the copy that still exists - and must not delete it.
-test_failed_marker_restore_names_the_surviving_copy() {
-  local case_dir rc real_mv
-  local -a marker_backups claim_backups
-  case_dir=$(make_case marker-restore-fails)
-  write_meta "$case_dir" no-mistakes ship
+# Installs a real `mv` that refuses exactly the owner marker's restore, so a
+# rollback gets the claim back into the record and then loses the marker. An
+# optional second argument is shell the stub runs before that refusal, so a
+# caller can move the slot on inside the same failure.
+# Args: case_dir [pre-failure-shell]
+fail_only_the_owner_marker_restore() {
+  local case_dir=$1 before=${2:-} real_mv
   real_mv=$(command -v mv)
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
 echo 'return failed' >&2
 exit 1
 EOF
@@ -2148,6 +2151,7 @@ EOF
 for arg in "\$@"; do
   case "\$arg" in
     */.fm-task-owner)
+      $before
       echo 'mv: simulated failure putting the owner marker back' >&2
       exit 1 ;;
   esac
@@ -2155,26 +2159,146 @@ done
 exec "$real_mv" "\$@"
 EOF
   chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/mv"
+}
+
+# A rollback that gets the claim back in and then cannot put the marker back has
+# restored one authoritative half of a pair. Leaving it there would publish a
+# record naming a path it can no longer prove - no verb could act on it and none
+# could finish it - so the claim comes back out and the retirement returns to
+# the recoverable pair it started as.
+test_failed_marker_restore_takes_the_claim_back_out() {
+  local case_dir rc
+  local -a marker_backups claim_backups
+  case_dir=$(make_case marker-restore-fails)
+  write_meta "$case_dir" no-mistakes ship
+  fail_only_the_owner_marker_restore "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "marker-restore-fails: a failed return must stop teardown"
-  assert_grep "worktree=$case_dir/wt" "$case_dir/state/task-x1.meta" \
-    "marker-restore-fails: the claim was not put back, so the retry lost its path"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "marker-restore-fails: the failed rollback discarded the task record"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "marker-restore-fails: the record kept a claim it has no marker to prove"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
+    "marker-restore-fails: taking the claim back out left no recoverable copy of it"
   marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
-  [ -f "${marker_backups[0]}" ] \
-    || fail "marker-restore-fails: the only surviving copy of the owner marker was deleted"
   assert_grep "task_id=task-x1" "${marker_backups[0]}" \
-    "marker-restore-fails: the surviving copy is not this task's marker"
-  assert_grep "restored from ${marker_backups[0]}" "$case_dir/stderr" \
-    "marker-restore-fails: the abandon diagnostic never named the copy that still exists"
-  assert_no_grep "recoverable claim is at" "$case_dir/stderr" \
-    "marker-restore-fails: the diagnostic named a claim backup the restore already consumed"
+    "marker-restore-fails: the marker half of the recoverable pair was lost"
+  assert_grep "${claim_backups[0]}" "$case_dir/stderr" \
+    "marker-restore-fails: the diagnostic never named the claim half of the pair"
+  assert_grep "${marker_backups[0]}" "$case_dir/stderr" \
+    "marker-restore-fails: the diagnostic never named the marker half of the pair"
+
+  # The pair is whole, so the operator's recovery is the ordinary one and the
+  # rerun proves ownership again.
+  cp -p "${claim_backups[0]}" "$case_dir/state/task-x1.meta"
+  rm -f "${claim_backups[0]}"
+  cp -p "${marker_backups[0]}" "$case_dir/wt/.fm-task-owner"
+  rm -f "${marker_backups[0]}"
+  rm -f "$case_dir/fakebin/mv"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "marker-restore-fails: the restored pair should tear down"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "marker-restore-fails: the rerun left the task record behind"
+  pass "a rollback that cannot put the marker back takes the claim back out and stays recoverable"
+}
+
+# The same failure over a slot that moved on inside it. The claim still comes
+# back out, but here the pair may never be offered again: both halves are
+# retired to inert evidence and the record's authority ends.
+test_failed_marker_restore_over_a_reissued_slot_retires_the_record() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence marker_evidence
+  case_dir=$(make_case marker-restore-reissued)
+  write_meta "$case_dir" no-mistakes ship
+  write_task_b_marker_fixture "$case_dir"
+  fail_only_the_owner_marker_restore "$case_dir" \
+    "cp -- \"$case_dir/task-b-marker.expected\" \"$case_dir/wt/.fm-task-owner\""
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "marker-restore-reissued: a failed return must stop teardown"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "marker-restore-reissued: the rollback rewrote the new holder's marker"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "marker-restore-reissued: the record kept a claim on a slot another task marks"
   claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
   [ ! -e "${claim_backups[0]}" ] \
-    || fail "marker-restore-fails: the consumed claim backup was left behind as a second recovery source"
-  pass "a restore that gets the claim in and fails on the marker names only the copy that survived"
+    || fail "marker-restore-reissued: the claim stayed where a later refusal offers it for restore"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "marker-restore-reissued: the owner marker stayed where a later refusal offers it for restore"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_evidence[0]}" \
+    "marker-restore-reissued: the claim was not kept as evidence of what the record held"
+  marker_evidence=("$case_dir/state"/.task-x1.meta.task-owner-released.*)
+  assert_grep "task_id=task-x1" "${marker_evidence[0]}" \
+    "marker-restore-reissued: the retired owner marker was not kept as evidence"
+
+  # No receipt would mean no verb could ever finish this record; the rerun is
+  # what proves the retirement was recorded.
+  rm -f "$case_dir/fakebin/mv"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "marker-restore-reissued: the retired record's rerun should finish"$'\n'"$(cat "$case_dir/stderr2")"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "marker-restore-reissued: the rerun rewrote the marker of the task holding the slot"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "marker-restore-reissued: the rerun invoked the provider return on a reissued slot"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "marker-restore-reissued: the retired record could never be finished"
+  pass "a rollback that loses the marker to a reissued slot retires both halves to evidence"
+}
+
+# The pre-move check's other outcome: something is in the slot, but nothing that
+# can name an owner. That is not proof the pool took the path back, so neither
+# half moves at all and the pair an operator needs is exactly as it was.
+test_unattributable_slot_leaves_the_rollback_pair_untouched() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence
+  case_dir=$(make_case rollback-unattributable)
+  write_meta "$case_dir" no-mistakes ship
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+printf 'not-a-marker\n' > "$case_dir/wt/.fm-task-owner"
+echo 'return failed' >&2
+exit 1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "rollback-unattributable: a failed return must stop teardown"
+  [ "$(cat "$case_dir/wt/.fm-task-owner")" = "not-a-marker" ] \
+    || fail "rollback-unattributable: the rollback wrote through an unattributable slot marker"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "rollback-unattributable: the claim went back over a slot that cannot be attributed"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
+    "rollback-unattributable: the recoverable claim was lost"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  assert_grep "task_id=task-x1" "${marker_backups[0]}" \
+    "rollback-unattributable: the recoverable marker half was lost"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  [ ! -e "${claim_evidence[0]}" ] \
+    || fail "rollback-unattributable: an unattributable slot was treated as proof the pool took the path back"
+  pass "an unattributable slot leaves both rollback halves exactly where recovery needs them"
 }
 
 # The other side of that surviving copy: once an operator has restored the
@@ -4369,7 +4493,9 @@ test_retried_pool_return_still_drops_the_task_branch
 test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
 test_reissued_slot_retires_the_record_as_inert_evidence
-test_failed_marker_restore_names_the_surviving_copy
+test_failed_marker_restore_takes_the_claim_back_out
+test_failed_marker_restore_over_a_reissued_slot_retires_the_record
+test_unattributable_slot_leaves_the_rollback_pair_untouched
 test_stale_owner_marker_backup_is_swept_with_the_record
 test_aborted_relaunch_prior_marker_copy_is_swept_with_the_record
 test_interrupted_retirement_keeps_and_names_both_recovery_halves
