@@ -387,12 +387,11 @@ fm_backend_endpoint_atom_valid() {  # <value>
 # a live record loses its worktree identity, and its surviving copy is the only
 # remaining record of the path, so name it wherever that loss surfaces. Whether
 # the retirement is RECORDED decides the story, not which namespace the copy
-# happens to sit in: a recorded retirement - by receipt, by quarantined released
-# evidence, or because the slot proved it had moved on - means this record holds
-# no path at all and every surviving copy is evidence only. An unrecorded
-# retirement parks instead: no runtime path restores it, and the same manual
-# drill printed by ownership proof names the preserved state and deliberate
-# reconciliation steps.
+# happens to sit in: a recorded retirement - by receipt or by quarantined
+# released evidence - means this record holds no path at all and every surviving
+# copy is evidence only. An unrecorded retirement parks instead: no runtime path
+# restores it, and the same manual drill printed by ownership proof names the
+# preserved state and deliberate reconciliation steps.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
   local meta=$1 backup evidence retired=1
   if declare -F fm_worktree_retirement_receipt_present >/dev/null 2>&1 \

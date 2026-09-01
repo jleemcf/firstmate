@@ -24,11 +24,12 @@
 # return or removal clears worktree= before the slot can become reusable, and
 # the worktree's .fm-task-owner marker retires atomically with that claim, so a
 # released slot never carries a live claim from the task that just left it.
-# A failed provider operation never leaves this record holding a claim it cannot
-# prove: the pair goes back together, or the retirement stands and refuses, or -
-# when the slot's own marker already names another task or generation - this
-# record's authority over that path is retired for good and both copies are kept
-# as inert evidence. bin/fm-worktree-ownership-lib.sh owns that recovery
+# Only a confirmed provider release completes that retirement. Every failure or
+# interruption parks it instead: the claim and owner-marker copies are preserved
+# untouched, the record claims no path, every further destructive lifecycle
+# action refuses, and one deliberate manual-recovery drill is printed. No
+# runtime path restores either half, and none of it ever creates or overwrites
+# another owner's marker. bin/fm-worktree-ownership-lib.sh owns that recovery
 # contract.
 # A force-authorized discard never bypasses that independent ownership proof.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
@@ -2794,10 +2795,10 @@ cleanup_firstmate_home_children() {
         if [ "$child_return_rc" -eq "$FM_WORKTREE_RETIREMENT_UNRECORDED" ]; then
           echo "warning: child worktree $child_wt was returned, but its retirement could not be recorded" >&2
         elif [ "$child_return_rc" -ne 0 ]; then
-          # A return that did not confirm the release parked this child's
-          # retirement, so no second destructive path may retry it - the lock
-          # may belong to a live process and the claim is no longer provable.
-          echo "error: treehouse return failed for child worktree $child_wt; its retirement is parked and no other removal may retry it" >&2
+          # The refusal that stopped this return already named its own state -
+          # an unproven claim, a claim this record does not hold, or a parked
+          # retirement. None of them make a second destructive path safe.
+          echo "error: treehouse return failed for child worktree $child_wt; the release was not confirmed, so that child's records are retained and no other removal may retry it" >&2
           return 1
         fi
       else
