@@ -707,6 +707,7 @@ spawn_remote_secondmate() {
 
 BACKEND=
 TASK_TMP=
+SPAWN_SUPERSEDED_TASK_TMP=
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
@@ -2116,6 +2117,12 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   fi
 else
+  # A fresh spawn over a record that already names a root supersedes it - the
+  # remote secondmate route re-launches a dead endpoint through this path, never
+  # through --relaunch. Remember the superseded root now, while the record still
+  # names it, so publication below can hand it back instead of orphaning one
+  # unpredictable /tmp root per incarnation.
+  SPAWN_SUPERSEDED_TASK_TMP=$(fm_meta_get "$STATE/$ID.meta" tasktmp 2>/dev/null || true)
   if ! TASK_TMP=$(fm_tasktmp_claim_create "$STATE" "$ID"); then
     echo "error: task temporary root allocation for $ID failed safely; see the tasktmp refusal above" >&2
     exit 1
@@ -2970,6 +2977,15 @@ if [ "$RELAUNCH" -eq 0 ]; then
     exit 1
   fi
   SPAWN_META_TMP=
+  # No record names the superseded root any more, so this is the point where
+  # reclaiming it can no longer take a root some record still owns.
+  # An unsafe superseded path is refused and left exactly where it is.
+  if [ -n "$SPAWN_SUPERSEDED_TASK_TMP" ] && [ "$SPAWN_SUPERSEDED_TASK_TMP" != "$TASK_TMP" ]; then
+    if ! fm_tasktmp_remove "$ID" "$SPAWN_SUPERSEDED_TASK_TMP"; then
+      echo "warning: the task temporary root $SPAWN_SUPERSEDED_TASK_TMP that $ID's previous record named could not be reclaimed: $FM_TASKTMP_ERROR" >&2
+    fi
+  fi
+  SPAWN_SUPERSEDED_TASK_TMP=
 fi
 
 # Fuse the backlog In-flight transition into the publication that just created

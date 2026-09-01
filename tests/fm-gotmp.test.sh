@@ -536,8 +536,17 @@ test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
   mkdir -p "$state"
   # An overriding cd makes the trusted temporary parent unresolvable, which is
   # the one trust check that must never fall through to an empty parent.
-  # shellcheck disable=SC2329 # Invoked indirectly: it overrides the cd builtin.
-  out=$( cd() { return 1; }; fm_tasktmp_claim_create "$state" "$id" 2>&1 ); rc=$?
+  # A fresh process is the honest fixture: the parent resolves once per process,
+  # so this proves the very first resolution failure refuses rather than
+  # inheriting an answer this suite already cached.
+  rc=0
+  out=$(bash -c '
+set -u
+# shellcheck source=/dev/null
+. "$1/bin/fm-tasktmp-lib.sh"
+cd() { return 1; }
+fm_tasktmp_claim_create "$2" "$3" 2>&1
+' _ "$ROOT" "$state" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "an unresolvable trusted temporary parent still allocated a root"
   case "$out" in
     *"trusted temporary parent"*) ;;
@@ -556,6 +565,54 @@ test_unresolvable_trusted_parent_refuses_instead_of_allocating() {
   [ -z "$(find "$state" -maxdepth 1 -name "*.tasktmp-claim*" -print -quit 2>/dev/null)" ] \
     || fail "a refused allocation left a private claim candidate behind"
   pass "tasktmp allocator: an unresolvable trusted temporary parent refuses before any candidate exists"
+}
+
+test_startup_reaches_route_scoped_state_directories() {
+  local home="$TMP_ROOT/route-home" state route id="route-remnant-z22-$$" root refused out
+  state=$home/state
+  route=$state/parent-route
+  mkdir -p "$route" "$home/data" "$home/config" "$home/projects"
+  # A remote-routed secondmate keeps its whole lifecycle one level down, so this
+  # is where its crash remnant and its refused-root record really land.
+  root=$(fm_tasktmp_claim_create "$route" "$id") \
+    || fail "the route fixture could not allocate its claimed root"
+  refused="$TMP_ROOT/route-refused-target"
+  mkdir -p "$refused"
+  fm_tasktmp_refusal_record "$route" "$id" "$refused" "route fixture refusal" \
+    || fail "the route fixture could not record a refused root"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in
+    *"TASKTMP_RECONCILE: $id: pending task temporary claim"*) ;;
+    *) fail "read-only startup never saw the route-scoped pending claim: $out" ;;
+  esac
+  case "$out" in
+    *"refused task temporary root $refused is still present"*) ;;
+    *) fail "read-only startup never re-reported the route-scoped refusal: $out" ;;
+  esac
+  [ -d "$root/gotmp" ] && [ -f "$route/$id.tasktmp-claim" ] \
+    || fail "read-only startup mutated the route-scoped root or claim"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  [ ! -e "$root" ] && [ ! -e "$route/$id.tasktmp-claim" ] \
+    || fail "locked startup did not reconcile the route-scoped crash remnant"
+  case "$out" in
+    *"refused task temporary root $refused is still present"*) ;;
+    *) fail "locked startup dropped the route-scoped refusal while its path is still on disk: $out" ;;
+  esac
+  [ -f "$route/$id.tasktmp-refused" ] \
+    || fail "locked startup retired a route-scoped record whose path still exists"
+  rmdir "$refused"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_BOOTSTRAP_NETWORK=skip \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  case "$out" in
+    *"BOOTSTRAP_INFO: $id: previously refused task temporary root $refused is gone"*) ;;
+    *) fail "locked startup did not retire the resolved route-scoped record: $out" ;;
+  esac
+  [ ! -e "$route/$id.tasktmp-refused" ] \
+    || fail "the resolved route-scoped refusal record was not retired"
+  rm -rf -- "$root"
+  pass "tasktmp startup: route-scoped state directories are reconciled and re-reported like the home's own"
 }
 
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root() {
@@ -778,6 +835,7 @@ test_teardown_refusal_is_durably_re_reported_after_the_task_record_is_gone
 test_teardown_reports_a_refusal_record_it_could_not_write
 test_unresolvable_trusted_parent_refuses_instead_of_allocating
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root
+test_startup_reaches_route_scoped_state_directories
 test_crash_window_preserves_a_recorded_root_that_no_longer_validates
 test_crash_window_retires_a_claim_whose_recorded_root_already_vanished
 test_reuse_restores_a_vanished_gotmp_child_in_its_own_root

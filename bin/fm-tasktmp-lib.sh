@@ -48,6 +48,7 @@ FM_TASKTMP_ERROR=
 FM_TASKTMP_TRUST=
 FM_TASKTMP_KIND=
 FM_TASKTMP_EUID=
+FM_TASKTMP_PARENT=
 FM_TASKTMP_STAT_UID=
 FM_TASKTMP_STAT_MODE=
 FM_TASKTMP_STAT_TYPE=
@@ -82,7 +83,12 @@ fm_tasktmp_euid() {
   FM_TASKTMP_EUID=$euid
 }
 
-fm_tasktmp_parent() {
+# The trusted temporary parent resolves once per process, exactly like the
+# effective uid, so no call site pays a subshell to re-derive it.
+# Callers inside this library read FM_TASKTMP_PARENT after the resolver returns;
+# fm_tasktmp_parent stays the printing form for anything outside it.
+fm_tasktmp_resolve_parent() {
+  [ -z "$FM_TASKTMP_PARENT" ] || return 0
   local parent
   parent=$(CDPATH='' cd -- /tmp 2>/dev/null && pwd -P) || {
     fm_tasktmp_error "trusted temporary parent /tmp cannot be resolved"
@@ -95,7 +101,12 @@ fm_tasktmp_parent() {
       return 1
       ;;
   esac
-  printf '%s\n' "$parent"
+  FM_TASKTMP_PARENT=$parent
+}
+
+fm_tasktmp_parent() {
+  fm_tasktmp_resolve_parent || return 1
+  printf '%s\n' "$FM_TASKTMP_PARENT"
 }
 
 fm_tasktmp_lstat() {  # <path>
@@ -157,7 +168,8 @@ fm_tasktmp_directory_stat_valid() {  # <path> <new|legacy>
 
 fm_tasktmp_classify_path() {  # <task-id> <path>
   local id=$1 path=$2 parent prefix nonce
-  parent=$(fm_tasktmp_parent) || return 1
+  fm_tasktmp_resolve_parent || return 1
+  parent=$FM_TASKTMP_PARENT
   FM_TASKTMP_KIND=
   if [ "$path" = "$parent/fm-$id" ] || [ "$path" = "/tmp/fm-$id" ]; then
     FM_TASKTMP_KIND=legacy
@@ -463,7 +475,8 @@ fm_tasktmp_nonce() {
 
 fm_tasktmp_claim_create() {  # <state> <task-id>
   local state=$1 id=$2 parent stable temp nonce candidate attempt max created
-  parent=$(fm_tasktmp_parent) || return 1
+  fm_tasktmp_resolve_parent || return 1
+  parent=$FM_TASKTMP_PARENT
   stable=$(fm_tasktmp_claim_path "$state" "$id")
   max=${FM_TASKTMP_CLAIM_ATTEMPTS:-8}
   case "$max" in ''|*[!0-9]*|0) max=8 ;; esac
@@ -622,7 +635,7 @@ fm_tasktmp_spawn_lock_live() {  # <state> <task-id>
   kill -0 "$pid" 2>/dev/null
 }
 
-fm_tasktmp_startup() {  # <state> <locked|read-only>
+fm_tasktmp_startup_sweep() {  # <state-dir> <locked|read-only>
   local state=$1 mode=$2 claim id lock meta record rc result=0
   [ -d "$state" ] || return 0
   for claim in "$state"/*.tasktmp-claim; do
@@ -706,6 +719,27 @@ fm_tasktmp_startup() {  # <state> <locked|read-only>
       continue
     fi
     fm_tasktmp_audit_meta "$meta" || result=1
+  done
+  return "$result"
+}
+
+# A remote-routed secondmate runs its whole claim, metadata, and refusal
+# lifecycle in a nested state/<route>/ directory of the same home, with its
+# spawn lock there too, so the home's startup owns those records exactly as it
+# owns its own.
+# One level is the whole production nesting; a symlinked child is never
+# followed, because reconciliation deletes and must stay inside this home.
+fm_tasktmp_startup() {  # <state> <locked|read-only>
+  local state=$1 mode=$2 route result=0
+  [ -d "$state" ] || return 0
+  fm_tasktmp_startup_sweep "$state" "$mode" || result=1
+  for route in "$state"/*/; do
+    route=${route%/}
+    [ -d "$route" ] || continue
+    if [ -L "$route" ]; then
+      continue
+    fi
+    fm_tasktmp_startup_sweep "$route" "$mode" || result=1
   done
   return "$result"
 }

@@ -212,6 +212,9 @@ assert_present "$PARENT/state/ios.meta" "default-off remote spawn published no p
   || fail "default-off remote spawn must not export a carrier into the remote pane"
 ! grep -q '^traceparent=' "$REMOTE_HOME/state/parent-route/ios.meta" \
   || fail "default-off remote spawn must not record a carrier on the remote host"
+FIRST_REMOTE_TASK_TMP=$(grep '^tasktmp=' "$REMOTE_HOME/state/parent-route/ios.meta" | cut -d= -f2-)
+[ -d "$FIRST_REMOTE_TASK_TMP/gotmp" ] \
+  || fail "the first remote incarnation published no usable temporary root"
 [ "$(remote_launch_snapshot)" = off ] \
   || fail "default-off remote spawn must deliver FM_TRACE_CONTEXT=off (got '$(remote_launch_snapshot)')"
 assert_absent "$REMOTE_HOME/config/trace-context" "default-off remote spawn inherited an enablement flag"
@@ -246,6 +249,13 @@ assert_present "$REMOTE_HOME/config/trace-context" \
   "an enabled remote launch did not inherit the enablement flag into the remote home"
 [ -n "$REMOTE_TASK_TMP" ] \
   || fail "the remote Herdr task metadata omitted its temporary root"
+# This route re-launches a dead endpoint through an ordinary fresh spawn, so the
+# superseded incarnation's root must be reclaimed rather than left in /tmp with
+# no record naming it.
+[ "$REMOTE_TASK_TMP" != "$FIRST_REMOTE_TASK_TMP" ] \
+  || fail "a fresh remote incarnation reused the previous root instead of claiming its own"
+[ ! -e "$FIRST_REMOTE_TASK_TMP" ] && [ ! -L "$FIRST_REMOTE_TASK_TMP" ] \
+  || fail "the superseded remote incarnation leaked $FIRST_REMOTE_TASK_TMP, which no record names any more"
 grep -q "export GOTMPDIR=$REMOTE_TASK_TMP/gotmp" "$HERDR_LOG" \
   || fail "the remote Herdr pane did not export the exact root recorded in its metadata"
 GOTMP_LINE=$(grep -n 'export GOTMPDIR=' "$HERDR_LOG" | tail -1 | cut -d: -f1)
