@@ -7,7 +7,10 @@
 # mutate backlog state, or write reports. Its default ledger collector may
 # atomically refresh parent-side cached copies of remote home summaries under
 # state/secondmate-summary-cache; those observational cache writes are its only
-# fleet-state mutation.
+# fleet-state mutation. It also needs a writable TMPDIR: it keeps a private
+# mode-0700 temporary directory that carries file-sized JSON projections
+# between jq invocations and is removed on every success, failure, and signal
+# path, so no snapshot leaves storage behind.
 #
 # Top-level fields:
 #   schema: stable schema id.
@@ -240,9 +243,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Every file-sized JSON projection travels between jq invocations as a file in
-# $SNAPSHOT_TMP_DIR, so a producer that writes nothing, writes several
-# documents, or writes the wrong shape has to fail loudly instead of binding
-# null into the published contract.
+# $SNAPSHOT_TMP_DIR rather than as an --argjson value, because an ordinarily
+# accumulated backlog, scout-report set, or registered-home summary outgrows
+# execve's single-argument ceiling (131072 bytes on Linux) and would abort the
+# whole snapshot with E2BIG. A file handoff carries no such bound, so these
+# reads must reject a producer that writes nothing, writes several documents,
+# or writes the wrong shape instead of binding null into the published
+# contract.
 SNAPSHOT_JQ_PRELUDE='def snapshot_document($label; $documents; $expected):
   if ($documents | length) != 1 then
     error("fm-fleet-snapshot: \($label) JSON must be exactly one document, found \($documents | length)")
