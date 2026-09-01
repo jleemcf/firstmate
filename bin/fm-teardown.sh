@@ -20,13 +20,17 @@
 # None of this loosens the landed-work gates below: the transition runs only on
 # the paths that already proceed to remove the record.
 # REFUSES before any worktree-based mutation unless the shared ownership
-# resolver proves the recorded path still belongs only to this task. The
-# worktree's .fm-task-owner marker retires atomically with its worktree= claim,
-# so a provider return can never make a slot reusable while a marker still names
-# the task that just left it, and a failed return puts both back.
+# resolver proves the recorded path still belongs only to this task. A provider
+# return or removal clears worktree= before the slot can become reusable, and
+# the worktree's .fm-task-owner marker retires atomically with that claim, so a
+# released slot never carries a live claim from the task that just left it.
+# A failed provider operation never leaves this record holding a claim it cannot
+# prove: the pair goes back together, or the retirement stands and refuses, or -
+# when the slot's own marker already names another task or generation - this
+# record's authority over that path is retired for good and both copies are kept
+# as inert evidence. bin/fm-worktree-ownership-lib.sh owns that recovery
+# contract.
 # A force-authorized discard never bypasses that independent ownership proof.
-# A provider return or removal clears worktree= before the slot can become
-# reusable and restores the claim if the provider operation fails.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so

@@ -138,11 +138,15 @@
 #   git worktree root distinct from the primary project checkout.
 #   A ship or scout spawn then stamps its task id and this spawn generation into
 #   the worktree's .fm-task-owner marker, excluded from git like the other
-#   per-task worktree files, and refuses when a marker already there names
-#   another task or cannot be attributed, so a recycled pool slot can never host
-#   two live workers. bin/fm-worktree-ownership-lib.sh owns what that marker
-#   proves for every later lifecycle verb, and bin/fm-teardown.sh retires it
-#   when the slot is released.
+#   per-task worktree files, so a recycled pool slot can never host two live
+#   workers. A fresh spawn refuses EVERY marker already there - another task's,
+#   one it cannot attribute, and one carrying this same task id - because task
+#   identity alone cannot prove that the marked generation stopped working.
+#   Only --relaunch, which has the recorded metadata that proves a same-task
+#   handoff, may restamp a marker this task already owns.
+#   bin/fm-worktree-ownership-lib.sh owns what that marker proves for every
+#   later lifecycle verb, and bin/fm-teardown.sh retires it when the slot is
+#   released.
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree

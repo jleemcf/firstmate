@@ -69,7 +69,10 @@
 # never succeeds with one half: a restore that gets the claim in and then fails
 # on the marker takes that claim back out, so the record returns to the exact
 # retirement it came from, with both copies recoverable again, rather than
-# naming a path it can no longer prove.
+# naming a path it can no longer prove. The one exit that returns the claim
+# alone is a slot whose directory went with the failed provider step: nothing is
+# left to mark there, the restored record proves that vacant path on its own,
+# and the marker's copy is kept beside the record until the record is gone.
 # A failed provider call is not the last word on who owns the slot. When the
 # slot's own marker positively names another task or generation, that proof
 # outranks the failure: the provider handed the path on, so nothing is written
@@ -1075,7 +1078,9 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
 
 # The in-worktree owner marker is the other half of the same claim, so it is
 # retired in the same step: gone before the provider can recycle the slot, and
-# put back with the claim if the provider operation fails.
+# put back with the claim when a failed provider operation leaves the slot still
+# this task's. A slot that moved on retires both halves for good instead; the
+# header above owns that contract.
 fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   local dir=$1 base=$2 expected=$3 marker stash
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
