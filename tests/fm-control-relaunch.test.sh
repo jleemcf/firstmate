@@ -353,6 +353,23 @@ test_legacy_tasktmp_relaunch_reuses_the_grandfathered_root() {
   pass "fm-control relaunch: a trusted grandfathered legacy root is reused, not reallocated"
 }
 
+test_relaunch_restores_a_vanished_gotmp_child_and_keeps_the_root() {
+  local dir out rc recorded_root
+  dir=$(new_case regotmp rlgotmp)
+  add_ship_task "$dir" rlgotmp claude
+  recorded_root=$(meta_field "$dir" rlgotmp tasktmp)
+  # The prior worker removed its own $GOTMPDIR; the root is still task-owned.
+  rm -rf -- "$recorded_root/gotmp"
+  out=$(run_control "$dir" rlgotmp relaunch --note "gotmp went missing"); rc=$?
+  expect_code 0 "$rc" "a task-owned root missing only its gotmp child must not block relaunch"$'\n'"$out"
+  [ "$(meta_field "$dir" rlgotmp tasktmp)" = "$recorded_root" ] \
+    || fail "relaunch reallocated instead of restoring the root it already owned"
+  [ -d "$recorded_root/gotmp" ] || fail "relaunch did not restore the gotmp child"
+  assert_grep "export GOTMPDIR=$recorded_root/gotmp" "$dir/fake/keys" \
+    "the replacement did not export the restored gotmp child"
+  pass "fm-control relaunch: a vanished gotmp child is restored rather than refused"
+}
+
 test_relaunch_preserves_durable_task_metadata() {
   local dir out rc
   dir=$(new_case durable-meta rl19)
@@ -1546,6 +1563,7 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
 
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_legacy_tasktmp_relaunch_reuses_the_grandfathered_root
+test_relaunch_restores_a_vanished_gotmp_child_and_keeps_the_root
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
 test_disabled_relaunch_clears_prior_trace_context

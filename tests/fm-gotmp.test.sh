@@ -366,9 +366,9 @@ SH
 }
 
 test_collision_is_refused_without_entering_or_deleting_candidate() {
-  local state="$TMP_ROOT/collision-state" fakebin="$TMP_ROOT/collision-bin" id="collision-z8-$$"
+  local state="$TMP_ROOT/collision-state" id="collision-z8-$$"
   local parent candidate inode mode out rc
-  mkdir -p "$state" "$fakebin"
+  mkdir -p "$state"
   parent=$(fm_tasktmp_parent) || fail "trusted temp parent unavailable"
   candidate="$parent/fm-$id.$GOTMP_TMP_NONCE"
   rm -rf -- "$candidate"
@@ -377,15 +377,14 @@ test_collision_is_refused_without_entering_or_deleting_candidate() {
   printf 'collision sentinel\n' > "$candidate/gotmp/sentinel"
   inode=$(tasktmp_lstat_identity "$candidate")
   mode=$(tasktmp_lstat_mode "$candidate")
-  cat > "$fakebin/mktemp" <<SH
-#!/usr/bin/env bash
-path=\${1%XXXXXXXXXXXX}$GOTMP_TMP_NONCE
-(umask 077; : > "\$path")
-printf '%s\\n' "\$path"
-SH
-  chmod +x "$fakebin/mktemp"
-  out=$(PATH="$fakebin:$PATH" FM_TASKTMP_CLAIM_ATTEMPTS=1 \
-    fm_tasktmp_claim_create "$state" "$id" 2>&1); rc=$?
+  # Pin the draw inside the substitution subshell so the allocator lands on the
+  # pre-existing hostile candidate; everything downstream of the nonce is the
+  # real allocator, and the override never escapes this call.
+  out=$(
+    # shellcheck disable=SC2329 # Invoked indirectly: it pins the nonce draw.
+    fm_tasktmp_nonce() { printf '%s\n' "$GOTMP_TMP_NONCE"; }
+    FM_TASKTMP_CLAIM_ATTEMPTS=1 fm_tasktmp_claim_create "$state" "$id" 2>&1
+  ); rc=$?
   [ "$rc" -ne 0 ] || fail "collision candidate was adopted"
   case "$out" in *"collision-free"*) ;; *) fail "collision refusal was not loud" ;; esac
   [ "$(tasktmp_lstat_identity "$candidate")" = "$inode" ] \
@@ -541,6 +540,98 @@ test_crash_window_retires_a_claim_whose_recorded_root_already_vanished() {
   pass "tasktmp claim: an identically recorded root that is already gone retires rather than wedging the id"
 }
 
+test_reuse_restores_a_vanished_gotmp_child_in_its_own_root() {
+  local state="$TMP_ROOT/regotmp-state" id="regotmp-z17-$$" root reused
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "gotmp-restore fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\n' "$root" > "$state/$id.meta"
+  fm_tasktmp_claim_mark_committed "$state" "$id" >/dev/null \
+    || fail "gotmp-restore fixture could not record its commit point"
+  fm_tasktmp_claim_transfer "$state" "$id" "$state/$id.meta" \
+    || fail "gotmp-restore fixture could not transfer ownership"
+  # The task's own agent removed $GOTMPDIR; the root itself is still ours.
+  rm -rf -- "$root/gotmp"
+  fm_tasktmp_trust "$id" "$root"
+  [ "$FM_TASKTMP_TRUST" = incomplete ] \
+    || fail "a task-owned 0700 root missing only its gotmp child reported as $FM_TASKTMP_TRUST"
+  reused=$(fm_tasktmp_recorded_prepare "$state" "$id" "$root") \
+    || fail "reuse refused a root it still owns: $FM_TASKTMP_ERROR"
+  [ "$reused" = "$root" ] || fail "reuse reallocated instead of restoring: $reused"
+  fm_tasktmp_trust "$id" "$root"
+  [ "$FM_TASKTMP_TRUST" = trusted ] \
+    || fail "reuse returned a root whose gotmp child is still unusable"
+  [ "$(tasktmp_lstat_mode "$root/gotmp")" = 700 ] \
+    || fail "the restored gotmp child is not private"
+  fm_tasktmp_remove "$id" "$root" || fail "restored root cleanup failed"
+  pass "tasktmp reuse: a vanished gotmp child is restored inside the root the task already owns"
+}
+
+test_teardown_removes_a_root_whose_gotmp_child_vanished() {
+  local id="td-nogotmp-z18-$$" task_tmp fake
+  task_tmp="/tmp/fm-$id.$GOTMP_TMP_NONCE"
+  rm -rf -- "$task_tmp"
+  mkdir -p "$task_tmp"
+  chmod 700 "$task_tmp"
+  fake=$(make_fake_root "$id" "$task_tmp")
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+    || fail "teardown refused a task-owned root whose gotmp child had vanished"
+  [ ! -e "$task_tmp" ] \
+    || fail "teardown leaked a task-owned root whose gotmp child had vanished"
+  [ ! -e "$fake/state/$id.meta" ] || fail "teardown did not complete"
+  pass "fm-teardown removes a task-owned root whose gotmp child vanished instead of leaking it"
+}
+
+test_ambiguous_metadata_preserves_the_claimed_root() {
+  local state="$TMP_ROOT/ambiguous-state" id="ambiguous-z19-$$" root out rc
+  mkdir -p "$state"
+  root=$(fm_tasktmp_claim_create "$state" "$id") || fail "ambiguous-metadata fixture allocation failed"
+  printf 'window=fake\ntasktmp=%s\ntasktmp=%s\n' "$root" "$root" > "$state/$id.meta"
+  out=$(fm_tasktmp_claim_reconcile_one "$state" "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "reconciliation claimed success against unprovable ownership"
+  case "$out" in *"duplicate or unreadable tasktmp fields"*) ;; *) fail "the ambiguous field was not named: $out" ;; esac
+  [ -d "$root/gotmp" ] || fail "reconciliation deleted a root whose ownership it could not establish"
+  [ -f "$state/$id.tasktmp-claim" ] || fail "reconciliation retired a claim it could not reconcile"
+  rm -f -- "$state/$id.meta"
+  fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
+  rm -rf -- "$root"
+  pass "tasktmp claim: metadata with duplicate tasktmp fields preserves and reports instead of deleting the root"
+}
+
+test_candidate_nonce_is_never_a_listable_state_filename() {
+  local state="$TMP_ROOT/nonce-state" fakebin="$TMP_ROOT/nonce-bin" id="nonce-z20-$$"
+  local listing real_chmod real_mkdir root nonce
+  listing="$TMP_ROOT/nonce-state-listing"
+  mkdir -p "$state" "$fakebin"
+  : > "$listing"
+  real_chmod=$(command -v chmod) || fail "test needs chmod"
+  real_mkdir=$(command -v mkdir) || fail "test needs mkdir"
+  # Snapshot the state directory across the whole window in which a claim names
+  # a path that does not exist yet: chmod runs while the private claim is still
+  # at its temporary name, mkdir runs when the candidate root is created.
+  # Nothing listable there may carry the candidate's name.
+  cat > "$fakebin/chmod" <<SH
+#!/usr/bin/env bash
+ls -a "$state" >> "$listing" 2>/dev/null || true
+exec "$real_chmod" "\$@"
+SH
+  cat > "$fakebin/mkdir" <<SH
+#!/usr/bin/env bash
+ls -a "$state" >> "$listing" 2>/dev/null || true
+exec "$real_mkdir" "\$@"
+SH
+  chmod +x "$fakebin/chmod" "$fakebin/mkdir"
+  root=$(PATH="$fakebin:$PATH" fm_tasktmp_claim_create "$state" "$id") \
+    || fail "nonce fixture allocation failed"
+  nonce=${root##*.}
+  [ -s "$listing" ] || fail "the fixture never observed the candidate-creation window"
+  if grep -q -- "$nonce" "$listing"; then
+    fail "the candidate nonce was a listable state filename before its root existed"
+  fi
+  fm_tasktmp_claim_reconcile_one "$state" "$id" >/dev/null 2>&1 || true
+  rm -rf -- "$root"
+  pass "tasktmp allocator: the candidate nonce never appears as a filename in the state directory"
+}
+
 test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact() {
   local state="$TMP_ROOT/readonly-live-state" id="readonly-live-z15-$$" root lock out rc
   mkdir -p "$state"
@@ -583,4 +674,8 @@ test_unresolvable_trusted_parent_refuses_instead_of_allocating
 test_crash_before_the_commit_point_transfers_an_identical_recorded_root
 test_crash_window_preserves_a_recorded_root_that_no_longer_validates
 test_crash_window_retires_a_claim_whose_recorded_root_already_vanished
+test_reuse_restores_a_vanished_gotmp_child_in_its_own_root
+test_teardown_removes_a_root_whose_gotmp_child_vanished
+test_ambiguous_metadata_preserves_the_claimed_root
+test_candidate_nonce_is_never_a_listable_state_filename
 test_read_only_startup_reports_a_live_spawn_as_an_ordinary_fact

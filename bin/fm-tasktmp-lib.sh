@@ -19,21 +19,27 @@
 # Missing tasktmp fields and recognized roots that are already absent remain
 # compatible no-ops for lifecycle cleanup.
 #
-# Trust is a THREE-state answer, so no caller may reduce it to a boolean.
+# Trust is a FOUR-state answer, so no caller may reduce it to a boolean.
 # fm_tasktmp_trust is the only interface call sites use; it sets
 # FM_TASKTMP_TRUST to exactly one of:
-#   trusted - the root, and unless the root-only scope is asked for its gotmp
-#             child, is present, task-owned, and private; it may be used,
-#             scanned, and removed.
-#   unsafe  - the path exists and failed a trust check; refuse it, report
-#             FM_TASKTMP_ERROR, and neither chmod, enter, canonicalize,
-#             traverse, adopt, nor delete it.
-#   absent  - the recognized root does not exist; a compatible no-op that is
-#             never a refusal.
+#   trusted    - the root, and unless the root-only scope is asked for its
+#                gotmp child, is present, task-owned, and private; it may be
+#                used, scanned, and removed.
+#   incomplete - the root itself passed every trust check but its gotmp child
+#                is absent. The path is proven ours and private, so this is a
+#                recoverable own-root state, never a refusal: reuse restores
+#                the child inside the root it already owns, and scanning and
+#                removal treat it exactly like trusted. Only the default
+#                gotmp scope can report it.
+#   unsafe     - the path exists and failed a trust check; refuse it, report
+#                FM_TASKTMP_ERROR, and neither chmod, enter, canonicalize,
+#                traverse, adopt, nor delete it.
+#   absent     - the recognized root does not exist; a compatible no-op that
+#                is never a refusal.
 # fm_tasktmp_validate and fm_tasktmp_validate_root stay the underlying
-# primitives (0 trusted, 1 unsafe, 2 absent) and must never be called as
-# `if ! fm_tasktmp_validate ...`, which silently merges unsafe with absent and
-# turns a vanished root into a refusal.
+# primitives (0 trusted, 1 unsafe, 2 absent, 3 incomplete) and must never be
+# called as `if ! fm_tasktmp_validate ...`, which silently merges unsafe with
+# absent and incomplete and turns a vanished or repairable root into a refusal.
 
 FM_TASKTMP_ERROR=
 FM_TASKTMP_TRUST=
@@ -178,8 +184,8 @@ fm_tasktmp_validate() {  # <task-id> <path>
   fm_tasktmp_directory_stat_valid "$path" "$kind" || return 1
   gotmp=$path/gotmp
   if fm_tasktmp_path_absent "$gotmp"; then
-    fm_tasktmp_error "task temporary root $path has no gotmp directory"
-    return 1
+    FM_TASKTMP_ERROR="task temporary root $path is task-owned but its gotmp child is missing"
+    return 3
   fi
   fm_tasktmp_directory_stat_valid "$gotmp" "$kind" || return 1
 }
@@ -194,6 +200,7 @@ fm_tasktmp_trust() {  # <task-id> <path> [root]
   case "$rc" in
     0) FM_TASKTMP_TRUST=trusted ;;
     2) FM_TASKTMP_TRUST=absent ;;
+    3) FM_TASKTMP_TRUST=incomplete ;;
     *) FM_TASKTMP_TRUST=unsafe ;;
   esac
   return 0
@@ -214,6 +221,19 @@ fm_tasktmp_recorded_prepare() {  # <state> <task-id> <recorded-path>
     absent)
       fm_tasktmp_claim_create "$state" "$id"
       return
+      ;;
+    incomplete)
+      # The root is already proven task-owned and private, so restoring the
+      # child Go cannot create for itself stays inside a directory no other
+      # user can write, and the restored pair is validated before it is used.
+      (umask 077; mkdir -- "$path/gotmp") 2>/dev/null || true
+      fm_tasktmp_trust "$id" "$path"
+      if [ "$FM_TASKTMP_TRUST" = trusted ]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+      fm_tasktmp_error "task temporary root $path is task-owned but its gotmp child could not be restored: $FM_TASKTMP_ERROR"
+      return 1
       ;;
   esac
   return 1
@@ -369,7 +389,7 @@ fm_tasktmp_claim_cleanup_root() {  # <task-id> <claimed-path>
 }
 
 fm_tasktmp_claim_reconcile_one() {  # <state> <task-id>
-  local state=$1 id=$2 meta="$1/$2.meta" rc
+  local state=$1 id=$2 meta="$1/$2.meta" rc recorded
   if fm_tasktmp_claim_read "$state" "$id"; then
     :
   else
@@ -377,24 +397,46 @@ fm_tasktmp_claim_reconcile_one() {  # <state> <task-id>
     [ "$rc" -eq 2 ] && return 0
     return "$rc"
   fi
-  if [ -f "$meta" ] && [ ! -L "$meta" ] \
-     && [ "$(fm_tasktmp_meta_tasktmp "$meta" 2>/dev/null || true)" = "$FM_TASKTMP_CLAIM_PATH" ]; then
-    # Durable metadata naming the identical root is the completed transfer, even
-    # when a crash lost the commit point.
-    # An already-absent root leaves nothing to own, clean, or leak, so only a
-    # path that still exists and stopped being trusted is preserved.
-    if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ]; then
-      fm_tasktmp_trust "$id" "$FM_TASKTMP_CLAIM_PATH"
-      if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
-        fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point and $FM_TASKTMP_CLAIM_PATH is no longer trusted: $FM_TASKTMP_ERROR; the root and claim were preserved"
-        return 1
-      fi
+  if [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    # Ownership that cannot be read is ownership that cannot be disproven, so
+    # an ambiguous or unreadable tasktmp field preserves and reports exactly
+    # like the sibling readers rather than falling through to cleanup.
+    if ! recorded=$(fm_tasktmp_meta_tasktmp "$meta" 2>/dev/null); then
+      fm_tasktmp_error "task metadata $meta has duplicate or unreadable tasktmp fields, so ownership of $FM_TASKTMP_CLAIM_PATH could not be established; the root and claim for $id were preserved"
+      return 1
     fi
-    fm_tasktmp_claim_retire "$state" "$id"
-    return
+    if [ "$recorded" = "$FM_TASKTMP_CLAIM_PATH" ]; then
+      # Durable metadata naming the identical root is the completed transfer,
+      # even when a crash lost the commit point.
+      # An already-absent root leaves nothing to own, clean, or leak, so only a
+      # path that still exists and stopped being trusted is preserved.
+      if [ "$FM_TASKTMP_CLAIM_PHASE" != committed ]; then
+        fm_tasktmp_trust "$id" "$FM_TASKTMP_CLAIM_PATH"
+        if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
+          fm_tasktmp_error "matching task metadata for $id was published before its temporary-root commit point and $FM_TASKTMP_CLAIM_PATH is no longer trusted: $FM_TASKTMP_ERROR; the root and claim were preserved"
+          return 1
+        fi
+      fi
+      fm_tasktmp_claim_retire "$state" "$id"
+      return
+    fi
   fi
   fm_tasktmp_claim_cleanup_root "$id" "$FM_TASKTMP_CLAIM_PATH" || return 1
   fm_tasktmp_claim_retire "$state" "$id"
+}
+
+# The candidate nonce is drawn independently of every filename this library
+# creates, so the not-yet-created root's name never exists as a listable entry
+# in a state directory that carries only the ambient umask.
+fm_tasktmp_nonce() {
+  local raw
+  raw=$(head -c 4096 /dev/urandom 2>/dev/null | LC_ALL=C tr -dc 'A-Za-z0-9' 2>/dev/null) || raw=
+  raw=${raw:0:12}
+  case "$raw" in
+    ''|*[!A-Za-z0-9]*) return 1 ;;
+  esac
+  [ "${#raw}" -ge 12 ] || return 1
+  printf '%s\n' "$raw"
 }
 
 fm_tasktmp_claim_create() {  # <state> <task-id>
@@ -410,14 +452,11 @@ fm_tasktmp_claim_create() {  # <state> <task-id>
       fm_tasktmp_error "could not create a private random task temporary claim for $id"
       return 1
     }
-    nonce=${temp##*.}
-    case "$nonce" in
-      ''|*[!A-Za-z0-9]*)
-        rm -f -- "$temp"
-        fm_tasktmp_error "temporary claim generator returned an invalid nonce"
-        return 1
-        ;;
-    esac
+    nonce=$(fm_tasktmp_nonce) || {
+      rm -f -- "$temp"
+      fm_tasktmp_error "temporary claim generator returned an invalid nonce"
+      return 1
+    }
     candidate=$parent/fm-$id.$nonce
     created=$(date -u +%Y-%m-%dT%H:%M:%SZ) || created=
     # One subshell so the private umask cannot outlive this publication, and one

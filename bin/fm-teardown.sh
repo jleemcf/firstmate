@@ -2912,12 +2912,11 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Revalidate immediately before removal.
 # The shared owner preserves absent and already-missing compatibility and
 # refuses every unsafe existing path without traversing or changing it.
-if [ -n "$TASK_TMP" ]; then
-  fm_tasktmp_trust "$ID" "$TASK_TMP"
+if [ -n "$TASK_TMP" ] && ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
   if [ "$FM_TASKTMP_TRUST" = unsafe ]; then
     TASK_TMP_REFUSED=$TASK_TMP
     echo "REFUSED: task temporary root for $ID stopped being trusted immediately before removal: $FM_TASKTMP_ERROR. It was preserved untouched; the rest of this teardown proceeds." >&2
-  elif ! fm_tasktmp_remove "$ID" "$TASK_TMP"; then
+  else
     echo "error: task temporary root for $ID could not be removed: $FM_TASKTMP_ERROR" >&2
     exit 1
   fi
