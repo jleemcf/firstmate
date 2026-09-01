@@ -127,6 +127,8 @@ test_stale_pool_base_refreshes_before_branching() {
   assert_grep "spawn_gen=$(grep '^spawn_gen=' "$HOME_DIR/state/$id.meta" | cut -d= -f2-)" \
     "$POOL_DIR/.fm-task-owner" \
     "spawn owner marker generation does not match metadata"
+  assert_grep 'task_owner_marker=1' "$HOME_DIR/state/$id.meta" \
+    "spawn did not publish the explicit owner-marker awareness bit"
   assert_no_owner_pending_records "$id" \
     "the published task record left its superseded ownership record behind"
   if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then

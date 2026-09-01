@@ -190,6 +190,8 @@ run_control() {  # <case-dir> <args...>
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_FAILURE="${FM_FAKE_GIT_FAILURE:-}" \
     FM_REAL_MV="${FM_REAL_MV:-}" FM_FAKE_COMPLETE_JOURNAL_MV_FAIL="${FM_FAKE_COMPLETE_JOURNAL_MV_FAIL:-}" \
     FM_FAKE_META_PUBLISH_MV_FAIL="${FM_FAKE_META_PUBLISH_MV_FAIL:-}" \
+    FM_FAKE_OWNER_PENDING_MV_FAIL="${FM_FAKE_OWNER_PENDING_MV_FAIL:-}" \
+    FM_FAKE_OWNER_MARKER_MV_FAIL="${FM_FAKE_OWNER_MARKER_MV_FAIL:-}" \
     FM_FAKE_TRACE_PREPARE="${FM_FAKE_TRACE_PREPARE:-}" \
     FM_FAKE_TRACE_RELEASE="${FM_FAKE_TRACE_RELEASE:-}" \
     FM_FAKE_META_WRITER_READY="${FM_FAKE_META_WRITER_READY:-}" \
@@ -234,17 +236,25 @@ if [ -n "${FM_FAKE_COMPLETE_JOURNAL_MV_FAIL:-}" ]; then
     fi
   done
 fi
-if [ -n "${FM_FAKE_META_PUBLISH_MV_FAIL:-}" ]; then
-  for path in "$@"; do
-    [ "$path" != "$FM_FAKE_META_PUBLISH_MV_FAIL" ] || exit 1
-  done
-fi
 source_path=
 target_path=
 for path in "$@"; do
   source_path=$target_path
   target_path=$path
 done
+if [ -n "${FM_FAKE_META_PUBLISH_MV_FAIL:-}" ] \
+   && [ "$target_path" = "$FM_FAKE_META_PUBLISH_MV_FAIL" ]; then
+  exit 1
+fi
+if [ -n "${FM_FAKE_OWNER_PENDING_MV_FAIL:-}" ]; then
+  case "$target_path" in
+    *.meta.worktree-owner-pending.*) exit 1 ;;
+  esac
+fi
+if [ -n "${FM_FAKE_OWNER_MARKER_MV_FAIL:-}" ] \
+   && [ "$target_path" = "$FM_FAKE_OWNER_MARKER_MV_FAIL" ]; then
+  exit 1
+fi
 if [ -n "${FM_FAKE_META_WRITER_TARGET:-}" ] \
    && [ "$target_path" = "$FM_FAKE_META_WRITER_TARGET" ] \
    && grep -q '^x_request=' "$source_path" 2>/dev/null; then
@@ -1406,12 +1416,54 @@ test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view() {
     "relaunch did not stamp the worktree with its own task identity"
   assert_grep "spawn_gen=$(meta_field "$dir" rl32 spawn_gen)" "$dir/wt/.fm-task-owner" \
     "relaunch marker generation does not match the published task generation"
+  assert_grep 'task_owner_marker=1' "$dir/home/state/rl32.meta" \
+    "relaunch did not publish the explicit owner-marker awareness bit"
   [ -z "$(git -C "$dir/wt" status --porcelain)" ] \
     || fail "the owner marker reads as uncommitted work: $(git -C "$dir/wt" status --porcelain)"
   if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
     printf '# observed relaunch owner marker: %s\n' "$(tr '\n' ' ' < "$dir/wt/.fm-task-owner")"
   fi
   pass "fm-control relaunch: the worktree carries this task's owner marker, excluded from git"
+}
+
+test_relaunch_pending_publish_failure_does_not_leak_a_prior_marker_backup() {
+  local dir out rc real_mv leftovers
+  dir=$(new_case owner-pending-failure rl42)
+  add_ship_task "$dir" rl42 claude
+  make_mv_failure_stub "$dir"
+  real_mv=$(command -v mv)
+
+  out=$(FM_REAL_MV="$real_mv" FM_FAKE_OWNER_PENDING_MV_FAIL=1 \
+    run_control "$dir" rl42 relaunch --note "stopped mid-refactor"); rc=$?
+
+  expect_code 1 "$rc" "a relaunch whose durable marker handoff cannot publish must refuse"
+  assert_grep 'spawn_gen=prior-rl42' "$dir/wt/.fm-task-owner" \
+    "the refused relaunch changed the still-authoritative prior owner marker"
+  leftovers=$(find "$dir/home/state" -maxdepth 1 -type f -name '.rl42.task-owner-prior.*' -print)
+  [ -z "$leftovers" ] || fail "the failed pending write leaked a prior-marker backup: $leftovers"
+  [ -z "$(find "$dir/home/state" -maxdepth 1 -type f -name '.rl42.meta.worktree-owner-pending.*' -print)" ] \
+    || fail "the failed pending write left a published handoff record"
+  pass "fm-control relaunch: a failed handoff publish leaks no prior-marker backup"
+}
+
+test_relaunch_marker_publish_failure_cleans_the_prior_marker_backup() {
+  local dir out rc real_mv leftovers
+  dir=$(new_case owner-marker-failure rl43)
+  add_ship_task "$dir" rl43 claude
+  make_mv_failure_stub "$dir"
+  real_mv=$(command -v mv)
+
+  out=$(FM_REAL_MV="$real_mv" FM_FAKE_OWNER_MARKER_MV_FAIL="$dir/wt/.fm-task-owner" \
+    run_control "$dir" rl43 relaunch --note "stopped mid-refactor"); rc=$?
+
+  expect_code 1 "$rc" "a relaunch whose new owner marker cannot publish must refuse"
+  assert_grep 'spawn_gen=prior-rl43' "$dir/wt/.fm-task-owner" \
+    "the failed marker publish did not preserve the prior owner marker"
+  leftovers=$(find "$dir/home/state" -maxdepth 1 -type f -name '.rl43.task-owner-prior.*' -print)
+  [ -z "$leftovers" ] || fail "the failed marker publish leaked a prior-marker backup: $leftovers"
+  [ -z "$(find "$dir/home/state" -maxdepth 1 -type f -name '.rl43.meta.worktree-owner-pending.*' -print)" ] \
+    || fail "the failed marker publish left its durable handoff record"
+  pass "fm-control relaunch: a failed marker publish cleans its prior-marker backup"
 }
 
 test_relaunch_refuses_a_worktree_marked_for_another_task() {
@@ -1660,6 +1712,8 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
 test_relaunch_refuses_a_recycled_worktree_claimed_by_another_task
 test_relaunch_names_the_backup_holding_an_interrupted_claim_retirement
 test_relaunch_stamps_the_worktree_owner_marker_out_of_git_view
+test_relaunch_pending_publish_failure_does_not_leak_a_prior_marker_backup
+test_relaunch_marker_publish_failure_cleans_the_prior_marker_backup
 test_relaunch_refuses_a_worktree_marked_for_another_task
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_a_symlinked_task_record_before_inspection

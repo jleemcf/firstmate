@@ -175,21 +175,22 @@ SH
   printf '%s\n' "$case_dir"
 }
 
-# Write a meta file for the task, exactly as a marker-era spawn publishes it:
-# the record names one spawn generation AND the slot carries the matching
-# .fm-task-owner marker. A record with a generation but no marker is not a
-# fixture shortcut, it is the recycled-slot state teardown must refuse, so it
-# only ever appears in the tests that are about that.
+# Write a meta file for the task exactly as a marker-aware spawn publishes it:
+# the record explicitly promises a marker, names one spawn generation, and the
+# slot carries the matching .fm-task-owner. A record carrying the awareness bit
+# without its marker is the recycled-slot state teardown must refuse.
 # Args: case_dir mode kind
 write_meta() {
   local case_dir=$1 mode=$2 kind=$3
-  write_pre_marker_meta "$case_dir" "$mode" "$kind" "spawn_gen=test-generation-task-x1"
+  write_pre_marker_meta "$case_dir" "$mode" "$kind" \
+    "spawn_gen=test-generation-task-x1" "task_owner_marker=1"
   [ ! -d "$case_dir/wt" ] || stamp_owner_marker "$case_dir/wt" task-x1
 }
 
-# The same record as it looked before .fm-task-owner existed: no spawn
-# generation at all, so the legacy branch and project-membership fallbacks are
-# the only proof available. Args: case_dir mode kind [extra-line...]
+# The same record as it looked before .fm-task-owner existed: it has no explicit
+# marker-awareness bit, so the legacy branch and project-membership fallbacks
+# remain available even when the record already carries the older spawn_gen=.
+# Args: case_dir mode kind [extra-line...]
 write_pre_marker_meta() {
   local case_dir=$1 mode=$2 kind=$3
   shift 3
@@ -1318,7 +1319,7 @@ EOF
 }
 
 # The residual recycled-slot path the owner marker exists to close. The record
-# still names its spawn generation, but the slot's .fm-task-owner is gone: the
+# explicitly promises its owner marker, but the slot's .fm-task-owner is gone: the
 # slot went back to the pool out of band, or a crewmate's `git clean -fdx`
 # removed the marker, which it can because the marker is only info/exclude'd.
 # The slot is a detached scout's now, so it leaves no fm/<id> branch to
@@ -1345,7 +1346,7 @@ EOF
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "marker-era-no-marker: a marker-era record whose marker is gone must refuse"
-  assert_grep "task task-x1 records spawn generation test-generation-task-x1" "$case_dir/stderr" \
+  assert_grep "task task-x1's marker-aware record names spawn generation test-generation-task-x1" "$case_dir/stderr" \
     "marker-era-no-marker: the refusal did not name the task and the generation it records"
   assert_grep "$canonical/.fm-task-owner is absent" "$case_dir/stderr" \
     "marker-era-no-marker: the refusal did not name the canonical path and its absent owner marker"
@@ -1358,16 +1359,16 @@ EOF
   pass "a marker-era record whose owner marker is gone cannot act on a reissued unbranched slot"
 }
 
-# The same recycled slot, reached through a record that says two things about
-# its generation. Two spawn_gen= lines name no single incarnation, and only the
-# total absence of the key means "written before markers existed", so treating
-# an ambiguous generation as pre-marker would hand the legacy branch and
-# project-membership chain back the reissued slot the marker exists to protect.
+# The same recycled slot, reached through a marker-aware record that says two
+# things about its generation. Two spawn_gen= lines name no single incarnation,
+# so treating that aware record as legacy would hand the branch and project
+# membership fallbacks back the reissued slot the marker exists to protect.
 test_duplicate_spawn_gen_refuses_a_reissued_scout_slot() {
   local case_dir canonical rc
   case_dir=$(make_case duplicate-spawn-gen)
   write_pre_marker_meta "$case_dir" no-mistakes ship \
-    "spawn_gen=test-generation-task-x1" "spawn_gen=test-generation-task-x1-again"
+    "spawn_gen=test-generation-task-x1" "spawn_gen=test-generation-task-x1-again" \
+    "task_owner_marker=1"
   canonical=$(CDPATH='' cd -- "$case_dir/wt" && pwd -P)
   assert_absent "$case_dir/wt/.fm-task-owner" \
     "duplicate-spawn-gen: the fixture stamped an owner marker the reissued slot would not have"
@@ -1399,13 +1400,42 @@ EOF
   pass "a record that names two spawn generations cannot act on a reissued unbranched slot"
 }
 
-# A record that wrote spawn_gen= and left it empty is not a record from before
-# the key existed either: the spawn that wrote the key is the spawn that stamps
-# a marker, so an empty generation refuses on the same rule as a duplicated one.
+# Carrying the awareness key ambiguously is not the same as lacking it. If two
+# values could fall through as legacy, a corrupted new claim could regain the
+# exact project-membership path this explicit bit closes.
+test_duplicate_marker_awareness_never_reopens_legacy_fallback() {
+  local case_dir rc
+  case_dir=$(make_case duplicate-marker-awareness)
+  write_pre_marker_meta "$case_dir" no-mistakes ship \
+    "spawn_gen=test-generation-task-x1" "task_owner_marker=1" "task_owner_marker=1"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "duplicate-marker-awareness: the fixture stamped an owner marker"
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' > "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "duplicate-marker-awareness: an ambiguous awareness bit must refuse"
+  assert_grep "names more than one task-owner marker-awareness value" "$case_dir/stderr" \
+    "duplicate-marker-awareness: the refusal did not name the ambiguous bit"
+  assert_absent "$case_dir/treehouse.log" \
+    "duplicate-marker-awareness: ambiguity reopened the destructive legacy path"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "duplicate-marker-awareness: the refusal removed the task record"
+  pass "an ambiguous owner-marker awareness bit never becomes legacy"
+}
+
+# A marker-aware record that wrote spawn_gen= and left it empty names no exact
+# incarnation, so it refuses on the same rule as a duplicated generation.
 test_empty_spawn_gen_refuses_a_reissued_scout_slot() {
   local case_dir rc
   case_dir=$(make_case empty-spawn-gen)
-  write_pre_marker_meta "$case_dir" no-mistakes ship "spawn_gen="
+  write_pre_marker_meta "$case_dir" no-mistakes ship "spawn_gen=" "task_owner_marker=1"
   assert_absent "$case_dir/wt/.fm-task-owner" \
     "empty-spawn-gen: the fixture stamped an owner marker the reissued slot would not have"
   git -C "$case_dir/wt" checkout -q --detach
@@ -1434,14 +1464,15 @@ EOF
   pass "a record that names an empty spawn generation cannot act on a reissued unbranched slot"
 }
 
-# The other half of that rule: a record written before .fm-task-owner existed
-# names no spawn generation at all, so nothing about it implies a marker was
-# ever stamped and the legacy chain stays its proof. An unbranched checkout that
-# is still a registered worktree of its own project is proved by that alone.
+# The other half of that rule: spawn_gen predates .fm-task-owner, so a live
+# pre-upgrade record can carry a generation while lacking the explicit
+# task_owner_marker=1 bit. Nothing migrates that record, and its legacy chain
+# remains untouched. An unbranched checkout still registered to the recorded
+# project is therefore proved by that membership alone.
 test_pre_marker_record_keeps_the_legacy_project_fallback() {
   local case_dir rc
   case_dir=$(make_case pre-marker-legacy)
-  write_pre_marker_meta "$case_dir" no-mistakes ship
+  write_pre_marker_meta "$case_dir" no-mistakes ship "spawn_gen=pre-upgrade-generation"
   git -C "$case_dir/wt" checkout -q --detach
   git -C "$case_dir/wt" branch -q -D fm/task-x1
   assert_absent "$case_dir/wt/.fm-task-owner" \
@@ -1461,7 +1492,7 @@ EOF
     "pre-marker-legacy: the pool slot was never returned"
   assert_absent "$case_dir/state/task-x1.meta" \
     "pre-marker-legacy: teardown left the pre-marker record behind"
-  pass "a pre-marker record with no spawn generation keeps the legacy ownership fallback"
+  pass "a pre-upgrade record with spawn generation but no awareness bit keeps the legacy fallback"
 }
 
 # The receipt is the only durable proof that the provider step already ran, so
@@ -3990,6 +4021,7 @@ test_worktree_detached_off_its_task_branch_tip_is_still_torn_down
 test_same_task_id_with_a_different_marker_generation_refuses
 test_marker_era_record_with_no_marker_refuses_a_reissued_scout_slot
 test_duplicate_spawn_gen_refuses_a_reissued_scout_slot
+test_duplicate_marker_awareness_never_reopens_legacy_fallback
 test_empty_spawn_gen_refuses_a_reissued_scout_slot
 test_pre_marker_record_keeps_the_legacy_project_fallback
 test_retirement_receipt_survives_a_failed_record_removal

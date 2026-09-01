@@ -849,6 +849,7 @@ spawn_abort_cleanup() {
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${SPAWN_GEN:-}" ] || echo "spawn_gen=$SPAWN_GEN"
+            [ "$KIND" = secondmate ] || echo "task_owner_marker=1"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
           } > "$SPAWN_META_TMP" 2>/dev/null \
             && fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE" \
@@ -2592,14 +2593,6 @@ stamp_task_worktree_owner() {
     return 1
   fi
   exclude_path "$FM_WORKTREE_TASK_OWNER_MARKER"
-  if [ "$RELAUNCH" -eq 1 ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
-    SPAWN_TASK_OWNER_BACKUP=$(umask 077; mktemp "$STATE/.$ID.task-owner-prior.XXXXXX") || return 1
-    if ! cp -p -- "$marker" "$SPAWN_TASK_OWNER_BACKUP"; then
-      rm -f -- "$SPAWN_TASK_OWNER_BACKUP"
-      SPAWN_TASK_OWNER_BACKUP=
-      return 1
-    fi
-  fi
   # Rewriting a marker this task already owns is one exact generation
   # transition, not two independent writes, so the record published below names
   # the generation being replaced. The record is what proves, after a crash
@@ -2621,6 +2614,17 @@ stamp_task_worktree_owner() {
     return 1
   fi
   SPAWN_TASK_OWNER_PENDING=1
+  # The prior marker remains authoritative until the final mv below. Take its
+  # rollback copy only after the durable handoff exists, so a failure to publish
+  # that handoff cannot leak a backup the abort path never learned to clean.
+  if [ "$RELAUNCH" -eq 1 ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+    SPAWN_TASK_OWNER_BACKUP=$(umask 077; mktemp "$STATE/.$ID.task-owner-prior.XXXXXX") || return 1
+    if ! cp -p -- "$marker" "$SPAWN_TASK_OWNER_BACKUP"; then
+      rm -f -- "$SPAWN_TASK_OWNER_BACKUP"
+      SPAWN_TASK_OWNER_BACKUP=
+      return 1
+    fi
+  fi
   tmp="$marker.next.${BASHPID:-$$}"
   if ! (umask 077; {
       printf '%s\n' 'schema=fm-task-owner.v1'
@@ -2638,14 +2642,16 @@ stamp_task_worktree_owner() {
 # The marker and the task record are two halves of one generation binding, so
 # the rollback decision is read from what the record itself publishes rather
 # than from how far this run got. Once state/<id>.meta names this spawn
-# generation, restoring the superseded marker would contradict the live record
-# and wedge every later ownership proof, so the stamp is committed instead.
-task_record_publishes_spawn_gen() {
-  local meta="$STATE/$ID.meta" recorded
+# generation and explicitly promises an owner marker, restoring the superseded
+# marker would contradict the live record and wedge every later ownership
+# proof, so the stamp is committed instead.
+task_record_publishes_owner_binding() {
+  local meta="$STATE/$ID.meta" recorded awareness
   [ -n "${SPAWN_GEN:-}" ] || return 1
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   recorded=$(fm_worktree_meta_exact_value "$meta" spawn_gen 2>/dev/null || true)
-  [ -n "$recorded" ] && [ "$recorded" = "$SPAWN_GEN" ]
+  awareness=$(fm_worktree_meta_exact_value "$meta" task_owner_marker 2>/dev/null || true)
+  [ -n "$recorded" ] && [ "$recorded" = "$SPAWN_GEN" ] && [ "$awareness" = 1 ]
 }
 
 # Retracts only the ownership record this exact generation published, so an
@@ -2663,12 +2669,23 @@ clear_task_worktree_owner_pending() {
 clear_aborted_task_worktree_owner_stamp() {
   local marker="${WT:-}/$FM_WORKTREE_TASK_OWNER_MARKER" stamp_rc
   if [ "$SPAWN_TASK_OWNER_STAMPED" != 1 ]; then
-    # The record went down first, so an abort before the marker existed still
-    # has one to retract.
-    clear_task_worktree_owner_pending
-    return $?
+    # The ownership record went down first, but the prior marker still occupies
+    # the slot until the atomic marker mv succeeds. Retract the pending record
+    # and discard the duplicate rollback copy; neither is authority once the
+    # original marker was never replaced.
+    stamp_rc=0
+    clear_task_worktree_owner_pending || stamp_rc=$?
+    if [ -n "$SPAWN_TASK_OWNER_BACKUP" ]; then
+      if rm -f -- "$SPAWN_TASK_OWNER_BACKUP"; then
+        SPAWN_TASK_OWNER_BACKUP=
+      else
+        echo "warning: task $ID's unused owner-marker backup remains at $SPAWN_TASK_OWNER_BACKUP" >&2
+        stamp_rc=1
+      fi
+    fi
+    return "$stamp_rc"
   fi
-  if task_record_publishes_spawn_gen; then
+  if task_record_publishes_owner_binding; then
     commit_task_worktree_owner_stamp
     return $?
   fi
@@ -3151,7 +3168,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen task_owner_marker traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -3171,6 +3188,10 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  # This explicit bit, not spawn_gen (which predates owner markers), makes a
+  # missing marker authoritative for new ordinary task claims. Existing records
+  # are never migrated and keep their legacy ownership fallback.
+  [ "$KIND" = secondmate ] || echo "task_owner_marker=1"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;

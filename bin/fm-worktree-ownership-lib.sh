@@ -13,16 +13,18 @@
 # to a later spawn of the same task id.
 # A matching owner marker proves an ordinary ship or scout without requiring a
 # branch, which covers every unbranched scout and ship before its first action.
-# A record that names a spawn generation was written by a spawn that stamps a
-# marker, so an absent marker on a live path is not a missing proof but the
-# signature of a slot that left this task, and it refuses by name unless the
-# provider's own id-to-path binding already spoke for that path independently.
-# Only a genuinely pre-marker record - one that carries no spawn generation line
-# at all - keeps the legacy chain: refs/heads/fm/<task-id> proves ownership,
-# another fm/<id> branch refuses, and an unattributed checkout falls back to
-# membership in the task's recorded project. A duplicated, empty, or unreadable
-# generation is not that record; it named a generation and then said nothing
-# usable about it, so it refuses by name instead of reopening those fallbacks.
+# A new claim records task_owner_marker=1 alongside the spawn generation that
+# its marker binds. An absent marker on a live path carrying that bit is not a
+# missing proof but the signature of a slot that left this task, and it refuses
+# by name unless the provider's own id-to-path binding already spoke for that
+# path independently. Records without the bit keep the legacy chain unchanged,
+# including records from before this marker that already carry spawn_gen=:
+# refs/heads/fm/<task-id> proves ownership, another fm/<id> branch refuses, and
+# an unattributed checkout falls back to membership in the recorded project.
+# No migration rewrites a live legacy record. A duplicated, empty, unreadable,
+# or unsupported awareness bit refuses instead of being inferred absent; when
+# the bit is set, an unusable generation likewise refuses rather than reopening
+# the legacy fallbacks.
 # A recorded path that no longer exists holds nothing this task could destroy,
 # so it is proved once no other task claims it and no provider binding
 # contradicts it. A record that claims no path at all has nothing to prove and
@@ -680,20 +682,19 @@ EOF
 # The per-task ownership marker bin/fm-spawn.sh stamps into every crewmate
 # worktree once it owns the slot. 0 when task id and spawn generation match this
 # task's metadata, 1 when either differs or the marker cannot be read, 2 when no
-# marker has been stamped there yet and the record is genuinely pre-marker, and
-# 3 when a marker-era record - one that names an exact spawn generation, so the
-# spawn that wrote it also stamped a marker - finds none. A generation mismatch
+# marker has been stamped there yet and the record carries no marker-awareness
+# bit, and 3 when a marker-aware record finds none. A generation mismatch
 # refuses even when the task id was reused.
-# Absence is only inconclusive for the pre-marker record, because for every
-# other one it is the signature of a slot that left this task: a pool return, a
-# reaper, or the `git clean -fdx` this marker is only info/exclude'd against.
-# The caller decides what an absent marker costs a marker-era record, since the
-# provider's own id-to-path binding can still speak for a path no marker does.
-fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation> [state-dir]
-  local canonical=$1 id=$2 expected_gen=$3 state=${4:-} marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
+# Absence is only inconclusive for a legacy record, because for every aware one
+# it is the signature of a slot that left this task: a pool return, a reaper, or
+# the `git clean -fdx` this marker is only info/exclude'd against. The caller
+# decides what an absent marker costs an aware record, since the provider's own
+# id-to-path binding can still speak for a path no marker does.
+fm_worktree_task_owner_marker_binding() {  # <canonical-worktree> <task-id> <spawn-generation> <marker-aware:0|1> [state-dir]
+  local canonical=$1 id=$2 expected_gen=$3 marker_aware=$4 state=${5:-} marker=$1/$FM_WORKTREE_TASK_OWNER_MARKER
   local schema owner generation
   if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
-    [ -z "$expected_gen" ] || return 3
+    [ "$marker_aware" != 1 ] || return 3
     return 2
   fi
   if [ ! -f "$marker" ] || [ -L "$marker" ]; then
@@ -735,6 +736,7 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   local state=$1 id=$2 meta=$3 worktree canonical kind backend project spawn_gen
   local marker worktree_id resolved resolved_canonical provider_proof='' rc=0 claim_rc=0 present=0
   local backup evidence marker_rc=0 gen_rc=0 gen_unusable=''
+  local marker_aware=0 awareness awareness_rc=0 awareness_unusable=''
   FM_WORKTREE_OWNERSHIP_PATH=
   FM_WORKTREE_OWNERSHIP_PROOF=
   FM_WORKTREE_OWNERSHIP_ORCA_PATH_MATCH=0
@@ -754,11 +756,26 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
   backend=$(fm_worktree_meta_exact_value "$meta" backend 2>/dev/null || true)
   [ -n "$backend" ] || backend=tmux
   project=$(fm_worktree_meta_exact_value "$meta" project 2>/dev/null || true)
-  # Only the total absence of the key is pre-marker legacy. A duplicated, empty,
-  # or unreadable generation is a record that named one and then said something
-  # unusable about it, and inferring "written before markers existed" from that
-  # is exactly the classification that reopens the branch/project fallback the
-  # marker was introduced to close.
+  # spawn_gen predates owner markers, so it cannot distinguish a legacy record
+  # from one that promises a positive marker. Only this explicit bit does that;
+  # its absence leaves old records byte-for-byte and behavior-for-behavior
+  # legacy, while any malformed attempt to carry it stays unknown rather than
+  # silently becoming legacy.
+  awareness=$(fm_worktree_meta_probe "$meta" task_owner_marker) || awareness_rc=$?
+  case "$awareness_rc" in
+    0)
+      if [ "$awareness" = 1 ]; then
+        marker_aware=1
+      else
+        awareness_unusable="names unsupported task-owner marker awareness '$awareness'"
+      fi
+      ;;
+    2) marker_aware=0 ;;
+    3) awareness_unusable='names more than one task-owner marker-awareness value' ;;
+    4) awareness_unusable='names an empty task-owner marker-awareness value' ;;
+    *) awareness_unusable='could not be read for task-owner marker awareness' ;;
+  esac
+
   spawn_gen=$(fm_worktree_meta_probe "$meta" spawn_gen) || gen_rc=$?
   case "$gen_rc" in
     0) ;;
@@ -853,20 +870,24 @@ fm_worktree_ownership_prove() {  # <state-dir> <task-id> <meta-file>
     fi
     [ -n "$provider_proof" ] || provider_proof=secondmate-marker
   else
-    if [ -n "$gen_unusable" ] && [ -z "$provider_proof" ]; then
-      fm_worktree_refuse "task $id's record $meta $gen_unusable, so nothing establishes whether worktree $canonical was ever stamped for this task; an unusable generation is never read as a pre-marker record."
+    if [ -n "$awareness_unusable" ] && [ -z "$provider_proof" ]; then
+      fm_worktree_refuse "task $id's record $meta $awareness_unusable, so marker ownership of worktree $canonical is ambiguous and the legacy fallback cannot be inferred."
+      return 1
+    fi
+    if [ "$marker_aware" -eq 1 ] && [ -n "$gen_unusable" ] && [ -z "$provider_proof" ]; then
+      fm_worktree_refuse "task $id's marker-aware record $meta $gen_unusable, so no exact marker generation proves ownership of worktree $canonical."
       return 1
     fi
     marker_rc=0
-    fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" "$state" || marker_rc=$?
+    fm_worktree_task_owner_marker_binding "$canonical" "$id" "$spawn_gen" "$marker_aware" "$state" || marker_rc=$?
     [ "$marker_rc" -ne 1 ] || return 1
     if [ "$marker_rc" -eq 3 ] && [ -z "$provider_proof" ]; then
-      # A marker-era record with no marker has already lost the only binding
+      # A marker-aware record with no marker has already lost the only binding
       # that distinguishes its slot from one reissued to another task, and the
       # remaining fallbacks cannot tell them apart: an unbranched scout leaves
       # no fm/<id> branch to contradict this record, and a reissued pool slot is
       # still a registered worktree of the same project.
-      fm_worktree_refuse "task $id records spawn generation $spawn_gen for worktree $canonical, but $canonical/$FM_WORKTREE_TASK_OWNER_MARKER is absent, so nothing proves task $id still owns that path."
+      fm_worktree_refuse "task $id's marker-aware record names spawn generation $spawn_gen for worktree $canonical, but $canonical/$FM_WORKTREE_TASK_OWNER_MARKER is absent, so nothing proves task $id still owns that path."
       return 1
     fi
     if [ "$marker_rc" -eq 0 ]; then
