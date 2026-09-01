@@ -385,22 +385,33 @@ fm_backend_endpoint_atom_valid() {  # <value>
 
 # A worktree-claim retirement (bin/fm-worktree-ownership-lib.sh) is the one way
 # a live record loses its worktree identity, and its surviving copy is the only
-# remaining record of the path, so name it wherever that loss surfaces. Which
-# copy it is decides the story: a quarantined released-evidence copy means the
-# provider already took the path back, while a claim backup leaves the provider
-# outcome unknown. Neither is ever advertised as a claim to put back
-# unexamined - a released path can already belong to another task.
+# remaining record of the path, so name it wherever that loss surfaces. Whether
+# the retirement is RECORDED decides the story, not which namespace the copy
+# happens to sit in: a recorded retirement - by receipt, by quarantined released
+# evidence, or because the slot proved it had moved on - means this record holds
+# no path at all and every surviving copy is evidence only. Only an unrecorded
+# retirement leaves the provider outcome open, and even then the copy is never
+# advertised as a claim to put back unexamined, because a released path can
+# already belong to another task.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
-  local meta=$1 backup evidence pair=
+  local meta=$1 backup evidence pair= retired=1
+  if declare -F fm_worktree_retirement_receipt_present >/dev/null 2>&1 \
+    && fm_worktree_retirement_receipt_present "$meta" >/dev/null 2>&1; then
+    retired=0
+  fi
   if declare -F fm_worktree_released_evidence_hint >/dev/null 2>&1 \
     && evidence=$(fm_worktree_released_evidence_hint "$meta" 2>/dev/null) \
     && [ -n "$evidence" ]; then
-    echo "The provider already released this record's worktree and that path may already belong to another task; only recording the retirement failed, so a copy of the released record was quarantined at $evidence. It is evidence of the release, never authority over that path, and must never be restored over the record." >&2
+    echo "This record's worktree was already retired and that path may already belong to another task, so a copy of the record it held was quarantined at $evidence. It is evidence of that retirement, never authority over the path, and must never be restored over the record." >&2
     return 0
   fi
   declare -F fm_worktree_claim_backup_hint >/dev/null 2>&1 || return 0
   backup=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || return 0
   [ -n "$backup" ] || return 0
+  if [ "$retired" -eq 0 ]; then
+    echo "This record's retirement is recorded, so it holds no worktree and the superseded copy at $backup names a path it no longer owns; it is evidence only and must never be restored over the record." >&2
+    return 0
+  fi
   if declare -F fm_worktree_marker_backup_clause >/dev/null 2>&1; then
     pair=$(fm_worktree_marker_backup_clause "$meta" 2>/dev/null) || pair=
   fi

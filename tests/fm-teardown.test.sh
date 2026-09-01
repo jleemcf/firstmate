@@ -222,6 +222,19 @@ stamp_owner_marker() {
   } > "$wt/.fm-task-owner"
 }
 
+# The exact bytes a reissued slot's new holder wrote into its owner marker,
+# recorded at $case_dir/task-b-marker.expected so a caller can prove nothing in
+# this task's teardown or recovery touched them.
+# Args: case_dir
+write_task_b_marker_fixture() {
+  local case_dir=$1
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=task-b'
+    printf '%s\n' 'spawn_gen=test-generation-task-b'
+  } > "$case_dir/task-b-marker.expected"
+}
+
 # A pool return that hands the slot to another task and then reports failure:
 # task-b's marker is in the slot before the failure surfaces, which is the only
 # state a completed handover can produce. Records the exact bytes task-b wrote
@@ -229,11 +242,7 @@ stamp_owner_marker() {
 # Args: case_dir
 reissue_slot_to_task_b_then_fail() {
   local case_dir=$1
-  {
-    printf '%s\n' 'schema=fm-task-owner.v1'
-    printf '%s\n' 'task_id=task-b'
-    printf '%s\n' 'spawn_gen=test-generation-task-b'
-  } > "$case_dir/task-b-marker.expected"
+  write_task_b_marker_fixture "$case_dir"
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
@@ -2243,12 +2252,17 @@ EOF
 # rather than the command substitution wrapped around the provider call.
 # Returns the teardown's exit status.
 # Args: case_dir
+# An optional second argument is shell run inside the provider call, just before
+# the signal, so a caller can put the slot into the state the interruption then
+# leaves unresolved.
+# Args: case_dir [pre-kill-shell]
 interrupt_teardown_inside_the_pool_return() {
-  local case_dir=$1 rc=0
+  local case_dir=$1 before=${2:-} rc=0
   cat > "$case_dir/fakebin/treehouse" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
 printf 'returned\n' >> "$case_dir/treehouse.log"
+$before
 kill -TERM "\$(cat "$case_dir/state/.control-task-x1.lock/pid")"
 exit 1
 EOF
@@ -2311,6 +2325,94 @@ test_interrupted_retirement_keeps_and_names_both_recovery_halves() {
   [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
     || fail "interrupted-pair: a record that cannot prove ownership still returned the slot"
   pass "an interrupted retirement keeps and names both halves of its recovery pair"
+}
+
+# The same interruption over a slot the pool has already handed on. The killed
+# process's warning is the one thing an operator will never read, so the state
+# it leaves on disk has to carry the rule: every later refusal reads the copies
+# beside the record, and if they are still restorable it will keep advertising a
+# restore that stamps this task back over the task now live in the slot.
+test_interrupted_retirement_over_a_reissued_slot_retires_the_record() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence marker_evidence
+  case_dir=$(make_case interrupted-reissued)
+  write_meta "$case_dir" no-mistakes ship
+  write_task_b_marker_fixture "$case_dir"
+
+  rc=0
+  interrupt_teardown_inside_the_pool_return "$case_dir" \
+    "cp -- \"$case_dir/task-b-marker.expected\" \"$case_dir/wt/.fm-task-owner\"" || rc=$?
+
+  expect_code 143 "$rc" "interrupted-reissued: the fixture must kill teardown inside the pool return"$'\n'"$(cat "$case_dir/stderr")"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "interrupted-reissued: the interrupted retirement rewrote the new holder's marker"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "interrupted-reissued: the claim stayed where a later refusal offers it for restore"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "interrupted-reissued: the owner marker stayed where a later refusal offers it for restore"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_evidence[0]}" \
+    "interrupted-reissued: the claim was not kept as evidence of what the record held"
+  marker_evidence=("$case_dir/state"/.task-x1.meta.task-owner-released.*)
+  assert_grep "task_id=task-x1" "${marker_evidence[0]}" \
+    "interrupted-reissued: the retired owner marker was not kept as evidence"
+  assert_grep "no restore was attempted" "$case_dir/stderr" \
+    "interrupted-reissued: the abandon diagnostic never said restoration was not attempted"
+  assert_no_grep "put both halves back" "$case_dir/stderr" \
+    "interrupted-reissued: the interrupted run still advertised restoring the pair"
+
+  # The rerun is where the killed process's warning cannot help: it has only the
+  # record and the copies beside it to go on.
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "interrupted-reissued: the retired record's rerun should finish"$'\n'"$(cat "$case_dir/stderr2")"
+  cmp -s "$case_dir/wt/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "interrupted-reissued: the rerun rewrote the marker of the task holding the slot"
+  assert_no_grep "recoverable" "$case_dir/stderr2" \
+    "interrupted-reissued: the rerun re-advertised a copy of a moved-on slot as recoverable"
+  assert_no_grep "put both halves back" "$case_dir/stderr2" \
+    "interrupted-reissued: the rerun re-advertised restoring the pair over the new owner"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "interrupted-reissued: the rerun invoked the provider return on a reissued slot"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "interrupted-reissued: the rerun left the retired record behind"
+  assert_absent "${claim_evidence[0]}" \
+    "interrupted-reissued: the claim evidence outlived the record it described"
+  assert_absent "${marker_evidence[0]}" \
+    "interrupted-reissued: the marker evidence outlived the record it described"
+  pass "an interrupted retirement over a reissued slot retires the record instead of offering it back"
+}
+
+# The strictness that makes the rule above safe to apply from a trap. Something
+# is in the slot, but it is not a marker that can name an owner, so it is not
+# proof the pool handed the path on - and the recovery pair an operator still
+# needs must survive.
+test_interrupted_retirement_keeps_the_pair_when_the_slot_is_unattributable() {
+  local case_dir rc
+  local -a claim_backups marker_backups claim_evidence
+  case_dir=$(make_case interrupted-unattributable)
+  write_meta "$case_dir" no-mistakes ship
+
+  rc=0
+  interrupt_teardown_inside_the_pool_return "$case_dir" \
+    "printf 'not-a-marker\n' > \"$case_dir/wt/.fm-task-owner\"" || rc=$?
+
+  expect_code 143 "$rc" "interrupted-unattributable: the fixture must kill teardown inside the pool return"$'\n'"$(cat "$case_dir/stderr")"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
+    "interrupted-unattributable: an unattributable slot cost the operator the recoverable claim"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  assert_grep "task_id=task-x1" "${marker_backups[0]}" \
+    "interrupted-unattributable: an unattributable slot cost the operator the marker half"
+  claim_evidence=("$case_dir/state"/.task-x1.meta.worktree-released.*)
+  [ ! -e "${claim_evidence[0]}" ] \
+    || fail "interrupted-unattributable: an unattributable slot was treated as proof the pool took the path back"
+  assert_grep "put both halves back" "$case_dir/stderr" \
+    "interrupted-unattributable: the abandon diagnostic dropped the recovery pair it still has"
+  pass "an unattributable slot is not handover proof and keeps the recovery pair"
 }
 
 # The other side of that pair: once both halves are back, the record proves its
@@ -4271,6 +4373,8 @@ test_failed_marker_restore_names_the_surviving_copy
 test_stale_owner_marker_backup_is_swept_with_the_record
 test_aborted_relaunch_prior_marker_copy_is_swept_with_the_record
 test_interrupted_retirement_keeps_and_names_both_recovery_halves
+test_interrupted_retirement_over_a_reissued_slot_retires_the_record
+test_interrupted_retirement_keeps_the_pair_when_the_slot_is_unattributable
 test_restored_recovery_pair_lets_the_rerun_finish
 test_vanished_worktree_teardown_keeps_the_task_branch
 test_detached_reachable_head_keeps_the_unpushed_task_branch

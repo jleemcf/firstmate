@@ -1168,10 +1168,17 @@ fm_worktree_claim_retire_commit() {
 # until an operator resolves it. Dropping the marker's copy here would leave the
 # claim's copy advertising a restore that can only produce a marker-aware record
 # with no marker - a state nothing can rebuild and every verb refuses forever.
+# The slot itself can still answer the question the interruption left open, so
+# it is asked before any copy is named as recoverable. A marker positively
+# naming another owner takes the same moved-on path the synchronous restore
+# takes, because a warning alone would leave both copies exactly where the next
+# run's refusal offers them - and that refusal outlives the killed process the
+# warning was printed from.
 fm_worktree_claim_retire_abandon() {
   local meta=$FM_WORKTREE_CLAIM_RETIRE_META backup=$FM_WORKTREE_CLAIM_RETIRE_BACKUP
   local marker=$FM_WORKTREE_CLAIM_RETIRE_MARKER
   local marker_backup=$FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP
+  local path=$FM_WORKTREE_CLAIM_RETIRE_PATH stash=
   [ "$FM_WORKTREE_CLAIM_RETIRE_ACTIVE" != 0 ] || return 0
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
@@ -1181,14 +1188,17 @@ fm_worktree_claim_retire_abandon() {
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
   if [ -n "$backup" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
     if [ -n "$marker_backup" ] && [ -f "$marker_backup" ]; then
-      if [ -d "${marker%/*}" ] && ! fm_worktree_marker_still_ours "$marker" "$marker_backup"; then
-        # The slot answers the question the interruption left open: it is not
-        # this task's any more, so naming either copy as recoverable would be
-        # advertising a restore over whoever holds it now.
-        echo "warning: a worktree claim retirement for $meta was interrupted, and $marker is no longer this task's own $FM_WORKTREE_TASK_OWNER_MARKER, so that path has moved on: no restore was attempted and neither the claim copy at $backup nor the marker copy at $marker_backup may be put back over it. They are evidence of what this record held, and every lifecycle verb refuses this record until it is resolved." >&2
-      else
-        echo "warning: a worktree claim retirement for $meta was interrupted before the provider reported its result; the recoverable claim is at $backup and the $FM_WORKTREE_TASK_OWNER_MARKER retired with it is at $marker_backup. Confirm the provider did NOT release that path first, then put both halves back together or neither: a claim restored without its marker can never prove ownership again. Every lifecycle verb refuses this record until it is resolved." >&2
+      if fm_worktree_marker_names_another_owner "$marker" "$marker_backup"; then
+        # The slot answers the question the interruption left open, and it
+        # answers it positively: another task holds it. Only naming that in a
+        # warning would leave both copies where a later refusal offers them, so
+        # the same rule the synchronous path applies is applied here.
+        fm_worktree_claim_retire_moved_on \
+          "a worktree claim retirement for $meta was interrupted before the provider reported its result" \
+          "$meta" "$path" "$backup" "$marker" "$marker_backup" || true
+        return 0
       fi
+      echo "warning: a worktree claim retirement for $meta was interrupted before the provider reported its result; the recoverable claim is at $backup and the $FM_WORKTREE_TASK_OWNER_MARKER retired with it is at $marker_backup. Confirm the provider did NOT release that path first, then put both halves back together or neither: a claim restored without its marker can never prove ownership again. Every lifecycle verb refuses this record until it is resolved." >&2
     else
       echo "warning: a worktree claim retirement for $meta was interrupted before the provider reported its result; the recoverable claim is at $backup and every lifecycle verb refuses this record until it is resolved." >&2
     fi
@@ -1198,6 +1208,15 @@ fm_worktree_claim_retire_abandon() {
   # marker's copy is the one surviving half and the state that refuses every
   # later proof is the absent marker, not a claim anyone has to recover.
   if [ -z "$backup" ] && [ -n "$marker_backup" ] && [ -f "$marker_backup" ]; then
+    if fm_worktree_marker_names_another_owner "$marker" "$marker_backup"; then
+      # The restored claim now names a slot another task marks, so the one half
+      # still on disk may never go back over it either. Every proof of this
+      # record refuses on that foreign marker, and the copy stops being
+      # something any later diagnostic can offer.
+      stash=$(fm_worktree_marker_released_evidence_quarantine "$meta" "$marker_backup") || stash=
+      echo "warning: the worktree claim in $meta was restored, but $marker now marks that slot for another task, so its retired $FM_WORKTREE_TASK_OWNER_MARKER was not put back and never may be; the copy is kept only as evidence at ${stash:-$marker_backup}." >&2
+      return 0
+    fi
     echo "warning: the worktree claim in $meta was restored, but its $FM_WORKTREE_TASK_OWNER_MARKER could not be put back at ${marker:-the recorded worktree}; every lifecycle verb refuses this record until that marker is restored from $marker_backup." >&2
     return 0
   fi
@@ -1213,9 +1232,9 @@ fm_worktree_claim_retire_abandon() {
 # offering to stamp this task back over the task that holds the slot now. The
 # retirement is recorded like any other release, so a rerun can finish this
 # record's remaining cleanup without ever resolving a path through it.
-fm_worktree_claim_retire_moved_on() {  # <meta-file> <claim-backup> <marker-path> <marker-backup>
-  local meta=$1 backup=$2 marker=$3 marker_backup=$4
-  local released=$FM_WORKTREE_CLAIM_RETIRE_PATH owner evidence= stash=
+fm_worktree_claim_retire_moved_on() {  # <cause> <meta-file> <released-path> <claim-backup> <marker-path> <marker-backup>
+  local cause=$1 meta=$2 released=$3 backup=$4 marker=$5 marker_backup=$6
+  local owner evidence= stash=
   owner=$(fm_worktree_meta_exact_value "$marker" task_id 2>/dev/null || true)
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
@@ -1223,11 +1242,14 @@ fm_worktree_claim_retire_moved_on() {  # <meta-file> <claim-backup> <marker-path
   FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
+  # The receipt goes down before either rename, so a record whose authority this
+  # call retires stays retired even when neither copy can be moved out of the
+  # namespace a later refusal would otherwise offer it from.
   fm_worktree_retirement_receipt_write "$meta" "$released" || true
   [ -z "$backup" ] || evidence=$(fm_worktree_released_evidence_quarantine "$meta" "$backup") || evidence=
   [ -z "$marker_backup" ] \
     || stash=$(fm_worktree_marker_released_evidence_quarantine "$meta" "$marker_backup") || stash=
-  fm_worktree_refuse "provider return failed, and $marker now marks worktree ${released:-that path} for task ${owner:-another task}, not task $(fm_worktree_record_identity "$meta"), so the pool already handed it on: no restore was attempted, that marker was left exactly as its owner wrote it, and this record's authority over ${released:-that path} is retired for good. What this retirement held is kept only as evidence that can never be restored over the record or that path - the claim at ${evidence:-no surviving copy} and the $FM_WORKTREE_TASK_OWNER_MARKER at ${stash:-no surviving copy}."
+  fm_worktree_refuse "$cause, and $marker now marks worktree ${released:-that path} for task ${owner:-another task}, not task $(fm_worktree_record_identity "$meta"), so the pool already handed it on: no restore was attempted, that marker was left exactly as its owner wrote it, and this record's authority over ${released:-that path} is retired for good. What this retirement held is kept only as evidence that can never be restored over the record or that path - the claim at ${evidence:-no surviving copy} and the $FM_WORKTREE_TASK_OWNER_MARKER at ${stash:-no surviving copy}."
   return 1
 }
 
@@ -1241,7 +1263,8 @@ fm_worktree_claim_retire_restore() {
   if [ -n "$marker_backup" ] && [ -d "${marker%/*}" ] \
     && ! fm_worktree_marker_still_ours "$marker" "$marker_backup"; then
     if fm_worktree_marker_names_another_owner "$marker" "$marker_backup"; then
-      fm_worktree_claim_retire_moved_on "$meta" "$backup" "$marker" "$marker_backup"
+      fm_worktree_claim_retire_moved_on "provider return failed" "$meta" \
+        "$FM_WORKTREE_CLAIM_RETIRE_PATH" "$backup" "$marker" "$marker_backup"
       return 1
     fi
     # Occupied by something this task cannot attribute: not proof the slot was
