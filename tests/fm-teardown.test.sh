@@ -2126,6 +2126,128 @@ EOF
   pass "a stale owner-marker copy is swept once the task record it described is gone"
 }
 
+# Reproduces the operator's remedy for a hung pool return: kill the teardown.
+# Bash runs the EXIT trap on SIGTERM, so fm_worktree_claim_retire_abandon closes
+# a retirement whose provider verdict never arrived - with the record's worktree=
+# line and the slot's owner marker both already off disk. The control lock holds
+# the teardown shell's own pid, which is what makes the signal reach the shell
+# rather than the command substitution wrapped around the provider call.
+# Returns the teardown's exit status.
+# Args: case_dir
+interrupt_teardown_inside_the_pool_return() {
+  local case_dir=$1 rc=0
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+kill -TERM "\$(cat "$case_dir/state/.control-task-x1.lock/pid")"
+exit 1
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  return "$rc"
+}
+
+# The claim copy and the owner-marker copy are one recovery pair. Restoring the
+# claim alone republishes a marker-aware record over a slot carrying no marker,
+# and nothing in the fleet can restamp that marker, so an interrupted retirement
+# that keeps one half and deletes the other advertises a recovery that wedges
+# the record for good.
+test_interrupted_retirement_keeps_and_names_both_recovery_halves() {
+  local case_dir rc
+  local -a claim_backups marker_backups
+  case_dir=$(make_case interrupted-pair)
+  write_meta "$case_dir" no-mistakes ship
+
+  rc=0
+  interrupt_teardown_inside_the_pool_return "$case_dir" || rc=$?
+
+  expect_code 143 "$rc" "interrupted-pair: the fixture must kill teardown inside the pool return"$'\n'"$(cat "$case_dir/stderr")"
+  assert_grep "returned" "$case_dir/treehouse.log" \
+    "interrupted-pair: the fixture never reached the provider call it interrupts"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "interrupted-pair: the claim was never retired, so this is not the state under test"
+  assert_absent "$case_dir/wt/.fm-task-owner" \
+    "interrupted-pair: the owner marker was never retired, so this is not the state under test"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$case_dir/wt" "${claim_backups[0]}" \
+    "interrupted-pair: the interrupted retirement kept no recoverable copy of the claim"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ -f "${marker_backups[0]}" ] \
+    || fail "interrupted-pair: the only surviving copy of the owner marker was deleted"
+  assert_grep "task_id=task-x1" "${marker_backups[0]}" \
+    "interrupted-pair: the surviving copy is not this task's marker"
+  assert_grep "${claim_backups[0]}" "$case_dir/stderr" \
+    "interrupted-pair: the abandon diagnostic never named the recoverable claim"
+  assert_grep "${marker_backups[0]}" "$case_dir/stderr" \
+    "interrupted-pair: the abandon diagnostic named the claim without its marker half"
+
+  # The operator follows only the claim half of that advice. The record is whole
+  # again and marker-aware, its slot is not, and the refusal that follows has to
+  # point at the copy that can still finish the recovery.
+  cp -p "${claim_backups[0]}" "$case_dir/state/task-x1.meta"
+  rm -f "${claim_backups[0]}"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 1 "$rc" "interrupted-pair: a claim restored without its marker must refuse"
+  assert_grep ".fm-task-owner is absent" "$case_dir/stderr2" \
+    "interrupted-pair: the refusal did not name the missing owner marker"
+  assert_grep "${marker_backups[0]}" "$case_dir/stderr2" \
+    "interrupted-pair: the refusal never named the marker copy that can finish the recovery"
+  assert_present "${marker_backups[0]}" \
+    "interrupted-pair: the refusal discarded the marker copy it depends on"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "interrupted-pair: the refusal removed the task record"
+  [ "$(grep -c returned "$case_dir/treehouse.log")" = 1 ] \
+    || fail "interrupted-pair: a record that cannot prove ownership still returned the slot"
+  pass "an interrupted retirement keeps and names both halves of its recovery pair"
+}
+
+# The other side of that pair: once both halves are back, the record proves its
+# own ownership again and the rerun finishes normally, taking every leftover
+# copy with the record it described.
+test_restored_recovery_pair_lets_the_rerun_finish() {
+  local case_dir rc
+  local -a claim_backups marker_backups
+  case_dir=$(make_case restored-pair)
+  write_meta "$case_dir" no-mistakes ship
+
+  rc=0
+  interrupt_teardown_inside_the_pool_return "$case_dir" || rc=$?
+  expect_code 143 "$rc" "restored-pair: the fixture must kill teardown inside the pool return"$'\n'"$(cat "$case_dir/stderr")"
+
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ -f "${claim_backups[0]}" ] && [ -f "${marker_backups[0]}" ] \
+    || fail "restored-pair: the interrupted retirement did not leave both halves to restore"
+  cp -p "${claim_backups[0]}" "$case_dir/state/task-x1.meta"
+  rm -f "${claim_backups[0]}"
+  cp -p "${marker_backups[0]}" "$case_dir/wt/.fm-task-owner"
+  rm -f "${marker_backups[0]}"
+
+  cat > "$case_dir/fakebin/treehouse" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = status ]; then printf '%s\n' '[]'; exit 0; fi
+printf 'returned\n' >> "$case_dir/treehouse.log"
+EOF
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 0 "$rc" "restored-pair: a fully restored pair should tear down"$'\n'"$(cat "$case_dir/stderr2")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "restored-pair: the rerun left the task record behind"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "restored-pair: a claim copy outlived the record it described"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "restored-pair: an owner-marker copy outlived the record it described"
+  pass "a recovery pair restored in full lets the rerun prove ownership and finish"
+}
+
 # An interrupted relaunch leaves the marker one generation ahead of the record
 # it is compared against. That is the crash the marker was introduced for, and
 # the restamp publishes a handoff naming exactly that transition for exactly
@@ -4037,6 +4159,8 @@ test_retired_rerun_still_drops_the_task_branch
 test_failed_return_never_overwrites_a_reissued_slots_marker
 test_failed_marker_restore_names_the_surviving_copy
 test_stale_owner_marker_backup_is_swept_with_the_record
+test_interrupted_retirement_keeps_and_names_both_recovery_halves
+test_restored_recovery_pair_lets_the_rerun_finish
 test_vanished_worktree_teardown_keeps_the_task_branch
 test_detached_reachable_head_keeps_the_unpushed_task_branch
 test_landed_task_branch_is_still_dropped

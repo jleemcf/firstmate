@@ -391,7 +391,7 @@ fm_backend_endpoint_atom_valid() {  # <value>
 # outcome unknown. Neither is ever advertised as a claim to put back
 # unexamined - a released path can already belong to another task.
 fm_backend_report_worktree_claim_backup() {  # <meta-file>
-  local meta=$1 backup evidence
+  local meta=$1 backup evidence pair=
   if declare -F fm_worktree_released_evidence_hint >/dev/null 2>&1 \
     && evidence=$(fm_worktree_released_evidence_hint "$meta" 2>/dev/null) \
     && [ -n "$evidence" ]; then
@@ -401,7 +401,10 @@ fm_backend_report_worktree_claim_backup() {  # <meta-file>
   declare -F fm_worktree_claim_backup_hint >/dev/null 2>&1 || return 0
   backup=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || return 0
   [ -n "$backup" ] || return 0
-  echo "An interrupted worktree claim retirement left the recorded claim at $backup; confirm the provider did NOT release that path before restoring it, since a released path may already belong to another task." >&2
+  if declare -F fm_worktree_marker_backup_clause >/dev/null 2>&1; then
+    pair=$(fm_worktree_marker_backup_clause "$meta" 2>/dev/null) || pair=
+  fi
+  echo "An interrupted worktree claim retirement left the recorded claim at $backup; confirm the provider did NOT release that path before restoring it, since a released path may already belong to another task.$pair" >&2
 }
 
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id> [allow-retired]
