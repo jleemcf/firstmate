@@ -99,7 +99,6 @@ FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 # Distinguishes "the provider released the path but the retirement could not be
 # recorded" from an ordinary provider failure, which is the opposite situation.
 FM_WORKTREE_RETIREMENT_UNRECORDED=4
-FM_WORKTREE_CLAIM_RETIRE_MARKER=
 FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
 # Stamped by bin/fm-spawn.sh into a crewmate worktree once the task owns it, and
 # removed by bin/fm-teardown.sh when the slot is released.
@@ -1020,7 +1019,6 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
     FM_WORKTREE_CLAIM_RETIRE_META=$meta
     FM_WORKTREE_CLAIM_RETIRE_BACKUP=
     FM_WORKTREE_CLAIM_RETIRE_PATH=
-    FM_WORKTREE_CLAIM_RETIRE_MARKER=
     FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
     FM_WORKTREE_CLAIM_RETIRE_ACTIVE=1
     return 0
@@ -1054,7 +1052,6 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
 # the header above owns the deliberate manual-recovery contract.
 fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   local dir=$1 base=$2 expected=$3 marker stash
-  FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   [ -n "$expected" ] && [ -d "$expected" ] || return 0
   marker="$expected/$FM_WORKTREE_TASK_OWNER_MARKER"
@@ -1065,7 +1062,6 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
     fm_worktree_refuse "could not retire the $FM_WORKTREE_TASK_OWNER_MARKER in $expected before the provider could reuse it."
     return 1
   fi
-  FM_WORKTREE_CLAIM_RETIRE_MARKER=$marker
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=$stash
 }
 
@@ -1078,7 +1074,6 @@ fm_worktree_claim_retire_release() {
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_PATH=
-  FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
   if [ -n "$marker_backup" ] && ! rm -f -- "$marker_backup"; then
@@ -1120,7 +1115,6 @@ fm_worktree_claim_retire_commit() {
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_PATH=
-  FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
 }
@@ -1137,7 +1131,6 @@ fm_worktree_claim_retire_abandon() {
   FM_WORKTREE_CLAIM_RETIRE_META=
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_PATH=
-  FM_WORKTREE_CLAIM_RETIRE_MARKER=
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   FM_WORKTREE_CLAIM_RETIRE_ACTIVE=0
   if [ -n "$backup" ] && [ -f "$backup" ] && [ -f "$meta" ] && [ ! -L "$meta" ]; then
