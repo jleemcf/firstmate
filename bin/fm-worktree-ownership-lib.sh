@@ -45,9 +45,10 @@
 # make the path reusable, while retaining a byte-for-byte recovery copy. It
 # retires the worktree's .fm-task-owner marker in the same step, since that
 # marker is the in-worktree half of the same claim. Only a marker that binds to
-# this record is retired; one that names another task stays where it is, so a
-# slot proved by something other than that marker never has another owner's
-# marker stashed away.
+# this record is retired; one that names another task is positive evidence that
+# the slot moved on, so it stays byte-for-byte where it is and the retirement
+# refuses before the provider runs rather than releasing a path this record
+# cannot prove it still owns.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
 # returned slot with a stale destructive claim.
 #
@@ -1056,9 +1057,11 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
 # Only a marker this record's own binding accounts for is ever retired. A
 # secondmate home is proved by its .fm-secondmate-home identity and never
 # carries a marker of its own, so any .fm-task-owner sitting in that slot is by
-# construction another task's and is left exactly where it is - retiring it
-# would stash another owner's marker and then offer it back through the manual
-# drill. On every path whose proof already ran the same binding this is a no-op.
+# construction another task's. That marker is evidence the slot belongs to
+# someone else now, so it is left byte-for-byte untouched and the retirement
+# refuses here - before any provider return or removal - leaving the claim
+# parked for the same deliberate manual drill every other unconfirmed outcome
+# gets. On every path whose proof already ran the same binding this is a no-op.
 fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   local dir=$1 base=$2 expected=$3 marker stash meta id generation awareness
   local marker_aware=0 bind_rc=0
@@ -1074,8 +1077,8 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   fm_worktree_task_owner_marker_binding "$expected" "$id" "$generation" "$marker_aware" "$dir" \
     2>/dev/null || bind_rc=$?
   if [ "$bind_rc" -ne 0 ]; then
-    echo "warning: $marker does not bind to task $id, so it is left in place and only the worktree claim is retired; once this slot is released that marker will refuse the next fresh spawn into $expected until someone confirms no agent is working there and removes it." >&2
-    return 0
+    fm_worktree_refuse "the $FM_WORKTREE_TASK_OWNER_MARKER at $marker does not bind to task $id, so $expected belongs to another task now; it is left exactly as it is and nothing may return or remove that path for task $id."
+    return 1
   fi
   stash=$(umask 077; mktemp "$dir/.${base}.task-owner-backup.XXXXXX") || return 1
   if ! cp -p -- "$marker" "$stash" || ! rm -f -- "$marker"; then

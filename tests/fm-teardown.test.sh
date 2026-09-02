@@ -222,6 +222,22 @@ stamp_owner_marker() {
   } > "$wt/.fm-task-owner"
 }
 
+# A seeded secondmate home for task-x1, the way bin/fm-home-seed.sh leaves one:
+# the record's worktree claim and home= both name it, and its
+# .fm-secondmate-home identity marker is the only thing that proves ownership.
+# The parent's record has moved to its home, so the slot it used to claim is a
+# child's now and must not keep the parent's owner marker.
+# Args: case_dir
+seed_secondmate_home() {
+  local case_dir=$1 home="$1/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  rm -f "$case_dir/wt/.fm-task-owner"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+}
+
 # The exact bytes a reissued slot's new holder wrote into its owner marker,
 # recorded at $case_dir/task-b-marker.expected so a caller can prove nothing in
 # this task's teardown or recovery touched them.
@@ -1685,30 +1701,30 @@ EOF
 
 # A secondmate home is proved by its own .fm-secondmate-home identity and never
 # carries an owner marker of its own, so any .fm-task-owner sitting in that
-# pooled slot belongs to another task. Retiring the claim must leave it exactly
-# where it is, and the parked drill must describe the live marker instead of
-# offering a stashed copy of it back to the operator.
-test_secondmate_retirement_leaves_a_foreign_owner_marker_alone() {
+# pooled slot is positive evidence that the slot belongs to another task now.
+# The retirement must refuse there, before the provider can return or remove
+# the path, and park exactly like every other unconfirmed outcome.
+test_secondmate_retirement_refuses_a_foreign_owner_marker() {
   local case_dir home rc real_rm
-  local -a marker_backups
+  local -a claim_backups marker_backups
   case_dir=$(make_case secondmate-foreign-marker)
   write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
   home="$case_dir/secondmate-home"
-  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
-  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
-  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
-  rm -f "$case_dir/state/task-x1.meta.bak"
-  rm -f "$case_dir/wt/.fm-task-owner"
-  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   write_task_b_marker_fixture "$case_dir"
   cp -- "$case_dir/task-b-marker.expected" "$home/.fm-task-owner"
-  # Fail the home removal itself, so the retirement parks and its preserved
-  # state is observable; a successful removal would delete the whole home.
+  # Record any attempt to remove the home instead of performing it, so a
+  # provider call is visible rather than destroying the evidence it ran.
   real_rm=$(command -v rm)
   cat > "$case_dir/fakebin/rm" <<EOF
 #!/usr/bin/env bash
 for arg; do
-  case "\$arg" in */secondmate-home) exit 1 ;; esac
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
 done
 exec "$real_rm" "\$@"
 EOF
@@ -1717,17 +1733,65 @@ EOF
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
-  expect_code 1 "$rc" "secondmate-foreign-marker: the failed home removal must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  expect_code 1 "$rc" "secondmate-foreign-marker: a slot marked for another task must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-foreign-marker: the provider was asked to release a slot marked for another task"
+  assert_present "$home/.fm-secondmate-home" \
+    "secondmate-foreign-marker: the refusal removed the secondmate home"
   cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
     || fail "secondmate-foreign-marker: the retirement touched another task's owner marker"
   marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
   [ ! -e "${marker_backups[0]}" ] \
     || fail "secondmate-foreign-marker: another task's marker was stashed as this record's recovery half"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$home" "${claim_backups[0]}" \
+    "secondmate-foreign-marker: the parked retirement lost its claim copy"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "secondmate-foreign-marker: the refusal automatically restored the claim"
+  assert_grep "does not bind to task task-x1" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the refusal never named the foreign marker"
   assert_grep "live marker remains at $home/.fm-task-owner" "$case_dir/stderr" \
     "secondmate-foreign-marker: the drill misstated the preserved marker state"
   assert_no_grep "preserved owner-marker copy" "$case_dir/stderr" \
     "secondmate-foreign-marker: the drill offered another task's marker back for restoration"
-  pass "a secondmate retirement leaves another task's owner marker untouched"
+  assert_grep "Manual recovery drill:" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the refusal omitted deliberate recovery"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-foreign-marker: a plain retry must stay parked"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-foreign-marker: the retry reached the provider"
+  cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "secondmate-foreign-marker: the retry touched another task's owner marker"
+  assert_present "${claim_backups[0]}" \
+    "secondmate-foreign-marker: the retry discarded the parked claim copy"
+  pass "a secondmate retirement refuses a slot another task's marker still names"
+}
+
+# The same home with no .fm-task-owner at all is the ordinary secondmate slot,
+# and the marker gate must leave it exactly as it was: proved by
+# .fm-secondmate-home alone, released, and its record removed.
+test_secondmate_retirement_releases_a_home_with_no_owner_marker() {
+  local case_dir home rc
+  local -a claim_backups
+  case_dir=$(make_case secondmate-no-marker)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "secondmate-no-marker: an unmarked secondmate home must still tear down"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$home" "secondmate-no-marker: the secondmate home was never released"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "secondmate-no-marker: teardown left the task record behind"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "secondmate-no-marker: a completed release left a parked claim copy behind"
+  pass "a secondmate home carrying no owner marker is still released and its record removed"
 }
 
 # The record must stay usable until the whole teardown has succeeded: a step
@@ -3241,14 +3305,7 @@ test_herdr_flat_teardown_preflight_refuses_before_changes() {
 
 configure_secondmate_with_herdr_child() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home"
-  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
-  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
-  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
-  rm -f "$case_dir/state/task-x1.meta.bak"
-  # The parent's record has moved to its home, so the slot it used to claim is
-  # a child's now and must not keep the parent's owner marker.
-  rm -f "$case_dir/wt/.fm-task-owner"
-  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  seed_secondmate_home "$case_dir"
   git -C "$case_dir/wt" branch -m fm/child-herdr
   fm_write_meta "$home/state/child-herdr.meta" \
     "window=childsession:wC:p1" \
@@ -3327,14 +3384,7 @@ SH
 
 configure_secondmate_with_tmux_children() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home" child child_wt
-  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
-  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
-  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
-  rm -f "$case_dir/state/task-x1.meta.bak"
-  # The parent's record has moved to its home, so the slot it used to claim is
-  # a child's now and must not keep the parent's owner marker.
-  rm -f "$case_dir/wt/.fm-task-owner"
-  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  seed_secondmate_home "$case_dir"
   for child in child-a child-b; do
     child_wt="$case_dir/$child-wt"
     git -C "$case_dir/project" worktree add -q -b "fm/$child" "$child_wt" main
@@ -3446,16 +3496,9 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed() {
 
 configure_nested_secondmate_with_herdr_grandchild() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home" nested_home="$1/secondmate-home/nested-home"
-  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  seed_secondmate_home "$case_dir"
   mkdir -p "$nested_home/state" "$nested_home/data" "$nested_home/config" "$nested_home/projects"
-  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf '%s\n' nested-sm > "$nested_home/.fm-secondmate-home"
-  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
-  rm -f "$case_dir/state/task-x1.meta.bak"
-  # The parent's record has moved to its home, so the slot it used to claim is
-  # a child's now and must not keep the parent's owner marker.
-  rm -f "$case_dir/wt/.fm-task-owner"
-  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
   fm_write_meta "$home/state/nested-sm.meta" \
     "window=firstmate:fm-nested-sm" \
     "endpoint_task_id=nested-sm" \
@@ -4311,7 +4354,8 @@ test_retirement_receipt_survives_a_failed_record_removal
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_marker_retirement_failure_parks_before_provider_action
-test_secondmate_retirement_leaves_a_foreign_owner_marker_alone
+test_secondmate_retirement_refuses_a_foreign_owner_marker
+test_secondmate_retirement_releases_a_home_with_no_owner_marker
 test_late_teardown_failure_leaves_a_rerunnable_record
 test_unrecorded_release_leaves_evidence_a_rerun_can_finish
 test_receipt_outranks_a_leftover_claim_copy
