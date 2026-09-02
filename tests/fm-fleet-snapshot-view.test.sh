@@ -153,27 +153,16 @@ test_empty_fleet_json() {
 }
 
 test_large_backlog_snapshot_view_and_summary_publication() {
-  local home backlog_size out
+  local home backlog_size out index=0
   home=$(make_home large-backlog)
-  python3 - "$home/data/backlog.md" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-rows = [
-    "## In flight\n",
-    "\n",
-    "## Queued\n",
-    "\n",
-    "## Done\n",
-]
-for index in range(2400):
-    rows.append(
-        f"- [x] archived-{index:04d} - Accumulated completed work {index:04d} "
-        "(repo: firstmate) (kind: ship) (done 2026-08-31)\n"
-    )
-path.write_text("".join(rows))
-PY
+  {
+    printf '## In flight\n\n## Queued\n\n## Done\n'
+    while [ "$index" -lt 2400 ]; do
+      printf -- '- [x] archived-%04d - Accumulated completed work %04d (repo: firstmate) (kind: ship) (done 2026-08-31)\n' \
+        "$index" "$index"
+      index=$((index + 1))
+    done
+  } > "$home/data/backlog.md"
   backlog_size=$(wc -c < "$home/data/backlog.md" | tr -d '[:space:]')
   [ "$backlog_size" -ge 204800 ] \
     || fail "large-backlog fixture was only $backlog_size bytes"
