@@ -1074,7 +1074,7 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   fm_worktree_task_owner_marker_binding "$expected" "$id" "$generation" "$marker_aware" "$dir" \
     2>/dev/null || bind_rc=$?
   if [ "$bind_rc" -ne 0 ]; then
-    echo "warning: $marker does not bind to task $id, so it is left untouched and only the worktree claim is retired; it belongs to whoever holds $expected next." >&2
+    echo "warning: $marker does not bind to task $id, so it is left in place and only the worktree claim is retired; once this slot is released that marker will refuse the next fresh spawn into $expected until someone confirms no agent is working there and removes it." >&2
     return 0
   fi
   stash=$(umask 077; mktemp "$dir/.${base}.task-owner-backup.XXXXXX") || return 1
