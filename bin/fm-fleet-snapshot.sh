@@ -1769,16 +1769,17 @@ scout_report_lines() {
     || { rm -f "$paths_file" "$rows_file"; return 1; }
   LC_ALL=C sort -o "$paths_file" "$paths_file" \
     || { rm -f "$paths_file" "$rows_file"; return 1; }
+  rc=0
   while IFS= read -r report; do
-    id=$(basename "$(dirname "$report")") \
-      || { rm -f "$paths_file" "$rows_file"; return 1; }
+    id=$(basename "$(dirname "$report")") || { rc=1; break; }
     row=$(jq -n --arg id "$id" --arg path "$report" '{id:$id,path:$path}') \
-      || { rm -f "$paths_file" "$rows_file"; return 1; }
-    printf '%s\n' "$row" >> "$rows_file" \
-      || { rm -f "$paths_file" "$rows_file"; return 1; }
+      || { rc=1; break; }
+    printf '%s\n' "$row" >> "$rows_file" || { rc=1; break; }
   done < "$paths_file"
-  jq -s 'sort_by(.id)' "$rows_file"
-  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    jq -s 'sort_by(.id)' "$rows_file"
+    rc=$?
+  fi
   rm -f "$paths_file" "$rows_file"
   return "$rc"
 }
