@@ -45,6 +45,13 @@ fail_after_patterns() { # <diagnostic>
   exit 2
 }
 
+emit_scan_record() { # <record-kind> <record>
+  local record_kind=$1 record=$2
+  if ! printf '%s\n' "$record"; then
+    fail_after_patterns "could not write $record_kind scan record"
+  fi
+}
+
 case "${1:-}" in
   -h|--help)
     usage
@@ -149,8 +156,8 @@ if ! awk '
     "$LIST_KIND pattern list could not be read: $LIST_PATH"
 fi
 PATTERN_COUNT=$(awk 'END { print NR + 0 }' "$PATTERNS")
-printf 'fm-push-scan: patterns loaded: %s (list=%s, path=%s)\n' \
-  "$PATTERN_COUNT" "$LIST_KIND" "$LIST_PATH"
+emit_scan_record "loaded-pattern count" \
+  "fm-push-scan: patterns loaded: $PATTERN_COUNT (list=$LIST_KIND, path=$LIST_PATH)"
 [ "$PATTERN_COUNT" -gt 0 ] || \
   fail_after_patterns "$LIST_KIND pattern list yielded zero usable patterns after comments and blank lines were removed: $LIST_PATH"
 
@@ -188,7 +195,9 @@ BODY_FILE="$TMP_ROOT/pull-request-body"
 if ! git -C "$REPO_ROOT" --no-pager diff --no-ext-diff --no-color origin/main...HEAD -- > "$DIFF_FILE"; then
   fail_after_patterns "git diff origin/main...HEAD failed"
 fi
-printf '%s\n' "$BRANCH" > "$BRANCH_FILE"
+if ! printf '%s\n' "$BRANCH" > "$BRANCH_FILE"; then
+  fail_after_patterns "materializing the branch scan source failed"
+fi
 if ! git -C "$REPO_ROOT" --no-pager log --format=%B origin/main..HEAD > "$MESSAGES_FILE"; then
   fail_after_patterns "reading commit messages from origin/main..HEAD failed"
 fi
@@ -233,8 +242,8 @@ while [ "$SOURCE_INDEX" -lt "${#SOURCE_FILES[@]}" ]; do
       0)
         HITS=1
         while IFS= read -r MATCH || [ -n "$MATCH" ]; do
-          printf 'fm-push-scan: hit: source=%s pattern[%s]=%s match=%s\n' \
-            "$LABEL" "$PATTERN_INDEX" "$PATTERN" "$MATCH"
+          emit_scan_record "hit" \
+            "fm-push-scan: hit: source=$LABEL pattern[$PATTERN_INDEX]=$PATTERN match=$MATCH"
         done < "$MATCHES"
         ;;
       1) ;;
@@ -248,8 +257,8 @@ while [ "$SOURCE_INDEX" -lt "${#SOURCE_FILES[@]}" ]; do
 done
 
 if [ "$HITS" -ne 0 ]; then
-  printf 'fm-push-scan: result: hits found\n'
+  emit_scan_record "final result" "fm-push-scan: result: hits found"
   exit 1
 fi
-printf 'fm-push-scan: result: clean\n'
+emit_scan_record "final result" "fm-push-scan: result: clean"
 exit 0

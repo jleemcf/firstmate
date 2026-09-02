@@ -46,6 +46,36 @@ run_scan() { # <repo> <home> <list>
   ) 2>&1
 }
 
+run_scan_with_printf_failure() { # <repo> <home> <list> <failure>
+  local repo=$1 home=$2 list=$3 failure=$4 branch
+  branch=$(git -C "$repo" symbolic-ref --short HEAD)
+  (
+    cd "$repo/nested" || exit 99
+    printf() {
+      case "${FM_TEST_PRINTF_FAILURE:-}" in
+        branch)
+          [ "${1:-}" = '%s\n' ] && [ "${2:-}" = "${FM_TEST_BRANCH:-}" ] && return 1
+          ;;
+        loaded-count)
+          case "${2:-}" in
+            'fm-push-scan: patterns loaded:'*) return 1 ;;
+          esac
+          ;;
+        clean-result)
+          [ "${2:-}" = 'fm-push-scan: result: clean' ] && return 1
+          ;;
+      esac
+      builtin printf "$@"
+    }
+    printf '' || exit 99
+    export -f printf
+    FM_TEST_PRINTF_FAILURE="$failure" FM_TEST_BRANCH="$branch" FM_HOME="$home" \
+      "$SCAN" "$list" \
+        --pr-title-file "$home/pr/title.txt" \
+        --pr-body-file "$home/pr/body.txt"
+  ) 2>&1
+}
+
 assert_no_result() { # <output> <label>
   assert_not_contains "$1" "fm-push-scan: result:" \
     "$2 emitted a scan result even though preflight failed"
@@ -205,6 +235,38 @@ test_clean_scan_passes_with_count_and_comments_removed() {
   pass "fm-push-scan.sh: clean complete set passes and prints its pattern count"
 }
 
+test_required_write_failures_stop_without_a_result() {
+  local repo home out rc
+  repo=$(new_repo write-failure feature/write-failure 'safe diff' 'safe message' 'Safe Author' 'safe@example.invalid')
+  home="$TMP_ROOT/write-failure-home"
+  mkdir -p "$home/config"
+  write_pr_text "$home/pr" 'Safe title' 'Safe body'
+  printf '%s\n' 'forbidden' > "$home/config/company-push-terms.txt"
+
+  out=$(run_scan_with_printf_failure "$repo" "$home" company branch); rc=$?
+  expect_code 2 "$rc" "an unwritable branch source must fail closed"
+  assert_contains "$out" "patterns loaded: 1 (list=company" \
+    "branch-write failure did not reach source materialization"
+  assert_contains "$out" "materializing the branch scan source failed" \
+    "branch-write failure did not identify the omitted source"
+  assert_no_result "$out" "branch-write failure"
+
+  out=$(run_scan_with_printf_failure "$repo" "$home" company loaded-count); rc=$?
+  expect_code 2 "$rc" "an unwritable pattern-count record must fail closed"
+  assert_contains "$out" "could not write loaded-pattern count scan record" \
+    "pattern-count write failure did not use the scanner diagnostic path"
+  assert_no_result "$out" "pattern-count write failure"
+
+  out=$(run_scan_with_printf_failure "$repo" "$home" company clean-result); rc=$?
+  expect_code 2 "$rc" "an unwritable clean-result record must fail closed"
+  assert_contains "$out" "patterns loaded: 1 (list=company" \
+    "clean-result write failure omitted the completed pattern count"
+  assert_contains "$out" "could not write final result scan record" \
+    "clean-result write failure did not use the scanner diagnostic path"
+  assert_no_result "$out" "clean-result write failure"
+  pass "fm-push-scan.sh: source and result write failures cannot report clean"
+}
+
 test_missing_list_fails_without_cwd_or_other_list_fallback
 test_script_root_default_is_cwd_independent
 test_empty_list_fails_for_zero_patterns
@@ -212,3 +274,4 @@ test_comment_only_list_fails_for_zero_patterns
 test_unreadable_list_fails_for_the_list_reason
 test_every_required_surface_is_scanned
 test_clean_scan_passes_with_count_and_comments_removed
+test_required_write_failures_stop_without_a_result
