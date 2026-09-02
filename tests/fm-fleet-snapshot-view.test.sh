@@ -227,11 +227,14 @@ test_registered_secondmate_summary_survives_argv_ceiling() {
   printf 'working: watching delegated scope\n' > "$home/state/sample-mate.status"
   fakebin=$(make_fakebin "$home")
 
-  summary_bytes=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$mate" \
+  # The parent samples a registered home by reading the ledger that home
+  # published, so the fixture publishes it the same way a real secondmate does.
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$mate" \
     FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
     FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME=0 \
-    "$SNAPSHOT" --secondmate-home-summary | LC_ALL=C wc -c | tr -d '[:space:]') \
-    || fail "uncapped secondmate home summary failed"
+    "$SUMMARY_REFRESH" \
+    || fail "uncapped secondmate home summary publication failed"
+  summary_bytes=$(LC_ALL=C wc -c < "$mate/state/home-summary.json" | tr -d '[:space:]')
   [ "$summary_bytes" -gt 131072 ] \
     || fail "secondmate summary fixture was only $summary_bytes bytes"
   [ "$summary_bytes" -le 262144 ] \
@@ -252,42 +255,13 @@ test_registered_secondmate_summary_survives_argv_ceiling() {
   pass "an oversized registered secondmate summary still aggregates into the fleet snapshot"
 }
 
-# A registered secondmate is sampled by running an external producer - fm-on.sh
-# over ssh for a remote home - whose stdout carries whatever the remote login
-# shell prints. The shim reproduces that at the sampling boundary: the producer
-# still exits 0 while its stdout is prefixed with rc-file noise, is empty,
-# repeats the whole document, or is a non-object document.
-install_secondmate_summary_shim() {  # <fakebin>
-  local fakebin=$1 real_env
-  real_env=$(command -v env)
-  cat > "$fakebin/env" <<SH
-#!/usr/bin/env bash
-set -u
-for arg in "\$@"; do
-  [ "\$arg" = --secondmate-home-summary ] || continue
-  case "\${FM_TEST_SUMMARY_MODE:-}" in
-    banner)
-      printf 'bash: /etc/bashrc: line 1: warning\\n'
-      exec "$real_env" "\$@"
-      ;;
-    empty) exit 0 ;;
-    duplicate)
-      "$real_env" "\$@" || exit \$?
-      exec "$real_env" "\$@"
-      ;;
-    document)
-      printf '%s' "\${FM_TEST_SUMMARY_OUTPUT:-}"
-      exit 0
-      ;;
-  esac
-done
-exec "$real_env" "\$@"
-SH
-  chmod +x "$fakebin/env"
-}
-
+# The parent samples a registered home by reading the ledger that home
+# published, and that file is foreign input the parent never produced: a home
+# can leave rc-file noise ahead of the document, an empty file, a repeated
+# document, or a document of the wrong shape behind. Each one has to degrade
+# only that home.
 test_unusable_secondmate_summary_degrades_that_home_only() {
-  local home mate fakebin out mode oversized doubled
+  local home mate fakebin ledger out mode clean doubled
   home=$(make_home degraded-mate-parent)
   mate="$TMP_ROOT/degraded-mate-home"
   seed_secondmate_home "$mate" degraded-mate 3
@@ -297,7 +271,13 @@ test_unusable_secondmate_summary_degrades_that_home_only() {
   fm_write_secondmate_meta "$home/state/degraded-mate.meta" "$mate"
   printf 'working: watching delegated scope\n' > "$home/state/degraded-mate.status"
   fakebin=$(make_fakebin "$home")
-  install_secondmate_summary_shim "$fakebin"
+  ledger="$mate/state/home-summary.json"
+
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$mate" \
+    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
+    "$SUMMARY_REFRESH" \
+    || fail "the secondmate fixture could not publish its ledger"
+  clean=$(cat "$ledger")
 
   out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
@@ -310,20 +290,25 @@ test_unusable_secondmate_summary_degrades_that_home_only() {
       and .secondmate_current.records[0].counts.landed == 3
   ' >/dev/null || fail "the secondmate fixture did not sample cleanly: $out"
 
-  doubled=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$mate" \
-    FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
-    FM_TEST_SUMMARY_MODE=duplicate \
-    env "$SNAPSHOT" --secondmate-home-summary) \
-    || fail "the duplicate-producer shim did not run"
+  # A repeated document is the corruption whose every document is individually
+  # shape-valid, so only counting the whole stream rejects it.
+  doubled=$(printf '%s\n%s\n' "$clean" "$clean")
   printf '%s' "$doubled" | jq -e -s '
     length == 2 and all(.[]; .schema == "fm-secondmate-home-summary.v1"
       and (.counts | type) == "object" and (.landed | type) == "array")
-  ' >/dev/null || fail "the duplicate shim did not emit two shape-valid summaries: $doubled"
+  ' >/dev/null || fail "the duplicated ledger was not two shape-valid summaries: $doubled"
 
   for mode in banner empty duplicate document; do
+    case "$mode" in
+      banner)
+        { printf 'bash: /etc/bashrc: line 1: warning\n'; printf '%s\n' "$clean"; } > "$ledger"
+        ;;
+      empty) : > "$ledger" ;;
+      duplicate) printf '%s' "$doubled" > "$ledger" ;;
+      document) printf '%s\n' '["not an object"]' > "$ledger" ;;
+    esac
     out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
       FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
-      FM_TEST_SUMMARY_MODE="$mode" FM_TEST_SUMMARY_OUTPUT='["not an object"]' \
       "$SNAPSHOT" --json) \
       || fail "snapshot aborted the whole fleet on a $mode secondmate summary"
     printf '%s' "$out" | jq -e '
@@ -341,17 +326,16 @@ test_unusable_secondmate_summary_degrades_that_home_only() {
     ' >/dev/null || fail "a $mode secondmate summary did not degrade to an unknown record: $out"
   done
 
-  oversized=$(printf '["%s"]' "$(printf 'x%.0s' $(seq 1 200))")
+  printf '%s\n' "$clean" > "$ledger"
   out=$(PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_SNAPSHOT_NOW=2026-09-01T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1788264000 \
     FM_SNAPSHOT_SECONDMATE_MAX_BYTES=64 \
-    FM_TEST_SUMMARY_MODE=document FM_TEST_SUMMARY_OUTPUT="$oversized" \
     "$SNAPSHOT" --json) \
     || fail "snapshot aborted the whole fleet on an oversized secondmate summary"
   printf '%s' "$out" | jq -e '
     (.secondmate_current.records | length) == 1
       and .secondmate_current.records[0].current.state == "unknown"
-      and .secondmate_current.records[0].current.reason == "structured home snapshot exceeded byte limit"
+      and .secondmate_current.records[0].current.reason == "structured home ledger exceeded byte limit"
       and .secondmate_current.records[0].reconcile_inventory == null
       and (.secondmate_landed.unreadable | length) == 1
   ' >/dev/null || fail "an oversized secondmate summary did not degrade to an unknown record: $out"
