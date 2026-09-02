@@ -250,6 +250,7 @@ trap 'exit 143' TERM
 # reads must reject a producer that writes nothing, writes several documents,
 # or writes the wrong shape instead of binding null into the published
 # contract.
+# shellcheck disable=SC2016 # jq variables expand inside jq, not in this shell.
 SNAPSHOT_JQ_PRELUDE='def snapshot_document($label; $documents; $expected):
   if ($documents | length) != 1 then
     error("fm-fleet-snapshot: \($label) JSON must be exactly one document, found \($documents | length)")
