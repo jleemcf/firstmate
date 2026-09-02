@@ -159,6 +159,11 @@ init_changed_fixture_repo() {
   : >"$repo/CONTRIBUTING.md"
   : >"$repo/src/unmapped.ts"
   git -C "$repo" init -q
+  # The fixture mirrors a real checkout's dot-directories (.agents, .claude,
+  # .pi), which an operator's own global gitignore commonly lists. Pin this
+  # repo off the host's global excludes so `add .` stages the same baseline on
+  # every machine and the changed-path scan can see those sources change.
+  git -C "$repo" config core.excludesFile /dev/null
   git -C "$repo" add .
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm baseline
 }
