@@ -206,6 +206,10 @@
 # Before any endpoint or launcher exists, every fresh spawn claim-then-creates a
 # random private task temporary root through bin/fm-tasktmp-lib.sh and records its
 # exact tasktmp= value.
+# A fresh spawn over a record that already named a root - the remote secondmate
+# route relaunches a dead endpoint this way - reclaims that superseded root once
+# the new metadata is published, and leaves it untouched if it is no longer
+# trusted.
 # Relaunch reuses an existing trusted recorded root and claims a new random root
 # only when that field or recognized directory is missing.
 # Every fresh spawn or relaunch records a new spawn_gen= incarnation token so durable
