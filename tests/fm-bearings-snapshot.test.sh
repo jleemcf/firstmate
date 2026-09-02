@@ -32,6 +32,18 @@ make_fakebin() {  # <dir>
   cat > "$fb/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 [ "${FAKE_NM_SLEEP:-0}" = 1 ] && sleep 30
+if [ "${1:-}" = axi ] && [ "${2:-}" = status ] && [ -n "${FAKE_NM_TERMINAL_BRANCH:-}" ]; then
+  cat <<EOF
+run:
+  id: "01BEARINGS"
+  branch: $FAKE_NM_TERMINAL_BRANCH
+  status: completed
+  head: "$FAKE_NM_TERMINAL_HEAD"
+  pr: "https://github.com/kunchenguid/firstmate/pull/9"
+  findings: none
+outcome: ${FAKE_NM_OUTCOME:-passed}
+EOF
+fi
 exit 0
 SH
   cat > "$fb/tmux" <<'SH'
@@ -58,8 +70,8 @@ if [ "${FAKE_GH_MANY:-0}" = 1 ]; then
 JSON
   exit 0
 fi
-cat <<'JSON'
-[{"number":9,"title":"Ship the thing","url":"https://github.com/kunchenguid/firstmate/pull/9","headRefName":"fm/ship-task","reviewDecision":"APPROVED","mergeable":"MERGEABLE","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]}]
+cat <<JSON
+[{"number":9,"title":"Ship the thing","url":"https://github.com/kunchenguid/firstmate/pull/9","headRefName":"fm/ship-task","reviewDecision":"${FAKE_GH_REVIEW:-APPROVED}","mergeable":"${FAKE_GH_MERGEABLE:-MERGEABLE}","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]}]
 JSON
 SH
   cat > "$fb/gh-axi" <<'SH'
@@ -1007,6 +1019,219 @@ EOF
       and (.in_flight | any(.doing == "Phase 7 started") | not)
   ' >/dev/null || fail "prior status report influenced the standalone snapshot: $two"
   pass "repeated snapshots keep the same current landed baseline and ignore prior reports"
+}
+
+setup_terminal_ship_home() {  # <name>
+  local wt
+  TS_HOME=$(make_home "$1")
+  wt="$TS_HOME/projects/terminal-ship"
+  fm_git_init_commit "$wt"
+  git -C "$wt" checkout -qb fm/terminal-ship
+  TS_HEAD=$(git -C "$wt" rev-parse HEAD)
+  cat > "$TS_HOME/data/backlog.md" <<'EOF'
+## In flight
+- [ ] terminal-ship - Terminal validation is not landing (repo: firstmate) (kind: ship) (since 2026-07-11)
+
+## Queued
+
+## Done
+EOF
+  : > "$TS_HOME/data/secondmates.md"
+  fm_write_meta "$TS_HOME/state/terminal-ship.meta" \
+    "window=firstmate:fm-terminal-ship" \
+    "worktree=$wt" \
+    "project=firstmate" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "pr=https://github.com/kunchenguid/firstmate/pull/9"
+  printf 'done: PR 9 updated\n' > "$TS_HOME/state/terminal-ship.status"
+  TS_FAKEBIN=$(make_fakebin "$TS_HOME")
+  : > "$TS_HOME/net.log"
+}
+
+test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence() {
+  local canonical json live
+  setup_terminal_ship_home terminal-ship-unverified
+  canonical=$(FAKE_NM_TERMINAL_BRANCH=fm/terminal-ship FAKE_NM_TERMINAL_HEAD="$TS_HEAD" \
+    PATH="$TS_FAKEBIN:$PATH" FM_HOME="$TS_HOME" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
+    NET_LOG="$TS_HOME/net.log" "$ROOT/bin/fm-fleet-snapshot.sh" --json)
+  printf '%s' "$canonical" | jq -e '
+    .tasks | any(.[]; .id == "terminal-ship"
+      and .current_state.state == "done"
+      and .current_state.source == "run-step"
+      and .current_state.detail == "run passed: PR merged/closed")
+  ' >/dev/null || fail "fixture did not reproduce the terminal run-step path: $canonical"
+
+  json=$(FAKE_NM_TERMINAL_BRANCH=fm/terminal-ship FAKE_NM_TERMINAL_HEAD="$TS_HEAD" \
+    run "$TS_HOME" "$TS_FAKEBIN" --json)
+  printf '%s' "$json" | jq -e '
+    (.in_flight | any(.[]; .id == "terminal-ship"
+      and .state == "awaiting_landing"
+      and .doing == "Final working state reached (run reported: run passed: PR merged/closed); merge state not verified"))
+      and (.landed | any(.[]; .id == "terminal-ship") | not)
+  ' >/dev/null || fail "terminal work was reported as landed or lost its source detail: $json"
+  [ ! -s "$TS_HOME/net.log" ] || fail "terminal-state safeguard made a network call: $(cat "$TS_HOME/net.log")"
+
+  live=$(FAKE_NM_TERMINAL_BRANCH=fm/terminal-ship FAKE_NM_TERMINAL_HEAD="$TS_HEAD" \
+    run "$TS_HOME" "$TS_FAKEBIN" --include-prs --json)
+  printf '%s' "$live" | jq -e '
+    (.in_flight | any(.[]; .id == "terminal-ship"
+      and .state == "awaiting_landing"
+      and (.doing | endswith("; PR open, checks passing; not merged"))))
+      and (.candidate_prs | any(.[]; .url == "https://github.com/kunchenguid/firstmate/pull/9"
+        and .merge_ready == true))
+  ' >/dev/null || fail "live PR evidence did not report the recorded open PR honestly: $live"
+  pass "terminal ship state stays unlanded while retaining source detail and exact live PR evidence"
+}
+
+test_live_pr_merge_state_requires_durable_provenance_and_mergeability() {
+  local home fakebin json doing
+  setup_terminal_ship_home terminal-ship-conflicting
+  json=$(FAKE_GH_MERGEABLE=CONFLICTING \
+    FAKE_NM_TERMINAL_BRANCH=fm/terminal-ship FAKE_NM_TERMINAL_HEAD="$TS_HEAD" \
+    run "$TS_HOME" "$TS_FAKEBIN" --include-prs --json)
+  printf '%s' "$json" | jq -e '
+    (.candidate_prs | any(.[]; .url == "https://github.com/kunchenguid/firstmate/pull/9"
+      and .review == "APPROVED" and .checks == "passing"
+      and .mergeable == "CONFLICTING" and .merge_ready == false))
+      and (.in_flight | any(.[]; .id == "terminal-ship" and .state == "awaiting_landing"))
+  ' >/dev/null || fail "a conflicting PR was reported merge-ready: $json"
+
+  home=$(make_home status-only-pr)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] status-only - Terminal task without a recorded PR (repo: firstmate) (kind: ship) (since 2026-07-11)
+
+## Queued
+
+## Done
+EOF
+  : > "$home/data/secondmates.md"
+  mkdir -p "$home/projects/wt"
+  fm_write_meta "$home/state/status-only.meta" \
+    "window=firstmate:fm-status-only" "worktree=$home/projects/wt" "project=firstmate" \
+    "harness=claude" "kind=ship" "mode=manual"
+  record_claude_state "$home/state" status-only idle
+  printf 'done: review ready; see https://github.com/kunchenguid/firstmate/pull/9 for context\n' \
+    > "$home/state/status-only.status"
+  fakebin=$(make_fakebin "$home")
+  : > "$home/net.log"
+  json=$(run "$home" "$fakebin" --include-prs --json)
+  doing=$(printf '%s' "$json" | jq -r '.in_flight[] | select(.id == "status-only") | .doing')
+  [ "${doing%; merge state not verified}" != "$doing" ] \
+    || fail "status-only PR task did not keep merge state unverified: $doing"
+  case "$doing" in *"PR open"*) fail "status-only PR text coloured merge state: $doing" ;; esac
+  printf '%s' "$json" | jq -e '(.recorded_prs | length) == 0' >/dev/null \
+    || fail "status text was promoted into a durable PR record: $json"
+  pass "live PR evidence requires both durable task provenance and a mergeable PR"
+}
+
+test_verified_open_pr_outranks_a_contradictory_done_row() {
+  local home fakebin json
+  home=$(make_home pr-over-done)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+- [x] pr-open-ship - Claimed landed https://github.com/kunchenguid/firstmate/pull/9 (repo: firstmate) (kind: ship) (merged 2026-07-10)
+EOF
+  : > "$home/data/secondmates.md"
+  mkdir -p "$home/projects/wt"
+  fm_write_meta "$home/state/pr-open-ship.meta" \
+    "window=firstmate:fm-pr-open-ship" "worktree=$home/projects/wt" "project=firstmate" \
+    "harness=claude" "kind=ship" "mode=manual" \
+    "pr=https://github.com/kunchenguid/firstmate/pull/9"
+  record_claude_state "$home/state" pr-open-ship idle
+  printf 'done: merged\n' > "$home/state/pr-open-ship.status"
+  fakebin=$(make_fakebin "$home")
+  : > "$home/net.log"
+
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.landed | any(.[]; .id == "pr-open-ship"))
+      and (.in_flight | any(.[]; .id == "pr-open-ship") | not)
+  ' >/dev/null || fail "the structured Done row did not outrank a weaker status claim: $json"
+  json=$(run "$home" "$fakebin" --include-prs --json)
+  printf '%s' "$json" | jq -e '
+    (.landed | any(.[]; .id == "pr-open-ship") | not)
+      and (.in_flight | any(.[]; .id == "pr-open-ship"
+        and .state == "awaiting_landing"
+        and (.doing | endswith("; PR open, checks passing; not merged"))))
+      and (.omitted | any(.[]; .surface
+        == "main Done backlog row(s) contradicted by a verified open PR: 1 (pr-open-ship)"))
+  ' >/dev/null || fail "verified open PR evidence did not outrank the contradictory Done row: $json"
+  pass "a verified open PR outranks a contradictory Done row and discloses the conflict"
+}
+
+test_bulk_payloads_bypass_exec_argument_limit() {
+  local home fakebin canonical summary bearings padding i backlog_bytes project_bytes registry_bytes
+  home=$(make_home bulk-payloads)
+  fakebin=$(make_fakebin "$home")
+  : > "$home/net.log"
+  padding=$(printf '%0120d' 0 | tr '0' x)
+  {
+    printf '## In flight\n\n## Queued\n'
+    i=1
+    while [ "$i" -le 1800 ]; do
+      printf -- '- [ ] bulk-%04d - Bulk queue item %04d %s (repo: firstmate) (kind: ship)\n' \
+        "$i" "$i" "$padding"
+      i=$((i + 1))
+    done
+    printf '\n## Done\n'
+  } > "$home/data/backlog.md"
+  {
+    printf 'kind=ship\nbackend=tmux\nproject='
+    LC_ALL=C head -c 262144 /dev/zero | tr '\0' x
+    printf '\n'
+  } > "$home/state/bulk-task.meta"
+  {
+    i=1
+    while [ "$i" -le 1800 ]; do
+      printf -- '- mate-%04d - fixture (home: %s/mates/domain-with-a-deliberately-long-name-for-argument-limit-coverage/mate-%04d; scope: fixture; projects: firstmate; added 2026-08-26)\n' \
+        "$i" "$home" "$i"
+      i=$((i + 1))
+    done
+  } > "$home/data/secondmates.md"
+  backlog_bytes=$(LC_ALL=C wc -c < "$home/data/backlog.md" | tr -d ' ')
+  project_bytes=$(LC_ALL=C tail -n 1 "$home/state/bulk-task.meta" | cut -d= -f2- | wc -c | tr -d ' ')
+  registry_bytes=$(LC_ALL=C wc -c < "$home/data/secondmates.md" | tr -d ' ')
+  [ "$backlog_bytes" -gt 262144 ] || fail "bulk backlog fixture did not exceed 256 KB: $backlog_bytes"
+  [ "$project_bytes" -gt 262144 ] || fail "bulk task fixture did not exceed 256 KB: $project_bytes"
+  [ "$registry_bytes" -gt 262144 ] || fail "bulk registry fixture did not exceed 256 KB: $registry_bytes"
+
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+    FM_SNAPSHOT_NOW=2026-08-26T00:00:00Z FM_SNAPSHOT_NOW_EPOCH=1787702400 \
+    FM_SNAPSHOT_REGISTRY_BYTES=500000 FM_SNAPSHOT_REGISTRY_LINES=3000 \
+    FM_SNAPSHOT_REGISTRY_RECORDS=3000 FM_SNAPSHOT_SECONDMATES=1 \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json) || fail "canonical snapshot rejected bulk payloads"
+  printf '%s' "$canonical" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and (.backlog.records | length) == 1800
+      and (.tasks | length) == 1
+      and (.tasks[0].project | length) == 262144
+      and .secondmate_current.total_registered == 1800
+  ' >/dev/null || fail "canonical snapshot lost bulk payload data"
+
+  summary=$(PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+    FM_SNAPSHOT_NOW=2026-08-26T00:00:00Z FM_SNAPSHOT_NOW_EPOCH=1787702400 \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --secondmate-home-summary) \
+    || fail "secondmate summary rejected bulk payloads"
+  printf '%s' "$summary" | jq -e '
+    .schema == "fm-secondmate-home-summary.v1"
+      and .counts.queued == 1800
+      and .counts.endpoints == 1
+  ' >/dev/null || fail "secondmate summary lost bulk payload data"
+
+  bearings=$(FM_SNAPSHOT_REGISTRY_BYTES=500000 FM_SNAPSHOT_REGISTRY_LINES=3000 \
+    FM_SNAPSHOT_REGISTRY_RECORDS=3000 FM_SNAPSHOT_SECONDMATES=1 \
+    run "$home" "$fakebin" --json) || fail "bearings snapshot rejected bulk payloads"
+  printf '%s' "$bearings" | jq -e '.schema == "fm-bearings.v1"' >/dev/null \
+    || fail "bearings snapshot did not preserve its JSON contract for bulk payloads"
+  [ ! -s "$home/net.log" ] || fail "bulk local snapshot made a network call: $(cat "$home/net.log")"
+  pass "bulk backlog, task, and registry payloads bypass the exec argument limit"
 }
 
 test_default_is_bounded_and_local_only() {
@@ -2298,6 +2523,10 @@ test_parent_evidence_reconciles_by_verb_and_key
 test_nonprogressing_child_states_are_explicit
 test_registry_unavailability_and_bounds_are_explicit
 test_current_landed_baseline_is_repeatable_and_prior_report_independent
+test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence
+test_live_pr_merge_state_requires_durable_provenance_and_mergeability
+test_verified_open_pr_outranks_a_contradictory_done_row
+test_bulk_payloads_bypass_exec_argument_limit
 test_default_is_bounded_and_local_only
 test_toon_json_parity
 test_landed_includes_secondmate_home_merges
