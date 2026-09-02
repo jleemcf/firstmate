@@ -1823,7 +1823,111 @@ EOF
     "secondmate-nonregular-marker: the refusal dropped the binding's own reason"
   assert_grep "Manual recovery drill:" "$case_dir/stderr" \
     "secondmate-nonregular-marker: the refusal omitted deliberate recovery"
+  assert_grep "$home/.fm-task-owner is a live symlink, not a regular ownership marker" \
+    "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the drill never reported the entry's observed type"
+  assert_grep "do not read, follow, move, or remove it - and stop" "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the drill did not tell the operator to stop"
+  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the drill called a live marker entry an unmarked claim"
+  assert_no_grep "skip marker restoration" "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the drill told the operator no marker was there"
   pass "a secondmate retirement refuses a marker entry that is not a regular file"
+}
+
+# A directory at the marker path is the same unattributable entry as a symlink,
+# and the drill must name that observed type rather than fall through to the
+# absent-marker wording.
+test_secondmate_retirement_refuses_a_directory_owner_marker() {
+  local case_dir home rc real_rm
+  case_dir=$(make_case secondmate-directory-marker)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/.fm-task-owner"
+  printf '%s\n' 'occupant' > "$home/.fm-task-owner/inside"
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-directory-marker: a directory marker entry must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-directory-marker: the provider was asked to release a slot with a directory marker entry"
+  [ -d "$home/.fm-task-owner" ] && [ ! -L "$home/.fm-task-owner" ] \
+    || fail "secondmate-directory-marker: the retirement changed the marker entry's type"
+  assert_grep 'occupant' "$home/.fm-task-owner/inside" \
+    "secondmate-directory-marker: the retirement disturbed the directory's contents"
+  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
+    "secondmate-directory-marker: the refusal never said ownership was unproved"
+  assert_grep "$home/.fm-task-owner is a live directory, not a regular ownership marker" \
+    "$case_dir/stderr" \
+    "secondmate-directory-marker: the drill never reported the entry's observed type"
+  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
+    "secondmate-directory-marker: the drill called a live marker entry an unmarked claim"
+  pass "a secondmate retirement refuses a directory at the marker path and names its type"
+}
+
+# A regular but malformed marker stays in the live-marker branch, so the drill
+# still names it - but the operator cannot read a task and generation out of it,
+# and the step must say so rather than pose a comparison they cannot make.
+test_secondmate_retirement_refuses_a_malformed_owner_marker() {
+  local case_dir home rc real_rm
+  local -a marker_backups
+  case_dir=$(make_case secondmate-malformed-marker)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  printf '%s\n' 'schema=fm-task-owner.v1' 'task_id=task-x1' > "$case_dir/malformed.expected"
+  cp -- "$case_dir/malformed.expected" "$home/.fm-task-owner"
+
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-malformed-marker: an incomplete marker must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-malformed-marker: the provider ran over an unreadable marker"
+  cmp -s "$home/.fm-task-owner" "$case_dir/malformed.expected" \
+    || fail "secondmate-malformed-marker: the retirement rewrote the marker it could not read"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "secondmate-malformed-marker: an unreadable marker was stashed as a recovery half"
+  assert_grep "unreadable or incomplete" "$case_dir/stderr" \
+    "secondmate-malformed-marker: the refusal dropped the binding's own reason"
+  assert_grep "unless it is a readable .fm-task-owner naming exactly the parked record's task and generation, stop" \
+    "$case_dir/stderr" \
+    "secondmate-malformed-marker: the drill posed a comparison the marker cannot answer"
+  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
+    "secondmate-malformed-marker: the drill called a live marker an unmarked claim"
+  pass "a secondmate retirement refuses an unreadable marker and does not ask the operator to read it"
 }
 
 # A record too incomplete to name the generation its marker would bind cannot
@@ -4471,6 +4575,8 @@ test_owner_marker_is_retired_before_the_pool_return
 test_marker_retirement_failure_parks_before_provider_action
 test_secondmate_retirement_refuses_a_foreign_owner_marker
 test_secondmate_retirement_refuses_a_non_regular_owner_marker
+test_secondmate_retirement_refuses_a_directory_owner_marker
+test_secondmate_retirement_refuses_a_malformed_owner_marker
 test_retirement_refuses_a_marker_its_own_record_cannot_bind
 test_secondmate_retirement_releases_a_home_with_no_owner_marker
 test_late_teardown_failure_leaves_a_rerunnable_record

@@ -216,12 +216,31 @@ fm_worktree_marker_backup_hint() {  # <meta-file>
   return 1
 }
 
+# The observed type of whatever sits at a path, decided from the path entry
+# alone: nothing here opens, follows, or reads through it, so an entry that is
+# unsafe to touch can still be named in a refusal. A symlink is reported as a
+# symlink even when it resolves to a regular file.
+fm_worktree_path_entry_type() {  # <path>
+  local path=$1
+  if [ -L "$path" ]; then
+    printf '%s' symlink
+  elif [ -d "$path" ]; then
+    printf '%s' directory
+  elif [ -f "$path" ]; then
+    printf '%s' 'regular file'
+  elif [ -e "$path" ]; then
+    printf '%s' 'special file'
+  else
+    printf '%s' 'missing entry'
+  fi
+}
+
 # The single manual drill printed beside every interrupted-retirement refusal.
 # It names the exact on-disk state and never performs, offers, or infers an
 # automatic restore. The operator must independently prove the provider never
 # released the path before deliberately rebuilding the two authoritative lines.
 fm_worktree_interrupted_retirement_manual_drill() {  # <meta-file>
-  local meta=$1 claim marker path marker_path receipt receipt_state marker_state marker_step
+  local meta=$1 claim marker path marker_path receipt receipt_state marker_state marker_step entry
   claim=$(fm_worktree_claim_backup_hint "$meta" 2>/dev/null) || claim=
   [ -n "$claim" ] || return 0
   marker=$(fm_worktree_marker_backup_hint "$meta" 2>/dev/null) || marker=
@@ -236,9 +255,15 @@ fm_worktree_interrupted_retirement_manual_drill() {  # <meta-file>
   if [ -n "$marker" ]; then
     marker_state="the preserved owner-marker copy is at $marker"
     marker_step="only if ${marker_path%/*} is still the exact provider-owned directory for this task and $marker_path is absent, copy $marker to that exact path without removing the backup; if the directory is gone or any marker exists, do not create or touch anything and stop."
-  elif [ -n "$marker_path" ] && [ -f "$marker_path" ] && [ ! -L "$marker_path" ]; then
-    marker_state="no owner-marker backup exists because the live marker remains at $marker_path"
-    marker_step="leave the existing marker at $marker_path untouched; if its task id or generation does not match the parked record, stop."
+  elif [ -n "$marker_path" ] && { [ -e "$marker_path" ] || [ -L "$marker_path" ]; }; then
+    entry=$(fm_worktree_path_entry_type "$marker_path")
+    if [ "$entry" = 'regular file' ]; then
+      marker_state="no owner-marker backup exists because the live marker remains at $marker_path"
+      marker_step="leave the existing marker at $marker_path untouched; unless it is a readable $FM_WORKTREE_TASK_OWNER_MARKER naming exactly the parked record's task and generation, stop."
+    else
+      marker_state="no owner-marker backup exists because $marker_path is a live $entry, not a regular ownership marker"
+      marker_step="leave the $entry at $marker_path exactly as it is - do not read, follow, move, or remove it - and stop, because nothing can attribute it and ownership of this path is unproved."
+    fi
   else
     marker_state='this legacy or unmarked claim has no owner-marker copy'
     marker_step='skip marker restoration because no marker copy exists.'
