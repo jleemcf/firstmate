@@ -466,8 +466,9 @@ task_json_lines() {
   local remote_host remote_root
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
-  local open_decisions_tsv open_decisions_json
+  local open_decisions_tsv open_decisions_json task_row task_rows_file rc
 
+  task_rows_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-fleet-tasks.XXXXXX") || return 1
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     id=$(basename "$meta" .meta)
@@ -507,14 +508,20 @@ task_json_lines() {
     if [ -n "$remote_host" ]; then
       # Remote endpoint liveness belongs to supervision. The snapshot never
       # probes a persistent remote endpoint while assembling parent inventory.
-      current_json=$(jq -n '{state:"unknown",source:"none",detail:"remote endpoint liveness not collected by fleet snapshot",raw:""}')
+      current_json=$(jq -n '{state:"unknown",source:"none",detail:"remote endpoint liveness not collected by fleet snapshot",raw:""}') \
+        || { rm -f "$task_rows_file"; return 1; }
     else
-      current_json=$(crew_state_json "$id")
+      current_json=$(crew_state_json "$id") \
+        || { rm -f "$task_rows_file"; return 1; }
     fi
-    event_json=$(status_event_json "$status_log")
-    last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
-    current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
-    current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
+    event_json=$(status_event_json "$status_log") \
+      || { rm -f "$task_rows_file"; return 1; }
+    last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""') \
+      || { rm -f "$task_rows_file"; return 1; }
+    current_state=$(printf '%s' "$current_json" | jq -r '.state // ""') \
+      || { rm -f "$task_rows_file"; return 1; }
+    current_source=$(printf '%s' "$current_json" | jq -r '.source // ""') \
+      || { rm -f "$task_rows_file"; return 1; }
 
     # Durable keyed open-decision set: fold the WHOLE status stream
     # (fm-classify-lib.sh's status_open_decisions) so a later unrelated event can
@@ -533,7 +540,8 @@ task_json_lines() {
     # never clear another concern's keyed decision. A parked/blocked state, or a
     # non-authoritative status-log/none read on a still-live task, keeps the fold's
     # open decision surfacing.
-    open_decisions_tsv=$(status_open_decisions "$status_log")
+    open_decisions_tsv=$(status_open_decisions "$status_log") \
+      || { rm -f "$task_rows_file"; return 1; }
     if [ "$kind" != secondmate ] && \
        { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ]; } \
            && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
@@ -543,9 +551,11 @@ task_json_lines() {
     open_decisions_json=$(printf '%s' "$open_decisions_tsv" | jq -R -s '
       [ splits("\n") | select(length > 0)
         | (capture("^(?<key>[^\t]*)\t(?<verb>[^\t]*)\t(?<summary>.*)$")?)
-        | select(. != null) ]')
-    pending_decision=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "needs-decision") then 1 else 0 end')
-    blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end')
+        | select(. != null) ]') || { rm -f "$task_rows_file"; return 1; }
+    pending_decision=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "needs-decision") then 1 else 0 end') \
+      || { rm -f "$task_rows_file"; return 1; }
+    blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end') \
+      || { rm -f "$task_rows_file"; return 1; }
 
     endpoint_exists=null
     agent_alive=not_checked
@@ -565,19 +575,30 @@ task_json_lines() {
     fi
 
     [ -f "$report_path" ] && report_present=1 || report_present=0
-    meta_json=$(path_present_json "$meta")
+    meta_json=$(path_present_json "$meta") \
+      || { rm -f "$task_rows_file"; return 1; }
     status_json=$event_json
-    report_json=$(path_present_json "$report_path")
-    if [ -n "$worktree" ]; then worktree_json=$(path_present_json "$worktree"); else worktree_json=$(jq -n '{path:null,present:false}'); fi
-    if [ -n "$home" ] && [ -n "$remote_host" ]; then
-      home_json=$(jq -n --rawfile path <(printf '%s' "$home") '{path:$path,present:null}')
-    elif [ -n "$home" ]; then
-      home_json=$(path_present_json "$home")
+    report_json=$(path_present_json "$report_path") \
+      || { rm -f "$task_rows_file"; return 1; }
+    if [ -n "$worktree" ]; then
+      worktree_json=$(path_present_json "$worktree") \
+        || { rm -f "$task_rows_file"; return 1; }
     else
-      home_json=$(jq -n '{path:null,present:false}')
+      worktree_json=$(jq -n '{path:null,present:false}') \
+        || { rm -f "$task_rows_file"; return 1; }
+    fi
+    if [ -n "$home" ] && [ -n "$remote_host" ]; then
+      home_json=$(jq -n --rawfile path <(printf '%s' "$home") '{path:$path,present:null}') \
+        || { rm -f "$task_rows_file"; return 1; }
+    elif [ -n "$home" ]; then
+      home_json=$(path_present_json "$home") \
+        || { rm -f "$task_rows_file"; return 1; }
+    else
+      home_json=$(jq -n '{path:null,present:false}') \
+        || { rm -f "$task_rows_file"; return 1; }
     fi
 
-    jq -n \
+    task_row=$(jq -n \
       --rawfile id <(printf '%s' "$id") \
       --rawfile kind <(printf '%s' "$kind") \
       --rawfile harness <(printf '%s' "$harness") \
@@ -608,13 +629,16 @@ task_json_lines() {
       --argjson pending_decision "$(bool_json "$pending_decision")" \
       --argjson blocked_event "$(bool_json "$blocked_event")" \
       --argjson report_present "$(bool_json "$report_present")" \
-      '($current_state_payload[0]) as $current_state
-      | ($meta_path_payload[0]) as $meta_path
-      | ($status_log_payload[0]) as $status_log
-      | ($report_payload[0]) as $report
-      | ($worktree_path_payload[0]) as $worktree_path
-      | ($home_path_payload[0]) as $home_path
-      | ($open_decisions_payload[0]) as $open_decisions
+      'def one($name; $payload):
+        if ($payload | length) == 1 then $payload[0]
+        else error("\($name) payload must contain exactly one JSON value") end;
+      one("current_state"; $current_state_payload) as $current_state
+      | one("meta_path"; $meta_path_payload) as $meta_path
+      | one("status_log"; $status_log_payload) as $status_log
+      | one("report"; $report_payload) as $report
+      | one("worktree_path"; $worktree_path_payload) as $worktree_path
+      | one("home_path"; $home_path_payload) as $home_path
+      | one("open_decisions"; $open_decisions_payload) as $open_decisions
       | {
         id:$id,
         kind:$kind,
@@ -657,8 +681,14 @@ task_json_lines() {
              steer:"bin/fm-send.sh fm-\($id) \u0027<instruction>\u0027",
              return_channel_note:null}
           end)
-      }'
-  done | jq -s 'sort_by(.id)'
+      }') || { rm -f "$task_rows_file"; return 1; }
+    printf '%s\n' "$task_row" >> "$task_rows_file" \
+      || { rm -f "$task_rows_file"; return 1; }
+  done
+  jq -s 'sort_by(.id)' "$task_rows_file"
+  rc=$?
+  rm -f "$task_rows_file"
+  return "$rc"
 }
 
 # Main-home current-inventory validity: same orphan / unstructured-current checks
@@ -1592,12 +1622,15 @@ secondmate_current_json() {  # <parent-tasks-json>
         --rawfile event_raw <(printf '%s' "$event_raw") \
         --rawfile event_note <(printf '%s' "$event_note") \
         --argjson event_age "$event_age" '
-        ($summary_payload[0]) as $summary
-        | ($decisions_payload[0]) as $decisions
-        | ($activities_payload[0]) as $activities
-        | ($activity_scan_payload[0]) as $activity_scan
-        | ($reconciliation_payload[0]) as $reconciliation
-        | ($terminal_payload[0]) as $terminal
+        def one($name; $payload):
+          if ($payload | length) == 1 then $payload[0]
+          else error("\($name) payload must contain exactly one JSON value") end;
+        one("summary"; $summary_payload) as $summary
+        | one("decisions"; $decisions_payload) as $decisions
+        | one("activities"; $activities_payload) as $activities
+        | one("activity_scan"; $activity_scan_payload) as $activity_scan
+        | one("reconciliation"; $reconciliation_payload) as $reconciliation
+        | one("terminal"; $terminal_payload) as $terminal
         | {id:$id,home:$home,host:($host | if . == "" then null else . end),remote:$remote,registered:$registered,
          spawn_gen:($spawn_gen | if . == "" then null else . end),
          current:{state:$state,reason:($current_reason | if . == "" then null else . end)},invalidity:$summary.invalidity,
@@ -1609,7 +1642,7 @@ secondmate_current_json() {  # <parent-tasks-json>
          decisions_open:$summary.decisions_open,holds:$summary.holds,queued:$summary.queued,
          landed:$summary.landed,endpoints:$summary.endpoints,counts:$summary.counts,omitted:$summary.omitted,
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan,reconciliation:$reconciliation},
-         terminal_evidence:$terminal,contradiction:$contradiction}')
+         terminal_evidence:$terminal,contradiction:$contradiction}') || return 1
     else
       if [ -n "$event_raw" ]; then
         provenance='parent-event-fallback'
@@ -1644,11 +1677,14 @@ secondmate_current_json() {  # <parent-tasks-json>
         --slurpfile terminal_payload <(printf '%s' "$terminal") \
         --slurpfile summary_payload <(printf '%s' "$summary") \
         --argjson summary_sampled "$summary_sampled" '
-        ($activities_payload[0]) as $activities
-        | ($activity_scan_payload[0]) as $activity_scan
-        | ($decisions_payload[0]) as $decisions
-        | ($terminal_payload[0]) as $terminal
-        | ($summary_payload[0]) as $summary
+        def one($name; $payload):
+          if ($payload | length) == 1 then $payload[0]
+          else error("\($name) payload must contain exactly one JSON value") end;
+        one("activities"; $activities_payload) as $activities
+        | one("activity_scan"; $activity_scan_payload) as $activity_scan
+        | one("decisions"; $decisions_payload) as $decisions
+        | one("terminal"; $terminal_payload) as $terminal
+        | one("summary"; $summary_payload) as $summary
         | {id:$id,home:($home | if . == "" then null else . end),host:($host | if . == "" then null else . end),remote:$remote,registered:$registered,
          spawn_gen:($spawn_gen | if . == "" then null else . end),
          current:{state:"unknown",reason:$reason},invalidity:null,
@@ -1657,7 +1693,7 @@ secondmate_current_json() {  # <parent-tasks-json>
          freshness:{status:$freshness,observed_at:$observed,age_seconds:$event_age},
          active_children:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],counts:{active_children:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[],
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan},
-         terminal_evidence:$terminal,contradiction:false}')
+         terminal_evidence:$terminal,contradiction:false}') || return 1
     fi
     records=$(jq -n \
       --slurpfile records_payload <(printf '%s' "$records") \
@@ -1727,7 +1763,8 @@ if [ "$OUTPUT_MODE" = secondmate-home-summary ]; then
   exit 0
 fi
 
-SCOUT_REPORTS_JSON=$(scout_report_lines)
+SCOUT_REPORTS_JSON=$(scout_report_lines) \
+  || { echo "fm-fleet-snapshot: scout report snapshot failed" >&2; exit 1; }
 MAIN_INVENTORY_JSON=$(main_inventory_json "$BACKLOG_JSON" "$TASKS_JSON") \
   || { echo "fm-fleet-snapshot: main inventory summary failed" >&2; exit 1; }
 SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON") \

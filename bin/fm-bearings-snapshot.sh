@@ -150,7 +150,8 @@ For every registered secondmate, readable structured facts from its own home are
   distinguish live and cached ledgers; a home without either is explicitly unreadable.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
   --all-decisions, --all-secondmates, --all-landed, --all-reports, --all-queued, --all-recorded-prs,
-  --all-unhealthy, --all-pr-repos, --include-prs (adds candidate_prs).
+  --all-unhealthy, --all-pr-repos, --include-prs.
+--include-prs adds candidate_prs{num,repo,task,url,review,mergeable,checks,merge_ready,durable_task_match,durable_task_id}.
 Raise FM_BEARINGS_PR_LIMIT to expand per-repository open-PR results.
 Raise FM_BEARINGS_CONTRADICTIONS to list more contradicted Done-row ids in omitted[];
   the disclosure always states the total, so raising it only widens the id list.
@@ -363,7 +364,16 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(.kind != "secondmate")
        | (durable_pr_url) as $url
        | select($url != null)
-       | select($include_prs == 1 and ($candidate_prs | any(.url == $url)))
+       | {id, url:$url} ]) as $durable_pr_records
+  | ([ $candidate_prs[] as $candidate
+       | ([ $durable_pr_records[] | select(.url == $candidate.url) | .id ] | sort) as $task_ids
+       | $candidate + {
+           durable_task_match:(($task_ids | length) == 1),
+           durable_task_id:(if ($task_ids | length) == 1 then $task_ids[0] else null end)
+         } ]) as $matched_candidate_prs
+  | ([ $durable_pr_records[]
+       | . as $record
+       | select($include_prs == 1 and ($matched_candidate_prs | any(.url == $record.url and .durable_task_match)))
        | .id ]) as $open_pr_ids
   | ([ .backlog.records[] | select(.state == "done" and .structured and .hold_kind != "captain")
        | {id, title, pr_url, report_path, local_note, completion, home:"(main)", home_id:"(main)"} ]) as $main_done_rows
@@ -433,26 +443,35 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(.backlog.current_role != "program")
        | select(.backlog.current_role != "held" or .current_state.state == "working")
        | . as $task
-       | select((($main_done_ids | index($task.id)) != null and .current_state.state == "done") | not)
+       | select(($main_done_ids | index($task.id)) == null)
        | ($task | durable_pr_url) as $durable_pr_url
        | (if $durable_pr_url == null then null
-          else ($candidate_prs | map(select(.url == $durable_pr_url)) | .[0] // null) end) as $open_pr
+          else ($matched_candidate_prs
+                | map(select(.url == $durable_pr_url and .durable_task_match))
+                | .[0] // null) end) as $open_pr
        | ((.current_state.detail // "")) as $state_detail
        | (if ($state_detail | length) > 0
           then $state_detail else (.hints.last_event_text // "") end) as $detail
        | (if ($state_detail | length) > 0
           then (.current_state.source // "none") else "status-log" end) as $detail_source
        | {id, kind,
-        state: (if .kind == "ship" and .current_state.state == "done"
+        state: (if .kind == "ship" and ($open_pr != null or .current_state.state == "done")
                 then "awaiting_landing" else .current_state.state end),
         repo:(.backlog.repo // .project // null),
-        doing: (if .kind == "ship" and .current_state.state == "done" then
+        doing: (if .kind == "ship" and $open_pr != null then
+                  ((if .current_state.state == "done" then
+                       (if ($detail | length) > 0
+                        then "Final working state reached (\(detail_attribution($detail_source))\($detail | trunc(60)))"
+                        else "Final working state reached" end)
+                     elif ($detail | length) > 0 then
+                       "Worker state \(.current_state.state) (\(detail_attribution($detail_source))\($detail | trunc(60)))"
+                     else "Worker state \(.current_state.state)" end)
+                   + "; PR open, checks \($open_pr.checks), mergeable \($open_pr.mergeable); not merged")
+                elif .kind == "ship" and .current_state.state == "done" then
                   ((if ($detail | length) > 0
                     then "Final working state reached (\(detail_attribution($detail_source))\($detail | trunc(60)))"
                     else "Final working state reached" end)
-                   + (if $include_prs == 1 and $open_pr != null then
-                        "; PR open, checks \($open_pr.checks), mergeable \($open_pr.mergeable); not merged"
-                      else "; merge state not verified" end))
+                   + "; merge state not verified")
                 else ($detail | trunc(90)) end)
       } ]
      + [ $secondmate_views[] as $m
@@ -534,7 +553,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | . + (if ($unhealthy_all | length) > 0 then
            {unhealthy_endpoints:(if $all_unhealthy == 1 then $unhealthy_all else $unhealthy_all[:$unhealthy_n] end)}
          else {} end)
-  | . + (if $include_prs == 1 then {candidate_prs:$candidate_prs} else {} end)
+  | . + (if $include_prs == 1 then {candidate_prs:$matched_candidate_prs} else {} end)
   | . + (if $f_bodies then {bodies:[ $snap.backlog.records[] | select(.structured and (.state == "queued" or .state == "done")) | {id, body:((.body_excerpt // .raw // "-") | trunc(200))} ]} else {} end)
   | . + (if $f_paths then {paths:[ $snap.tasks[] | {id, worktree:(.paths.worktree.path // "-"), home:(.paths.home.path // "-"), status:.paths.status_log.path, report:.paths.report.path} ]} else {} end)
   | . + (if $f_actions then {actions:[ $snap.tasks[] | {id, watch:(.actions.watch // .actions.send // "-"), steer:(.actions.steer // .actions.send // "-")} ]} else {} end)
@@ -585,7 +604,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $all_recorded_prs == 0 and ($recorded_prs_all | length) > $recorded_prs_n then {surface:("recorded_prs showing \($recorded_prs_n) of \($recorded_prs_all | length)"), reveal:"--all-recorded-prs"} else empty end),
         (if $all_unhealthy == 0 and ($unhealthy_all | length) > $unhealthy_n then {surface:("unhealthy_endpoints showing \($unhealthy_n) of \($unhealthy_all | length)"), reveal:"--all-unhealthy"} else empty end),
         (if $include_prs == 1 and $pr_repos_total > $pr_repos_shown then {surface:("PR repositories showing \($pr_repos_shown) of \($pr_repos_total)"), reveal:"--all-pr-repos"} else empty end),
-        (if $include_prs == 1 and $pr_rows_capped > 0 then {surface:("candidate_prs showing \($candidate_prs | length) of at least \($pr_rows_min_total); capped in \($pr_rows_capped) repo(s)"), reveal:"raise FM_BEARINGS_PR_LIMIT"} else empty end),
+        (if $include_prs == 1 and $pr_rows_capped > 0 then {surface:("candidate_prs showing \($matched_candidate_prs | length) of at least \($pr_rows_min_total); capped in \($pr_rows_capped) repo(s)"), reveal:"raise FM_BEARINGS_PR_LIMIT"} else empty end),
         (if $include_prs == 1 then empty else {surface:"live PR discovery + checks", reveal:"--include-prs"} end) ]) }
 ') || { echo "fm-bearings-snapshot: projection failed" >&2; exit 1; }
 

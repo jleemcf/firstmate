@@ -1080,7 +1080,8 @@ test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence() {
       and .state == "awaiting_landing"
       and (.doing | endswith("; PR open, checks passing, mergeable MERGEABLE; not merged"))))
       and (.candidate_prs | any(.[]; .url == "https://github.com/kunchenguid/firstmate/pull/9"
-        and .merge_ready == true))
+        and .merge_ready == true and .durable_task_match == true
+        and .durable_task_id == "terminal-ship"))
   ' >/dev/null || fail "live PR evidence did not report the recorded open PR honestly: $live"
   pass "terminal ship state stays unlanded while retaining source detail and exact live PR evidence"
 }
@@ -1129,6 +1130,45 @@ EOF
   pass "live PR evidence requires both durable task provenance and a mergeable PR"
 }
 
+test_merge_ready_candidate_keeps_uncapped_durable_task_proof() {
+  local home fakebin json i id
+  home=$(make_home uncapped-pr-proof)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] z-captain-call - Merge-ready candidate beyond the display cap (repo: firstmate) (kind: ship) (since 2026-07-11)
+
+## Queued
+
+## Done
+EOF
+  : > "$home/data/secondmates.md"
+  i=1
+  while [ "$i" -le 20 ]; do
+    id=$(printf 'a-recorded-%02d' "$i")
+    fm_write_meta "$home/state/$id.meta" \
+      "project=firstmate" "harness=claude" "kind=ship" "mode=manual" \
+      "pr=https://github.com/kunchenguid/firstmate/pull/$((100 + i))"
+    i=$((i + 1))
+  done
+  fm_write_meta "$home/state/z-captain-call.meta" \
+    "project=firstmate" "harness=claude" "kind=ship" "mode=manual" \
+    "pr=https://github.com/kunchenguid/firstmate/pull/9"
+  fakebin=$(make_fakebin "$home")
+  : > "$home/net.log"
+
+  json=$(run "$home" "$fakebin" --include-prs --json)
+  printf '%s' "$json" | jq -e '
+    (.recorded_prs | length) == 20
+      and (.recorded_prs | any(.url == "https://github.com/kunchenguid/firstmate/pull/9") | not)
+      and (.candidate_prs | any(.[];
+        .url == "https://github.com/kunchenguid/firstmate/pull/9"
+        and .merge_ready == true
+        and .durable_task_match == true
+        and .durable_task_id == "z-captain-call"))
+  ' >/dev/null || fail "display cap hid the candidate's durable Captain's Call proof: $json"
+  pass "merge-ready candidates retain durable Captain's Call proof beyond display caps"
+}
+
 test_verified_open_pr_outranks_a_contradictory_done_row() {
   local home fakebin json
   home=$(make_home pr-over-done)
@@ -1139,33 +1179,43 @@ test_verified_open_pr_outranks_a_contradictory_done_row() {
 
 ## Done
 - [x] pr-open-ship - Claimed landed https://github.com/kunchenguid/firstmate/pull/9 (repo: firstmate) (kind: ship) (merged 2026-07-10)
+- [x] done-live - Structured Done row with a stale live child (repo: firstmate) (kind: ship) (merged 2026-07-09)
 EOF
   : > "$home/data/secondmates.md"
   mkdir -p "$home/projects/wt"
   fm_write_meta "$home/state/pr-open-ship.meta" \
-    "window=firstmate:fm-pr-open-ship" "worktree=$home/projects/wt" "project=firstmate" \
+    "worktree=$home/projects/wt" "project=firstmate" \
     "harness=claude" "kind=ship" "mode=manual" \
     "pr=https://github.com/kunchenguid/firstmate/pull/9"
-  record_claude_state "$home/state" pr-open-ship idle
   printf 'done: merged\n' > "$home/state/pr-open-ship.status"
+  fm_write_meta "$home/state/done-live.meta" \
+    "window=firstmate:fm-done-live" "worktree=$home/projects/wt" "project=firstmate" \
+    "harness=claude" "kind=ship" "mode=manual"
+  record_claude_state "$home/state" done-live busy
+  printf 'working: stale child still claims work\n' > "$home/state/done-live.status"
   fakebin=$(make_fakebin "$home")
   : > "$home/net.log"
 
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.landed | any(.[]; .id == "pr-open-ship"))
-      and (.in_flight | any(.[]; .id == "pr-open-ship") | not)
-  ' >/dev/null || fail "the structured Done row did not outrank a weaker status claim: $json"
+      and (.landed | any(.[]; .id == "done-live"))
+      and (.in_flight | any(.[]; .id == "pr-open-ship" or .id == "done-live") | not)
+      and (.omitted | any(.[]; .surface
+        == "main Done backlog row(s) contradicted by a live child state: 2 (done-live=working, pr-open-ship=unknown)"))
+  ' >/dev/null || fail "structured Done rows did not outrank weaker live-state claims: $json"
   json=$(run "$home" "$fakebin" --include-prs --json)
   printf '%s' "$json" | jq -e '
     (.landed | any(.[]; .id == "pr-open-ship") | not)
+      and (.landed | any(.[]; .id == "done-live"))
+      and (.in_flight | any(.[]; .id == "done-live") | not)
       and (.in_flight | any(.[]; .id == "pr-open-ship"
         and .state == "awaiting_landing"
-        and (.doing | endswith("; PR open, checks passing, mergeable MERGEABLE; not merged"))))
+        and .doing == "Worker state unknown (no backend target recorded); PR open, checks passing, mergeable MERGEABLE; not merged"))
       and (.omitted | any(.[]; .surface
         == "main Done backlog row(s) contradicted by a verified open PR: 1 (pr-open-ship)"))
   ' >/dev/null || fail "verified open PR evidence did not outrank the contradictory Done row: $json"
-  pass "a verified open PR outranks a contradictory Done row and discloses the conflict"
+  pass "Done rows stay exclusive unless a verified open PR supplies stronger evidence"
 }
 
 test_bulk_payloads_bypass_exec_argument_limit() {
@@ -1252,16 +1302,13 @@ EOF
   cat > "$fakebin/jq" <<'SH'
 #!/usr/bin/env bash
 if [ "$#" -eq 2 ] && [ "$1" = -s ] && [ "$2" = 'sort_by(.id)' ]; then
-  n=$(cat "$EMPTY_JQ_COUNT" 2>/dev/null || printf '0\n')
-  n=$((n + 1))
-  printf '%s\n' "$n" > "$EMPTY_JQ_COUNT"
-  [ "$n" -eq 2 ] && exit 0
+  exit 0
 fi
 exec "$REAL_JQ" "$@"
 SH
   chmod +x "$fakebin/jq"
   : > "$home/net.log"
-  out=$(REAL_JQ="$real_jq" EMPTY_JQ_COUNT="$home/jq-count" \
+  out=$(REAL_JQ="$real_jq" \
     PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
     "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "empty scout-report producer emitted a successful snapshot: $out"
@@ -1269,6 +1316,49 @@ SH
     "empty producer must fail at its independent binding"
   case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "failed producer still emitted a snapshot: $out" ;; esac
   pass "an empty snapshot producer fails loudly instead of shifting later payloads"
+}
+
+test_invalid_task_payloads_fail_without_omitting_the_task() {
+  local home fakebin real_jq mode out rc
+  home=$(make_home invalid-task-payload)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] payload-task - Task payload validation fixture (repo: firstmate) (kind: ship) (since 2026-07-11)
+
+## Queued
+
+## Done
+EOF
+  : > "$home/data/secondmates.md"
+  fm_write_meta "$home/state/payload-task.meta" \
+    "project=firstmate" "harness=claude" "kind=ship" "mode=manual"
+  fakebin=$(make_fakebin "$home")
+  real_jq=$(command -v jq)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+last=${!#}
+if [ "$last" = '{path:$path,present:$present}' ]; then
+  case "$TASK_PAYLOAD_FAULT" in
+    empty) exit 0 ;;
+    malformed) printf '{malformed\n'; exit 0 ;;
+  esac
+fi
+exec "$REAL_JQ" "$@"
+SH
+  chmod +x "$fakebin/jq"
+  : > "$home/net.log"
+
+  for mode in empty malformed; do
+    rc=0
+    out=$(REAL_JQ="$real_jq" TASK_PAYLOAD_FAULT="$mode" \
+      PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+      "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
+    [ "$rc" -ne 0 ] || fail "$mode task payload silently omitted its task: $out"
+    assert_contains "$out" "fm-fleet-snapshot: task snapshot failed" \
+      "$mode task payload did not fail at the task boundary"
+    case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "$mode task payload emitted a snapshot: $out" ;; esac
+  done
+  pass "empty and malformed task payloads fail without silently omitting a task"
 }
 
 test_default_is_bounded_and_local_only() {
@@ -2562,9 +2652,11 @@ test_registry_unavailability_and_bounds_are_explicit
 test_current_landed_baseline_is_repeatable_and_prior_report_independent
 test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence
 test_live_pr_merge_state_requires_durable_provenance_and_mergeability
+test_merge_ready_candidate_keeps_uncapped_durable_task_proof
 test_verified_open_pr_outranks_a_contradictory_done_row
 test_bulk_payloads_bypass_exec_argument_limit
 test_empty_snapshot_producer_fails_loudly_without_payload_shift
+test_invalid_task_payloads_fail_without_omitting_the_task
 test_default_is_bounded_and_local_only
 test_toon_json_parity
 test_landed_includes_secondmate_home_merges
