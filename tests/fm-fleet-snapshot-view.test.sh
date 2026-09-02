@@ -266,8 +266,8 @@ test_registered_secondmate_summary_survives_argv_ceiling() {
 # A registered secondmate is sampled by running an external producer - fm-on.sh
 # over ssh for a remote home - whose stdout carries whatever the remote login
 # shell prints. The shim reproduces that at the sampling boundary: the producer
-# still exits 0 while its stdout is prefixed with rc-file noise, is empty, or is
-# a non-object document.
+# still exits 0 while its stdout is prefixed with rc-file noise, is empty,
+# repeats the whole document, or is a non-object document.
 install_secondmate_summary_shim() {  # <fakebin>
   local fakebin=$1 real_env
   real_env=$(command -v env)
