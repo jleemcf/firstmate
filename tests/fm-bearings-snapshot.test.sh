@@ -418,7 +418,7 @@ SH
 }
 
 test_parent_activity_evidence_is_bounded_and_disclosed() {
-  local home mate fakebin canonical json i
+  local home mate fakebin canonical json i real_jq out rc
   home=$(make_home bounded-parent-activity)
   mate="$TMP_ROOT/bounded-parent-activity-home"
   write_domain_alpha_fixture "$home" "$mate"
@@ -447,7 +447,36 @@ test_parent_activity_evidence_is_bounded_and_disclosed() {
   printf '%s' "$json" | jq -e '
     .omitted | any(.surface == "secondmate parent activity evidence truncated for 1 record(s)")
   ' >/dev/null || fail "bearings did not disclose bounded parent activity evidence: $json"
-  pass "parent activity evidence is bounded and disclosed"
+
+  real_jq=$(command -v jq)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+last=${!#}
+case "${PARENT_PAYLOAD_FAULT:-}" in
+  activity) case "$last" in *'[splits("\n")'*) exit 9 ;; esac ;;
+  row) [ "$last" = '.home // ""' ] && exit 9 ;;
+esac
+exec "$REAL_JQ" "$@"
+SH
+  chmod +x "$fakebin/jq"
+  canonical=$(REAL_JQ="$real_jq" PARENT_PAYLOAD_FAULT=activity \
+    PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json)
+  printf '%s' "$canonical" | "$real_jq" -e '
+    .secondmate_current.records[] | select(.id == "domain-alpha")
+    | .parent_event.activity_scan.available == false
+      and .parent_event.activity_scan.reasons == ["read_failed"]
+  ' >/dev/null || fail "parent activity producer failure was not explicitly unavailable: $canonical"
+
+  rc=0
+  out=$(REAL_JQ="$real_jq" PARENT_PAYLOAD_FAULT=row \
+    PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "secondmate row extraction failure emitted a successful snapshot: $out"
+  assert_contains "$out" "fm-fleet-snapshot: registered secondmate aggregation failed" \
+    "secondmate row extraction failure lacked a boundary diagnostic"
+  case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "secondmate row failure emitted a partial snapshot: $out" ;; esac
+  pass "parent activity failures disclose unavailability and row failures fail closed"
 }
 
 test_active_child_overrides_old_parent_event() {
@@ -1180,6 +1209,7 @@ test_verified_open_pr_outranks_a_contradictory_done_row() {
 ## Done
 - [x] pr-open-ship - Claimed landed https://github.com/kunchenguid/firstmate/pull/9 (repo: firstmate) (kind: ship) (merged 2026-07-10)
 - [x] done-live - Structured Done row with a stale live child (repo: firstmate) (kind: ship) (merged 2026-07-09)
+- [x] done-captain - Completed captain-held task with stale metadata (repo: firstmate) (kind: captain) (hold: old captain choice) (hold-kind: captain) (merged 2026-07-08)
 EOF
   : > "$home/data/secondmates.md"
   mkdir -p "$home/projects/wt"
@@ -1193,6 +1223,11 @@ EOF
     "harness=claude" "kind=ship" "mode=manual"
   record_claude_state "$home/state" done-live busy
   printf 'working: stale child still claims work\n' > "$home/state/done-live.status"
+  fm_write_meta "$home/state/done-captain.meta" \
+    "window=firstmate:fm-done-captain" "worktree=$home/projects/wt" "project=firstmate" \
+    "harness=claude" "kind=captain" "mode=manual"
+  record_claude_state "$home/state" done-captain busy
+  printf 'working: stale captain task still claims work\n' > "$home/state/done-captain.status"
   fakebin=$(make_fakebin "$home")
   : > "$home/net.log"
 
@@ -1200,15 +1235,17 @@ EOF
   printf '%s' "$json" | jq -e '
     (.landed | any(.[]; .id == "pr-open-ship"))
       and (.landed | any(.[]; .id == "done-live"))
-      and (.in_flight | any(.[]; .id == "pr-open-ship" or .id == "done-live") | not)
+      and (.landed | any(.[]; .id == "done-captain") | not)
+      and (.in_flight | any(.[]; .id == "pr-open-ship" or .id == "done-live" or .id == "done-captain") | not)
       and (.omitted | any(.[]; .surface
-        == "main Done backlog row(s) contradicted by a live child state: 2 (done-live=working, pr-open-ship=unknown)"))
+        == "main Done backlog row(s) contradicted by a live child state: 3 (done-captain=working, done-live=working, pr-open-ship=unknown)"))
   ' >/dev/null || fail "structured Done rows did not outrank weaker live-state claims: $json"
   json=$(run "$home" "$fakebin" --include-prs --json)
   printf '%s' "$json" | jq -e '
     (.landed | any(.[]; .id == "pr-open-ship") | not)
       and (.landed | any(.[]; .id == "done-live"))
-      and (.in_flight | any(.[]; .id == "done-live") | not)
+      and (.landed | any(.[]; .id == "done-captain") | not)
+      and (.in_flight | any(.[]; .id == "done-live" or .id == "done-captain") | not)
       and (.in_flight | any(.[]; .id == "pr-open-ship"
         and .state == "awaiting_landing"
         and .doing == "Worker state unknown (no backend target recorded); PR open, checks passing, mergeable MERGEABLE; not merged"))
@@ -1287,7 +1324,7 @@ test_bulk_payloads_bypass_exec_argument_limit() {
 }
 
 test_empty_snapshot_producer_fails_loudly_without_payload_shift() {
-  local home fakebin real_jq out rc=0
+  local home fakebin real_jq real_find mode out rc
   home=$(make_home empty-payload-failure)
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
@@ -1297,29 +1334,54 @@ test_empty_snapshot_producer_fails_loudly_without_payload_shift() {
 ## Done
 EOF
   : > "$home/data/secondmates.md"
+  mkdir -p "$home/data/scout-fault"
+  printf '# Report\n' > "$home/data/scout-fault/report.md"
   fakebin=$(make_fakebin "$home")
   real_jq=$(command -v jq)
+  real_find=$(command -v find)
   cat > "$fakebin/jq" <<'SH'
 #!/usr/bin/env bash
-if [ "$#" -eq 2 ] && [ "$1" = -s ] && [ "$2" = 'sort_by(.id)' ]; then
-  exit 0
+last=${!#}
+if [ "${SCOUT_FAULT:-}" = final ] && [ "$#" -eq 3 ] && [ "$1" = -s ] \
+  && [ "$2" = 'sort_by(.id)' ]; then
+  case "$3" in */fm-fleet-scout-rows.*) exit 0 ;; esac
+fi
+if [ "${SCOUT_FAULT:-}" = row ] && [ "$last" = '{id:$id,path:$path}' ]; then
+  exit 9
 fi
 exec "$REAL_JQ" "$@"
 SH
-  chmod +x "$fakebin/jq"
+  cat > "$fakebin/find" <<'SH'
+#!/usr/bin/env bash
+if [ "${SCOUT_FAULT:-}" = find ]; then
+  printf '%s\n' "$SCOUT_PARTIAL_REPORT"
+  exit 9
+fi
+exec "$REAL_FIND" "$@"
+SH
+  chmod +x "$fakebin/jq" "$fakebin/find"
   : > "$home/net.log"
-  out=$(REAL_JQ="$real_jq" \
-    PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
-    "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "empty scout-report producer emitted a successful snapshot: $out"
-  assert_contains "$out" "scout_reports payload must contain exactly one JSON value" \
-    "empty producer must fail at its independent binding"
-  case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "failed producer still emitted a snapshot: $out" ;; esac
-  pass "an empty snapshot producer fails loudly instead of shifting later payloads"
+  for mode in final row find; do
+    rc=0
+    out=$(REAL_JQ="$real_jq" REAL_FIND="$real_find" SCOUT_FAULT="$mode" \
+      SCOUT_PARTIAL_REPORT="$home/data/scout-fault/report.md" \
+      PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+      "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
+    [ "$rc" -ne 0 ] || fail "$mode scout-report failure emitted a successful snapshot: $out"
+    if [ "$mode" = final ]; then
+      assert_contains "$out" "scout_reports payload must contain exactly one JSON value" \
+        "empty final producer must fail at its independent binding"
+    else
+      assert_contains "$out" "fm-fleet-snapshot: scout report snapshot failed" \
+        "$mode scout producer failure did not reach the executable boundary"
+    fi
+    case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "$mode scout failure emitted a partial snapshot: $out" ;; esac
+  done
+  pass "scout discovery, row, and final failures cannot emit partial snapshots"
 }
 
 test_invalid_task_payloads_fail_without_omitting_the_task() {
-  local home fakebin real_jq mode out rc
+  local home fakebin real_jq real_awk mode out rc
   home=$(make_home invalid-task-payload)
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
@@ -1338,7 +1400,7 @@ EOF
 #!/usr/bin/env bash
 last=${!#}
 if [ "$last" = '{path:$path,present:$present}' ]; then
-  case "$TASK_PAYLOAD_FAULT" in
+  case "${TASK_PAYLOAD_FAULT:-}" in
     empty) exit 0 ;;
     malformed) printf '{malformed\n'; exit 0 ;;
   esac
@@ -1358,7 +1420,37 @@ SH
       "$mode task payload did not fail at the task boundary"
     case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "$mode task payload emitted a snapshot: $out" ;; esac
   done
-  pass "empty and malformed task payloads fail without silently omitting a task"
+
+  real_awk=$(command -v awk)
+  cat > "$fakebin/awk" <<'SH'
+#!/usr/bin/env bash
+case "${TASK_READER_FAULT:-}" in
+  pr) case "$*" in *'match($0'*) exit 9 ;; esac ;;
+  status) case "$*" in *'/[^[:space:]]/'*) exit 9 ;; esac ;;
+esac
+exec "$REAL_AWK" "$@"
+SH
+  chmod +x "$fakebin/awk"
+  printf 'done: https://github.com/kunchenguid/firstmate/pull/91\n' > "$home/state/payload-task.status"
+  for mode in pr status; do
+    if [ "$mode" = status ]; then
+      fm_write_meta "$home/state/payload-task.meta" \
+        "project=firstmate" "harness=claude" "kind=ship" "mode=manual" \
+        "pr=https://github.com/kunchenguid/firstmate/pull/91"
+    else
+      fm_write_meta "$home/state/payload-task.meta" \
+        "project=firstmate" "harness=claude" "kind=ship" "mode=manual"
+    fi
+    rc=0
+    out=$(REAL_JQ="$real_jq" REAL_AWK="$real_awk" TASK_READER_FAULT="$mode" \
+      PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+      "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
+    [ "$rc" -ne 0 ] || fail "$mode reader failure emitted a successful snapshot: $out"
+    assert_contains "$out" "fm-fleet-snapshot: task snapshot failed" \
+      "$mode reader failure did not reach the task boundary"
+    case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "$mode reader failure emitted a partial snapshot: $out" ;; esac
+  done
+  pass "task payload and evidence-reader failures cannot omit task state"
 }
 
 test_default_is_bounded_and_local_only() {
@@ -1656,7 +1748,7 @@ SH
 }
 
 test_projection_and_toon_fail_closed() {
-  local home fakebin out err rc
+  local home fakebin out err rc real_jq real_sed json
   home=$(make_home fail-closed); write_fixture "$home"
   fakebin=$(make_fakebin "$home")
   install_failing_jq "$fakebin" model
@@ -1671,7 +1763,51 @@ test_projection_and_toon_fail_closed() {
   [ "$rc" -ne 0 ] || fail "TOON rendering failure exited successfully"
   [ -z "$out" ] || fail "TOON rendering failure emitted output"
   grep -F 'TOON rendering failed' "$err" >/dev/null || fail "TOON failure lacked a diagnostic"
-  pass "projection and TOON rendering failures exit nonzero with diagnostics"
+
+  real_jq=$(command -v jq)
+  real_sed=$(command -v sed)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+last=${!#}
+case "${BEARINGS_DISCOVERY_FAULT:-}" in
+  inventory) [ "$last" = '.tasks[].pr.url // empty' ] && exit 9 ;;
+  append) [ "$last" = '$a + $b' ] && exit 9 ;;
+esac
+exec "$REAL_JQ" "$@"
+SH
+  cat > "$fakebin/sed" <<'SH'
+#!/usr/bin/env bash
+if [ "${BEARINGS_DISCOVERY_FAULT:-}" = slug ]; then
+  case "$*" in *'github\.com'*) exit 9 ;; esac
+fi
+exec "$REAL_SED" "$@"
+SH
+  chmod +x "$fakebin/jq" "$fakebin/sed"
+
+  rc=0
+  out=$(REAL_JQ="$real_jq" REAL_SED="$real_sed" BEARINGS_DISCOVERY_FAULT=inventory \
+    run "$home" "$fakebin" --include-prs --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "PR inventory extraction failure emitted a successful snapshot: $out"
+  assert_contains "$out" "recorded PR repository discovery failed" \
+    "PR inventory extraction failure lacked a diagnostic"
+  case "$out" in *'"schema": "fm-bearings.v1"'*) fail "PR inventory failure emitted a partial model: $out" ;; esac
+
+  rc=0
+  out=$(REAL_JQ="$real_jq" REAL_SED="$real_sed" BEARINGS_DISCOVERY_FAULT=slug \
+    run "$home" "$fakebin" --include-prs --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "repository parser failure emitted a successful snapshot: $out"
+  assert_contains "$out" "PR repository parsing failed" \
+    "repository parser failure lacked a diagnostic"
+  case "$out" in *'"schema": "fm-bearings.v1"'*) fail "repository parser failure emitted a partial model: $out" ;; esac
+
+  json=$(REAL_JQ="$real_jq" REAL_SED="$real_sed" BEARINGS_DISCOVERY_FAULT=append \
+    run "$home" "$fakebin" --include-prs --json)
+  printf '%s' "$json" | "$real_jq" -e '
+    .schema == "fm-bearings.v1"
+      and (.candidate_prs | length) == 0
+      and (.prs | contains("1 repo(s) unavailable"))
+  ' >/dev/null || fail "candidate append failure retained a partial candidate array: $json"
+  pass "projection and discovery failures fail closed or disclose unavailable repositories"
 }
 
 # The Lavish-103 defect, end to end: a COMPLETED scout that raised a decision and

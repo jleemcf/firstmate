@@ -221,7 +221,9 @@ PR_ROWS_MIN_TOTAL=0
 
 # Parse owner/repo from an https or ssh GitHub remote/PR URL; empty if not GitHub.
 repo_slug() {  # <url>
-  printf '%s' "$1" | sed -n 's#.*github\.com[:/]\([^/]*/[^/]*\)#\1#p' | sed 's#\.git$##; s#/pull/.*$##; s#/$##'
+  local slug
+  slug=$(printf '%s' "$1" | sed -n 's#.*github\.com[:/]\([^/]*/[^/]*\)#\1#p') || return 1
+  printf '%s' "$slug" | sed 's#\.git$##; s#/pull/.*$##; s#/$##'
 }
 
 # Bounded gh call; prints stdout, non-zero on timeout/failure. gh only.
@@ -237,21 +239,29 @@ if [ "$INCLUDE_PRS" = 1 ]; then
   else
     # Candidate repos: recorded pr= URLs plus live worktree origins. Deduped.
     repos=""
+    recorded_pr_urls=$(printf '%s' "$SNAP" | jq -r '.tasks[].pr.url // empty') \
+      || { echo "fm-bearings-snapshot: recorded PR repository discovery failed" >&2; exit 1; }
     while IFS= read -r u; do
       [ -n "$u" ] || continue
-      s=$(repo_slug "$u"); [ -n "$s" ] || continue
+      s=$(repo_slug "$u") \
+        || { echo "fm-bearings-snapshot: PR repository parsing failed" >&2; exit 1; }
+      [ -n "$s" ] || continue
       case " $repos " in *" $s "*) : ;; *) repos="$repos $s" ;; esac
     done <<EOF
-$(printf '%s' "$SNAP" | jq -r '.tasks[].pr.url // empty')
+$recorded_pr_urls
 EOF
+    worktree_paths=$(printf '%s' "$SNAP" | jq -r '.tasks[] | select(.kind != "secondmate") | .paths.worktree.path // empty') \
+      || { echo "fm-bearings-snapshot: worktree repository discovery failed" >&2; exit 1; }
     while IFS= read -r wt; do
       [ -n "$wt" ] || continue
       [ -d "$wt" ] || continue
       u=$(git -C "$wt" remote get-url origin 2>/dev/null) || continue
-      s=$(repo_slug "$u"); [ -n "$s" ] || continue
+      s=$(repo_slug "$u") \
+        || { echo "fm-bearings-snapshot: worktree repository parsing failed" >&2; exit 1; }
+      [ -n "$s" ] || continue
       case " $repos " in *" $s "*) : ;; *) repos="$repos $s" ;; esac
     done <<EOF
-$(printf '%s' "$SNAP" | jq -r '.tasks[] | select(.kind != "secondmate") | .paths.worktree.path // empty')
+$worktree_paths
 EOF
 
     for repo in $repos; do PR_REPOS_TOTAL=$((PR_REPOS_TOTAL + 1)); done
@@ -281,12 +291,18 @@ EOF
         }
         | . + {merge_ready:(.review == "APPROVED" and .checks == "passing" and .mergeable == "MERGEABLE")}
         ] as $rows | {returned:($rows | length), rows:$rows[:$limit]}') || { nwarn=$((nwarn + 1)); continue; }
-      returned=$(printf '%s' "$repo_result" | jq '.returned')
-      repo_rows=$(printf '%s' "$repo_result" | jq '.rows')
-      cnt=$(printf '%s' "$repo_rows" | jq 'length')
+      returned=$(printf '%s' "$repo_result" | jq -er '
+        .returned | select(type == "number" and . >= 0 and floor == .)') \
+        || { nwarn=$((nwarn + 1)); continue; }
+      repo_rows=$(printf '%s' "$repo_result" | jq -ce '.rows | arrays') \
+        || { nwarn=$((nwarn + 1)); continue; }
+      cnt=$(printf '%s' "$repo_rows" | jq -er 'length') \
+        || { nwarn=$((nwarn + 1)); continue; }
+      next_rows=$(jq -cen --argjson a "$rows" --argjson b "$repo_rows" '$a + $b') \
+        || { nwarn=$((nwarn + 1)); continue; }
       [ "$returned" -gt "$FM_BEARINGS_PR_LIMIT" ] && ncapped=$((ncapped + 1))
       npr=$((npr + cnt))
-      rows=$(jq -n --argjson a "$rows" --argjson b "$repo_rows" '$a + $b')
+      rows=$next_rows
     done
     PR_REPOS_SHOWN=$nrepos
     PR_ROWS_CAPPED=$ncapped
@@ -375,13 +391,15 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | . as $record
        | select($include_prs == 1 and ($matched_candidate_prs | any(.url == $record.url and .durable_task_match)))
        | .id ]) as $open_pr_ids
-  | ([ .backlog.records[] | select(.state == "done" and .structured and .hold_kind != "captain")
-       | {id, title, pr_url, report_path, local_note, completion, home:"(main)", home_id:"(main)"} ]) as $main_done_rows
-  | ([ $main_done_rows[] | . as $row | select(($open_pr_ids | index($row.id)) != null) ]) as $main_done_pr_open
+  | ([ .backlog.records[] | select(.state == "done" and .structured)
+       | {id, title, pr_url, report_path, local_note, completion, hold_kind,
+          home:"(main)", home_id:"(main)"} ]) as $main_done_all_rows
+  | ([ $main_done_all_rows[] | select(.hold_kind != "captain") ]) as $main_done_rows
+  | ([ $main_done_all_rows[] | . as $row | select(($open_pr_ids | index($row.id)) != null) ]) as $main_done_pr_open
   | ([ $main_done_rows[] | . as $row | select(($open_pr_ids | index($row.id)) == null) ]) as $main_done
+  | ([ $main_done_all_rows[] | . as $row | select(($open_pr_ids | index($row.id)) == null) | .id ]) as $main_done_exclusion_ids
   | ((.secondmate_landed.records) // []) as $mate_done
   | ($main_done + $mate_done) as $all_landed_rows
-  | ($main_done | map(.id)) as $main_done_ids
   | ([ $all_landed_rows | group_by(.home_id)[]
        | sort_by([(.completion.date // ""), .id]) | reverse
        | (if $all_landed == 1 then . else .[:$landed_per_home_n] end) ]) as $per_home_groups
@@ -443,7 +461,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(.backlog.current_role != "program")
        | select(.backlog.current_role != "held" or .current_state.state == "working")
        | . as $task
-       | select(($main_done_ids | index($task.id)) == null)
+       | select(($main_done_exclusion_ids | index($task.id)) == null)
        | ($task | durable_pr_url) as $durable_pr_url
        | (if $durable_pr_url == null then null
           else ($matched_candidate_prs
