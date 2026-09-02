@@ -24,13 +24,18 @@
 # return or removal clears worktree= before the slot can become reusable, and
 # the worktree's .fm-task-owner marker retires atomically with that claim, so a
 # released slot never carries a live claim from the task that just left it.
-# Only a confirmed provider release completes that retirement. Every failure or
-# interruption parks it instead: the claim and owner-marker copies are preserved
-# untouched, the record claims no path, every further destructive lifecycle
-# action refuses, and one deliberate manual-recovery drill is printed. No
-# runtime path restores either half, and none of it ever creates or overwrites
-# another owner's marker. bin/fm-worktree-ownership-lib.sh owns that recovery
-# contract.
+# That retirement begins only once the marker at the slot is proved absent or
+# exactly this record's own: any other entry there - another task's, malformed,
+# unreadable, or not a regular file - refuses before the claim is touched, with
+# the record's claim, that entry, and the slot exactly as they were and nothing
+# parked, so resolving that entry and rerunning is an ordinary recovery.
+# Only a confirmed provider release completes a retirement that did begin. Every
+# later failure or interruption parks it instead: the claim and owner-marker
+# copies are preserved untouched, the record claims no path, every further
+# destructive lifecycle action refuses, and one deliberate manual-recovery drill
+# is printed. No runtime path restores either half, and none of it ever creates
+# or overwrites another owner's marker. bin/fm-worktree-ownership-lib.sh owns
+# that recovery contract.
 # A force-authorized discard never bypasses that independent ownership proof.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
@@ -1459,8 +1464,10 @@ teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-
 # Every claim-retiring provider operation has one shape: prove ownership unless
 # the caller already did under the same locks, retire the exact claim the
 # operation is about to make reusable, run the provider operation, then release
-# only on confirmed success. Every other outcome parks the retirement, refuses
-# further destructive action, and requires deliberate manual recovery.
+# only on confirmed success. A retirement refused before it begins - including
+# over an owner-marker entry this record cannot prove is its own - leaves the
+# record and the slot as they were; every other outcome parks the retirement,
+# refuses further destructive action, and requires deliberate manual recovery.
 # FM_WORKTREE_RETIREMENT_UNRECORDED from a confirmed release reaches the caller
 # unchanged, because a released path with an unrecorded retirement is not a
 # failed provider operation.
