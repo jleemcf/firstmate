@@ -47,10 +47,12 @@
 # marker is the in-worktree half of the same claim. Only a marker this record
 # can prove is its own is retired; any other entry at that path - foreign,
 # malformed, not a regular file, or unprovable because the record itself is
-# incomplete - leaves ownership conflicting or unproved, so it stays
-# byte-for-byte where it is and the retirement refuses before the provider runs
-# rather than releasing a path this record cannot prove it still owns. Only an
-# absent marker is silent, which is what a legacy or unmarked slot looks like.
+# incomplete - leaves ownership conflicting or unproved. That is settled by a
+# read-only preflight BEFORE the claim is stripped, so such an entry refuses
+# with the record, the entry, and the slot exactly as they were and no
+# retirement ever begins: clearing the stray entry and rerunning is a real
+# recovery, not a manual drill. Only an absent marker is silent, which is what
+# a legacy or unmarked slot looks like.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
 # returned slot with a stale destructive claim.
 #
@@ -1062,11 +1064,12 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
     return 1
   fi
   dir=${meta%/*}
+  base=${meta##*/}
+  fm_worktree_marker_retire_admissible "$dir" "$base" "$expected" || return 1
   backup=$(fm_worktree_claim_strip_into_backup "$meta") || {
     fm_worktree_refuse "could not atomically clear task worktree claim in $meta before provider return."
     return 1
   }
-  base=${meta##*/}
   FM_WORKTREE_CLAIM_RETIRE_META=$meta
   FM_WORKTREE_CLAIM_RETIRE_BACKUP=$backup
   FM_WORKTREE_CLAIM_RETIRE_PATH=$expected
@@ -1077,27 +1080,21 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
   }
 }
 
-# The in-worktree owner marker is the other half of the same claim, so it is
-# retired in the same step and gone before the provider can recycle the slot.
-# No runtime path puts it or the worktree claim back after retirement starts;
-# the header above owns the deliberate manual-recovery contract.
-# Only a marker this record can prove is its own is ever retired. A secondmate
-# home is proved by its .fm-secondmate-home identity and never carries a marker
-# of its own, so anything at that path there is by construction not this
-# record's. Whatever the reason the binding cannot be proved - another task's
-# marker, an unreadable or incomplete one, an entry that is not a regular file,
-# or a record too incomplete to name the generation it would bind - ownership of
-# the path is conflicting or unproved, so the entry is left byte-for-byte
-# untouched and the retirement refuses here, before any provider return or
-# removal, leaving the claim parked for the same deliberate manual drill every
-# other unconfirmed outcome gets. Only an absent marker stays silent, which is
-# what a legacy or unmarked slot looks like. The binding prints the exact reason
-# it could not attribute the entry, and on every path whose proof already ran
-# the same binding this is a no-op.
-fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
-  local dir=$1 base=$2 expected=$3 marker stash meta id generation awareness
+# Whether this record may touch whatever sits at its slot's owner-marker path.
+# 0 when nothing is there - a legacy or unmarked slot - or when the entry is
+# exactly this record's marker. 1 for every other entry: another task's marker,
+# an unreadable or incomplete one, something that is not a regular file, or a
+# record too incomplete to name the generation it would bind. A secondmate home
+# is proved by its .fm-secondmate-home identity and never carries a marker of
+# its own, so anything at that path there is by construction not this record's.
+# Nothing here creates, moves, reads through, or removes anything, so a refusal
+# leaves the slot and the record exactly as they were, and the caller runs it
+# before it rewrites either half of the claim. The binding prints the exact
+# reason it could not attribute the entry. On every path whose ownership proof
+# already ran the same binding this is a no-op.
+fm_worktree_marker_retire_admissible() {  # <state-dir> <meta-basename> <expected-worktree>
+  local dir=$1 base=$2 expected=$3 marker meta id generation awareness
   local marker_aware=0 bind_rc=0
-  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   [ -n "$expected" ] && [ -d "$expected" ] || return 0
   marker="$expected/$FM_WORKTREE_TASK_OWNER_MARKER"
   [ -e "$marker" ] || [ -L "$marker" ] || return 0
@@ -1108,10 +1105,27 @@ fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
   [ "$awareness" != 1 ] || marker_aware=1
   fm_worktree_task_owner_marker_binding "$expected" "$id" "$generation" "$marker_aware" "$dir" \
     || bind_rc=$?
-  if [ "$bind_rc" -ne 0 ]; then
-    fm_worktree_refuse "task $id cannot prove the $FM_WORKTREE_TASK_OWNER_MARKER at $marker is its own, so ownership of that path is conflicting or unproved; it is left exactly as it is and nothing may return or remove $expected for task $id."
-    return 1
-  fi
+  [ "$bind_rc" -ne 0 ] || return 0
+  fm_worktree_refuse "task $id cannot prove the $FM_WORKTREE_TASK_OWNER_MARKER at $marker is its own, so ownership of that path is conflicting or unproved; it is left exactly as it is, this record keeps its worktree claim, and nothing may return or remove $expected for task $id until that entry is resolved."
+  return 1
+}
+
+# The in-worktree owner marker is the other half of the same claim, so it is
+# retired in the same step and gone before the provider can recycle the slot.
+# No runtime path puts it or the worktree claim back after retirement starts;
+# the header above owns the deliberate manual-recovery contract.
+# The admissibility gate above already ran before the claim was stripped, so by
+# here the path holds either nothing or exactly this record's marker. It is
+# re-checked because the claim rewrite sits between the two, and a slot that
+# changed under us in that window must park rather than stash an entry this
+# record can no longer prove is its own.
+fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
+  local dir=$1 base=$2 expected=$3 marker stash
+  FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
+  fm_worktree_marker_retire_admissible "$dir" "$base" "$expected" || return 1
+  [ -n "$expected" ] && [ -d "$expected" ] || return 0
+  marker="$expected/$FM_WORKTREE_TASK_OWNER_MARKER"
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 0
   stash=$(umask 077; mktemp "$dir/.${base}.task-owner-backup.XXXXXX") || return 1
   if ! cp -p -- "$marker" "$stash" || ! rm -f -- "$marker"; then
     rm -f -- "$stash"

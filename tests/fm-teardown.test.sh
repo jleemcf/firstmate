@@ -1699,235 +1699,171 @@ EOF
   pass "marker-retirement preparation failure parks before provider action"
 }
 
-# A secondmate home is proved by its own .fm-secondmate-home identity and never
-# carries an owner marker of its own, so any .fm-task-owner sitting in that
-# pooled slot is positive evidence that the slot belongs to another task now.
-# The retirement must refuse there, before the provider can return or remove
-# the path, and park exactly like every other unconfirmed outcome.
-test_secondmate_retirement_refuses_a_foreign_owner_marker() {
-  local case_dir home rc real_rm
+# A slot's owner-marker path is inspected read-only BEFORE the claim is touched,
+# so an entry this record cannot prove is its own refuses with the record, the
+# entry, and the slot exactly as they were. No retirement begins, so there is
+# nothing to park and no drill to print: clearing the entry and rerunning is the
+# recovery. These cases are the reachable ones, because a secondmate home is
+# proved by its .fm-secondmate-home identity and never carries a marker of its
+# own, while every crewmate proof already refuses a non-binding marker outright.
+
+# Fails any removal of the secondmate home instead of performing it, so a
+# provider call is visible in $case_dir/provider.log rather than destroying the
+# evidence that it ran.
+# Args: case_dir
+refuse_and_log_secondmate_home_removal() {
+  local case_dir=$1 real_rm
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+}
+
+# The exact state a read-only preflight refusal must leave behind: the record
+# still holds its claim, neither half of the retirement was copied aside, and no
+# parked-retirement drill was printed because no retirement ever began. This is
+# the inverse of an interrupted retirement, which parks both copies and prints
+# the drill (see test_marker_retirement_failure_parks_before_provider_action).
+# Args: case_dir home tag [stderr-file]
+assert_marker_preflight_refused_intact() {
+  local case_dir=$1 home=$2 tag=$3 stderr=${4:-$1/stderr}
   local -a claim_backups marker_backups
+  assert_absent "$case_dir/provider.log" \
+    "$tag: the provider was asked to act on a slot whose marker entry is unprovable"
+  assert_present "$home/.fm-secondmate-home" \
+    "$tag: the refusal removed the secondmate home"
+  assert_grep "worktree=$home" "$case_dir/state/task-x1.meta" \
+    "$tag: the refusal stripped a claim it never proved it could retire"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  [ ! -e "${claim_backups[0]}" ] \
+    || fail "$tag: a read-only refusal left a parked claim copy behind"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "$tag: a read-only refusal stashed the marker entry as a recovery half"
+  assert_grep "ownership of that path is conflicting or unproved" "$stderr" \
+    "$tag: the refusal never said ownership was unproved"
+  assert_no_grep "Manual recovery drill:" "$stderr" \
+    "$tag: a refusal that began no retirement still printed the parked drill"
+}
+
+test_secondmate_retirement_refuses_a_foreign_owner_marker() {
+  local case_dir home rc
   case_dir=$(make_case secondmate-foreign-marker)
   write_meta "$case_dir" local-only secondmate
   seed_secondmate_home "$case_dir"
   home="$case_dir/secondmate-home"
   write_task_b_marker_fixture "$case_dir"
   cp -- "$case_dir/task-b-marker.expected" "$home/.fm-task-owner"
-  # Record any attempt to remove the home instead of performing it, so a
-  # provider call is visible rather than destroying the evidence it ran.
-  real_rm=$(command -v rm)
-  cat > "$case_dir/fakebin/rm" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    */secondmate-home)
-      printf 'home removal attempted\n' >> "$case_dir/provider.log"
-      exit 1
-      ;;
-  esac
-done
-exec "$real_rm" "\$@"
-EOF
-  chmod +x "$case_dir/fakebin/rm"
+  refuse_and_log_secondmate_home_removal "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "secondmate-foreign-marker: a slot marked for another task must refuse"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-foreign-marker: the provider was asked to release a slot marked for another task"
-  assert_present "$home/.fm-secondmate-home" \
-    "secondmate-foreign-marker: the refusal removed the secondmate home"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-foreign-marker
   cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
-    || fail "secondmate-foreign-marker: the retirement touched another task's owner marker"
-  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
-  [ ! -e "${marker_backups[0]}" ] \
-    || fail "secondmate-foreign-marker: another task's marker was stashed as this record's recovery half"
-  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
-  assert_grep "worktree=$home" "${claim_backups[0]}" \
-    "secondmate-foreign-marker: the parked retirement lost its claim copy"
-  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
-    "secondmate-foreign-marker: the refusal automatically restored the claim"
-  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
-    "secondmate-foreign-marker: the refusal never named the unprovable marker"
+    || fail "secondmate-foreign-marker: the refusal touched another task's owner marker"
   assert_grep "is marked as task task-b's workspace" "$case_dir/stderr" \
     "secondmate-foreign-marker: the refusal dropped the binding's own reason"
-  assert_grep "live marker remains at $home/.fm-task-owner" "$case_dir/stderr" \
-    "secondmate-foreign-marker: the drill misstated the preserved marker state"
-  assert_no_grep "preserved owner-marker copy" "$case_dir/stderr" \
-    "secondmate-foreign-marker: the drill offered another task's marker back for restoration"
-  assert_grep "Manual recovery drill:" "$case_dir/stderr" \
-    "secondmate-foreign-marker: the refusal omitted deliberate recovery"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
 
-  expect_code 1 "$rc" "secondmate-foreign-marker: a plain retry must stay parked"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-foreign-marker: the retry reached the provider"
+  expect_code 1 "$rc" "secondmate-foreign-marker: a plain retry must refuse the same way"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-foreign-marker \
+    "$case_dir/stderr2"
   cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
     || fail "secondmate-foreign-marker: the retry touched another task's owner marker"
-  assert_present "${claim_backups[0]}" \
-    "secondmate-foreign-marker: the retry discarded the parked claim copy"
-  pass "a secondmate retirement refuses a slot another task's marker still names"
+  pass "a secondmate retirement refuses a slot another task's marker names, claim intact"
 }
 
-# An entry at the marker path that is not a regular file cannot be attributed to
-# anyone, so it is the same conflicting-or-unproved ownership as a foreign
-# marker and must refuse on the same terms - not be waved through as "no marker
-# to retire". The entry keeps its type and target.
+# An entry that is not a regular file can be attributed to nobody, so it is the
+# same conflicting-or-unproved ownership as a foreign marker - not "no marker to
+# retire". It keeps its type and target, and is never followed or read through.
 test_secondmate_retirement_refuses_a_non_regular_owner_marker() {
-  local case_dir home rc real_rm link_target
-  local -a claim_backups marker_backups
+  local case_dir home rc link_target
   case_dir=$(make_case secondmate-nonregular-marker)
   write_meta "$case_dir" local-only secondmate
   seed_secondmate_home "$case_dir"
   home="$case_dir/secondmate-home"
   printf '%s\n' 'not an ownership marker' > "$case_dir/elsewhere"
   ln -s "$case_dir/elsewhere" "$home/.fm-task-owner"
-  real_rm=$(command -v rm)
-  cat > "$case_dir/fakebin/rm" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    */secondmate-home)
-      printf 'home removal attempted\n' >> "$case_dir/provider.log"
-      exit 1
-      ;;
-  esac
-done
-exec "$real_rm" "\$@"
-EOF
-  chmod +x "$case_dir/fakebin/rm"
+  refuse_and_log_secondmate_home_removal "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "secondmate-nonregular-marker: an unattributable marker entry must refuse"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-nonregular-marker: the provider was asked to release a slot with an unattributable marker"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-nonregular-marker
   [ -L "$home/.fm-task-owner" ] \
-    || fail "secondmate-nonregular-marker: the retirement changed the marker entry's type"
+    || fail "secondmate-nonregular-marker: the refusal changed the marker entry's type"
   link_target=$(readlink "$home/.fm-task-owner")
   [ "$link_target" = "$case_dir/elsewhere" ] \
-    || fail "secondmate-nonregular-marker: the retirement repointed the marker entry"
+    || fail "secondmate-nonregular-marker: the refusal repointed the marker entry"
   assert_grep 'not an ownership marker' "$case_dir/elsewhere" \
-    "secondmate-nonregular-marker: the retirement followed the link and rewrote its target"
-  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
-  [ ! -e "${marker_backups[0]}" ] \
-    || fail "secondmate-nonregular-marker: an unattributable marker was stashed as a recovery half"
-  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
-  assert_grep "worktree=$home" "${claim_backups[0]}" \
-    "secondmate-nonregular-marker: the parked retirement lost its claim copy"
+    "secondmate-nonregular-marker: the refusal followed the link and rewrote its target"
   assert_grep "not a regular ownership marker" "$case_dir/stderr" \
     "secondmate-nonregular-marker: the refusal dropped the binding's own reason"
-  assert_grep "Manual recovery drill:" "$case_dir/stderr" \
-    "secondmate-nonregular-marker: the refusal omitted deliberate recovery"
-  assert_grep "$home/.fm-task-owner is a live symlink, not a regular ownership marker" \
-    "$case_dir/stderr" \
-    "secondmate-nonregular-marker: the drill never reported the entry's observed type"
-  assert_grep "do not read, follow, move, or remove it - and stop" "$case_dir/stderr" \
-    "secondmate-nonregular-marker: the drill did not tell the operator to stop"
-  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
-    "secondmate-nonregular-marker: the drill called a live marker entry an unmarked claim"
-  assert_no_grep "skip marker restoration" "$case_dir/stderr" \
-    "secondmate-nonregular-marker: the drill told the operator no marker was there"
   pass "a secondmate retirement refuses a marker entry that is not a regular file"
 }
 
-# A directory at the marker path is the same unattributable entry as a symlink,
-# and the drill must name that observed type rather than fall through to the
-# absent-marker wording.
+# A directory at the marker path is the same unattributable entry as a symlink.
 test_secondmate_retirement_refuses_a_directory_owner_marker() {
-  local case_dir home rc real_rm
+  local case_dir home rc
   case_dir=$(make_case secondmate-directory-marker)
   write_meta "$case_dir" local-only secondmate
   seed_secondmate_home "$case_dir"
   home="$case_dir/secondmate-home"
   mkdir -p "$home/.fm-task-owner"
   printf '%s\n' 'occupant' > "$home/.fm-task-owner/inside"
-  real_rm=$(command -v rm)
-  cat > "$case_dir/fakebin/rm" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    */secondmate-home)
-      printf 'home removal attempted\n' >> "$case_dir/provider.log"
-      exit 1
-      ;;
-  esac
-done
-exec "$real_rm" "\$@"
-EOF
-  chmod +x "$case_dir/fakebin/rm"
+  refuse_and_log_secondmate_home_removal "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "secondmate-directory-marker: a directory marker entry must refuse"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-directory-marker: the provider was asked to release a slot with a directory marker entry"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-directory-marker
   [ -d "$home/.fm-task-owner" ] && [ ! -L "$home/.fm-task-owner" ] \
-    || fail "secondmate-directory-marker: the retirement changed the marker entry's type"
+    || fail "secondmate-directory-marker: the refusal changed the marker entry's type"
   assert_grep 'occupant' "$home/.fm-task-owner/inside" \
-    "secondmate-directory-marker: the retirement disturbed the directory's contents"
-  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
-    "secondmate-directory-marker: the refusal never said ownership was unproved"
-  assert_grep "$home/.fm-task-owner is a live directory, not a regular ownership marker" \
-    "$case_dir/stderr" \
-    "secondmate-directory-marker: the drill never reported the entry's observed type"
-  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
-    "secondmate-directory-marker: the drill called a live marker entry an unmarked claim"
-  pass "a secondmate retirement refuses a directory at the marker path and names its type"
+    "secondmate-directory-marker: the refusal disturbed the directory's contents"
+  assert_grep "not a regular ownership marker" "$case_dir/stderr" \
+    "secondmate-directory-marker: the refusal dropped the binding's own reason"
+  pass "a secondmate retirement refuses a directory at the marker path"
 }
 
-# A regular but malformed marker stays in the live-marker branch, so the drill
-# still names it - but the operator cannot read a task and generation out of it,
-# and the step must say so rather than pose a comparison they cannot make.
+# A regular but incomplete marker names no generation to bind, so it is just as
+# unprovable as a foreign one and must not be stashed or removed.
 test_secondmate_retirement_refuses_a_malformed_owner_marker() {
-  local case_dir home rc real_rm
-  local -a marker_backups
+  local case_dir home rc
   case_dir=$(make_case secondmate-malformed-marker)
   write_meta "$case_dir" local-only secondmate
   seed_secondmate_home "$case_dir"
   home="$case_dir/secondmate-home"
   printf '%s\n' 'schema=fm-task-owner.v1' 'task_id=task-x1' > "$case_dir/malformed.expected"
   cp -- "$case_dir/malformed.expected" "$home/.fm-task-owner"
-
-  real_rm=$(command -v rm)
-  cat > "$case_dir/fakebin/rm" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    */secondmate-home)
-      printf 'home removal attempted\n' >> "$case_dir/provider.log"
-      exit 1
-      ;;
-  esac
-done
-exec "$real_rm" "\$@"
-EOF
-  chmod +x "$case_dir/fakebin/rm"
+  refuse_and_log_secondmate_home_removal "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "secondmate-malformed-marker: an incomplete marker must refuse"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-malformed-marker: the provider ran over an unreadable marker"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-malformed-marker
   cmp -s "$home/.fm-task-owner" "$case_dir/malformed.expected" \
-    || fail "secondmate-malformed-marker: the retirement rewrote the marker it could not read"
-  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
-  [ ! -e "${marker_backups[0]}" ] \
-    || fail "secondmate-malformed-marker: an unreadable marker was stashed as a recovery half"
+    || fail "secondmate-malformed-marker: the refusal rewrote the marker it could not read"
   assert_grep "unreadable or incomplete" "$case_dir/stderr" \
     "secondmate-malformed-marker: the refusal dropped the binding's own reason"
-  assert_grep "unless it is a readable .fm-task-owner naming exactly the parked record's task and generation, stop" \
-    "$case_dir/stderr" \
-    "secondmate-malformed-marker: the drill posed a comparison the marker cannot answer"
-  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr" \
-    "secondmate-malformed-marker: the drill called a live marker an unmarked claim"
-  pass "a secondmate retirement refuses an unreadable marker and does not ask the operator to read it"
+  pass "a secondmate retirement refuses an unreadable marker without touching it"
 }
 
 # A record too incomplete to name the generation its marker would bind cannot
@@ -1936,8 +1872,7 @@ EOF
 # is unproved and carry the binding's reason, so the operator repairs their own
 # record instead of hunting a reissue that never happened.
 test_retirement_refuses_a_marker_its_own_record_cannot_bind() {
-  local case_dir home rc real_rm
-  local -a marker_backups
+  local case_dir home rc
   case_dir=$(make_case secondmate-unprovable-marker)
   write_meta "$case_dir" local-only secondmate
   seed_secondmate_home "$case_dir"
@@ -1954,39 +1889,68 @@ test_retirement_refuses_a_marker_its_own_record_cannot_bind() {
     printf '%s\n' 'spawn_gen=test-generation-task-x1'
   } > "$case_dir/own-marker.expected"
   cp -- "$case_dir/own-marker.expected" "$home/.fm-task-owner"
-  real_rm=$(command -v rm)
-  cat > "$case_dir/fakebin/rm" <<EOF
-#!/usr/bin/env bash
-for arg; do
-  case "\$arg" in
-    */secondmate-home)
-      printf 'home removal attempted\n' >> "$case_dir/provider.log"
-      exit 1
-      ;;
-  esac
-done
-exec "$real_rm" "\$@"
-EOF
-  chmod +x "$case_dir/fakebin/rm"
+  refuse_and_log_secondmate_home_removal "$case_dir"
 
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "secondmate-unprovable-marker: a record that cannot bind its own marker must refuse"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/provider.log" \
-    "secondmate-unprovable-marker: the provider ran on a path whose ownership was never proved"
+  assert_marker_preflight_refused_intact "$case_dir" "$home" secondmate-unprovable-marker
   cmp -s "$home/.fm-task-owner" "$case_dir/own-marker.expected" \
-    || fail "secondmate-unprovable-marker: the retirement rewrote the marker it could not bind"
-  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
-  [ ! -e "${marker_backups[0]}" ] \
-    || fail "secondmate-unprovable-marker: an unbound marker was stashed as a recovery half"
-  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
-    "secondmate-unprovable-marker: the refusal never said ownership was unproved"
+    || fail "secondmate-unprovable-marker: the refusal rewrote the marker it could not bind"
   assert_grep "task metadata has no exact spawn generation" "$case_dir/stderr" \
     "secondmate-unprovable-marker: the refusal dropped the binding's own reason"
   assert_no_grep "belongs to another task" "$case_dir/stderr" \
     "secondmate-unprovable-marker: the refusal asserted another task owns a path nothing attributes to one"
   pass "a retirement refuses, without blaming another task, when its own record cannot bind its marker"
+}
+
+# The drill's live-entry branch is still reachable, just not from the preflight:
+# a retirement that parked while the slot carried no marker can find a stray
+# entry there by the time an operator reads the drill. It must then name the
+# entry's observed type rather than call the claim legacy or unmarked.
+test_parked_retirement_drill_names_a_stray_entry_at_the_marker_path() {
+  local case_dir home rc
+  local -a claim_backups
+  case_dir=$(make_case parked-stray-marker-entry)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  refuse_and_log_secondmate_home_removal "$case_dir"
+
+  # Park a real retirement: nothing is at the marker path, so the preflight
+  # admits the slot, the claim is stripped, and the provider then fails.
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "parked-stray-marker-entry: the failed removal must park the retirement"$'
+'"$(cat "$case_dir/stderr")"
+  assert_present "$case_dir/provider.log" \
+    "parked-stray-marker-entry: the fixture never reached the provider, so nothing parked"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$home" "${claim_backups[0]}" \
+    "parked-stray-marker-entry: the parked retirement lost its claim copy"
+  assert_grep "legacy or unmarked claim" "$case_dir/stderr" \
+    "parked-stray-marker-entry: an unmarked slot should read as unmarked while it is empty"
+
+  # A stray entry appears at the marker path afterwards.
+  ln -s "$case_dir/elsewhere" "$home/.fm-task-owner"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout2" 2> "$case_dir/stderr2" || rc=$?
+
+  expect_code 1 "$rc" "parked-stray-marker-entry: the parked record must still refuse"
+  assert_grep "$home/.fm-task-owner is a live symlink, not a regular ownership marker" \
+    "$case_dir/stderr2" \
+    "parked-stray-marker-entry: the drill never reported the stray entry's observed type"
+  assert_grep "do not read, follow, move, or remove it - and stop" "$case_dir/stderr2" \
+    "parked-stray-marker-entry: the drill did not tell the operator to stop"
+  assert_no_grep "legacy or unmarked claim" "$case_dir/stderr2" \
+    "parked-stray-marker-entry: the drill called a live entry an unmarked claim"
+  assert_no_grep "skip marker restoration" "$case_dir/stderr2" \
+    "parked-stray-marker-entry: the drill told the operator no entry was there"
+  [ -L "$home/.fm-task-owner" ] \
+    || fail "parked-stray-marker-entry: the refusal touched the stray entry"
+  pass "a parked retirement's drill names a stray entry that appears at the marker path"
 }
 
 # The same home with no .fm-task-owner at all is the ordinary secondmate slot,
@@ -4578,6 +4542,7 @@ test_secondmate_retirement_refuses_a_non_regular_owner_marker
 test_secondmate_retirement_refuses_a_directory_owner_marker
 test_secondmate_retirement_refuses_a_malformed_owner_marker
 test_retirement_refuses_a_marker_its_own_record_cannot_bind
+test_parked_retirement_drill_names_a_stray_entry_at_the_marker_path
 test_secondmate_retirement_releases_a_home_with_no_owner_marker
 test_late_teardown_failure_leaves_a_rerunnable_record
 test_unrecorded_release_leaves_evidence_a_rerun_can_finish
