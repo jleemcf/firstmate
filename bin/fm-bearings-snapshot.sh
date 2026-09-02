@@ -451,7 +451,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
                     then "Final working state reached (\(detail_attribution($detail_source))\($detail | trunc(60)))"
                     else "Final working state reached" end)
                    + (if $include_prs == 1 and $open_pr != null then
-                        "; PR open, checks \($open_pr.checks); not merged"
+                        "; PR open, checks \($open_pr.checks), mergeable \($open_pr.mergeable); not merged"
                       else "; merge state not verified" end))
                 else ($detail | trunc(90)) end)
       } ]

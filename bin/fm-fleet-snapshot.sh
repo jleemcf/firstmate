@@ -666,9 +666,14 @@ task_json_lines() {
 # Meta inventory remains the sole source of live workers; this object only
 # discloses backlog↔task inconsistency for renderers (Bearings omitted/gates).
 main_inventory_json() {  # <backlog-json> <tasks-json>
-  printf '%s\n%s\n' "$1" "$2" | jq -s '
-    .[0] as $backlog
-    | .[1] as $tasks
+  jq -n \
+    --slurpfile backlog_payload <(printf '%s' "$1") \
+    --slurpfile tasks_payload <(printf '%s' "$2") '
+    def one($name; $payload):
+      if ($payload | length) == 1 then $payload[0]
+      else error("\($name) payload must contain exactly one JSON value") end;
+    one("backlog"; $backlog_payload) as $backlog
+    | one("tasks"; $tasks_payload) as $tasks
     | ([ $backlog.records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
     | ([ $backlog.records[]?
@@ -694,16 +699,21 @@ main_inventory_json() {  # <backlog-json> <tasks-json>
 # This mode never reads parent events or terminal text and never aggregates
 # nested secondmates.
 secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
-  printf '%s\n%s\n' "$1" "$2" | jq -s \
+  jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --argjson generated_epoch "$SNAPSHOT_EPOCH" \
     --arg home "$FM_HOME" \
     --argjson child_n "$FM_SNAPSHOT_SECONDMATE_CHILDREN" \
     --argjson queued_n "$FM_SNAPSHOT_SECONDMATE_QUEUED" \
     --argjson decisions_n "$FM_SNAPSHOT_SECONDMATE_DECISIONS" \
-    --argjson landed_n "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" '
-    .[0] as $backlog
-    | .[1] as $tasks
+    --argjson landed_n "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" \
+    --slurpfile backlog_payload <(printf '%s' "$1") \
+    --slurpfile tasks_payload <(printf '%s' "$2") '
+    def one($name; $payload):
+      if ($payload | length) == 1 then $payload[0]
+      else error("\($name) payload must contain exactly one JSON value") end;
+    one("backlog"; $backlog_payload) as $backlog
+    | one("tasks"; $tasks_payload) as $tasks
     | def trunc($n):
       tostring | gsub("\\s+"; " ")
       | if length > $n then .[:$n] + "…" else . end;
@@ -1333,10 +1343,16 @@ terminal_evidence_json() {  # <parent-task-json> <event-note> <evidence-contradi
 }
 
 parent_evidence_reconciliation_json() {  # <summary-json> <activities-json> <decisions-json>
-  printf '%s\n%s\n%s\n' "$1" "$2" "$3" | jq -s '
-    .[0] as $summary
-    | .[1] as $activities
-    | .[2] as $decisions
+  jq -n \
+    --slurpfile summary_payload <(printf '%s' "$1") \
+    --slurpfile activities_payload <(printf '%s' "$2") \
+    --slurpfile decisions_payload <(printf '%s' "$3") '
+    def one($name; $payload):
+      if ($payload | length) == 1 then $payload[0]
+      else error("\($name) payload must contain exactly one JSON value") end;
+    one("summary"; $summary_payload) as $summary
+    | one("activities"; $activities_payload) as $activities
+    | one("decisions"; $decisions_payload) as $decisions
     | def keyed: . != null and . != "" and . != "default";
     def result($e; $matches; $complete; $surface):
       $e + {
@@ -1402,9 +1418,14 @@ secondmate_current_json() {  # <parent-tasks-json>
   local summary_source summary_age summary_observed summary_freshness cache_path collection_status collection_slot
   local records='[]' seen_homes=''
   registry=$(registry_secondmates_json) || return 1
-  union=$(printf '%s\n%s\n' "$registry" "$tasks" | jq -s '
-    .[0] as $registry
-    | .[1] as $tasks
+  union=$(jq -n \
+    --slurpfile registry_payload <(printf '%s' "$registry") \
+    --slurpfile tasks_payload <(printf '%s' "$tasks") '
+    def one($name; $payload):
+      if ($payload | length) == 1 then $payload[0]
+      else error("\($name) payload must contain exactly one JSON value") end;
+    one("registry"; $registry_payload) as $registry
+    | one("tasks"; $tasks_payload) as $tasks
     | ($registry.records // []) as $registered
     | (($registered | map(.id)) // []) as $registered_ids
     | ([ $registered[] as $r
@@ -1638,17 +1659,29 @@ secondmate_current_json() {  # <parent-tasks-json>
          parent_event:{raw:$event_raw,note:$event_note,age_seconds:$event_age,open_activities:$activities,open_decisions:$decisions,activity_scan:$activity_scan},
          terminal_evidence:$terminal,contradiction:false}')
     fi
-    records=$(printf '%s\n%s\n' "$records" "$record" | jq -s '.[0] + [.[1]]')
+    records=$(jq -n \
+      --slurpfile records_payload <(printf '%s' "$records") \
+      --slurpfile record_payload <(printf '%s' "$record") '
+      def one($name; $payload):
+        if ($payload | length) == 1 then $payload[0]
+        else error("\($name) payload must contain exactly one JSON value") end;
+      one("records"; $records_payload) + [one("record"; $record_payload)]') || return 1
   done <<EOF
 $rows
 EOF
   snapshot_collection_cleanup
-  printf '%s\n%s\n' "$(printf '%s' "$union" | jq '.registry')" "$records" | jq -s \
+  jq -n \
+    --slurpfile registry_payload <(printf '%s' "$union" | jq '.registry') \
+    --slurpfile records_payload <(printf '%s' "$records") \
     --argjson total_registered "$total_registered" \
     --argjson total "$total" \
     --argjson shown "$shown" \
-    --argjson truncated "$truncated" \
-    '{registry:.[0],records:.[1],total_registered:$total_registered,total:$total,shown:$shown,truncated:$truncated}'
+    --argjson truncated "$truncated" '
+    def one($name; $payload):
+      if ($payload | length) == 1 then $payload[0]
+      else error("\($name) payload must contain exactly one JSON value") end;
+    {registry:one("registry"; $registry_payload),records:one("records"; $records_payload),
+     total_registered:$total_registered,total:$total,shown:$shown,truncated:$truncated}'
 }
 
 secondmate_landed_from_current_json() {  # <secondmate-current-json>
@@ -1702,10 +1735,7 @@ SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON") \
 SECONDMATE_LANDED_JSON=$(secondmate_landed_from_current_json "$SECONDMATE_CURRENT_JSON") \
   || { echo "fm-fleet-snapshot: secondmate landed projection failed" >&2; exit 1; }
 
-printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
-  "$BACKLOG_JSON" "$TASKS_JSON" "$MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON" \
-  "$SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON" \
-| jq -s \
+jq -n \
   --arg generated "$SNAPSHOT_NOW" \
   --arg fm_home "$FM_HOME" \
   --arg fm_root "$FM_ROOT" \
@@ -1713,12 +1743,21 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  '.[0] as $backlog
-   | .[1] as $tasks
-   | .[2] as $main_inventory
-   | .[3] as $scout_reports
-   | .[4] as $secondmate_current
-   | .[5] as $secondmate_landed
+  --slurpfile backlog_payload <(printf '%s' "$BACKLOG_JSON") \
+  --slurpfile tasks_payload <(printf '%s' "$TASKS_JSON") \
+  --slurpfile main_inventory_payload <(printf '%s' "$MAIN_INVENTORY_JSON") \
+  --slurpfile scout_reports_payload <(printf '%s' "$SCOUT_REPORTS_JSON") \
+  --slurpfile secondmate_current_payload <(printf '%s' "$SECONDMATE_CURRENT_JSON") \
+  --slurpfile secondmate_landed_payload <(printf '%s' "$SECONDMATE_LANDED_JSON") \
+  'def one($name; $payload):
+     if ($payload | length) == 1 then $payload[0]
+     else error("\($name) payload must contain exactly one JSON value") end;
+   one("backlog"; $backlog_payload) as $backlog
+   | one("tasks"; $tasks_payload) as $tasks
+   | one("main_inventory"; $main_inventory_payload) as $main_inventory
+   | one("scout_reports"; $scout_reports_payload) as $scout_reports
+   | one("secondmate_current"; $secondmate_current_payload) as $secondmate_current
+   | one("secondmate_landed"; $secondmate_landed_payload) as $secondmate_landed
    | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");

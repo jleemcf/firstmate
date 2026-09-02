@@ -1078,7 +1078,7 @@ test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence() {
   printf '%s' "$live" | jq -e '
     (.in_flight | any(.[]; .id == "terminal-ship"
       and .state == "awaiting_landing"
-      and (.doing | endswith("; PR open, checks passing; not merged"))))
+      and (.doing | endswith("; PR open, checks passing, mergeable MERGEABLE; not merged"))))
       and (.candidate_prs | any(.[]; .url == "https://github.com/kunchenguid/firstmate/pull/9"
         and .merge_ready == true))
   ' >/dev/null || fail "live PR evidence did not report the recorded open PR honestly: $live"
@@ -1095,7 +1095,9 @@ test_live_pr_merge_state_requires_durable_provenance_and_mergeability() {
     (.candidate_prs | any(.[]; .url == "https://github.com/kunchenguid/firstmate/pull/9"
       and .review == "APPROVED" and .checks == "passing"
       and .mergeable == "CONFLICTING" and .merge_ready == false))
-      and (.in_flight | any(.[]; .id == "terminal-ship" and .state == "awaiting_landing"))
+      and (.in_flight | any(.[]; .id == "terminal-ship"
+        and .state == "awaiting_landing"
+        and (.doing | endswith("; PR open, checks passing, mergeable CONFLICTING; not merged"))))
   ' >/dev/null || fail "a conflicting PR was reported merge-ready: $json"
 
   home=$(make_home status-only-pr)
@@ -1159,7 +1161,7 @@ EOF
     (.landed | any(.[]; .id == "pr-open-ship") | not)
       and (.in_flight | any(.[]; .id == "pr-open-ship"
         and .state == "awaiting_landing"
-        and (.doing | endswith("; PR open, checks passing; not merged"))))
+        and (.doing | endswith("; PR open, checks passing, mergeable MERGEABLE; not merged"))))
       and (.omitted | any(.[]; .surface
         == "main Done backlog row(s) contradicted by a verified open PR: 1 (pr-open-ship)"))
   ' >/dev/null || fail "verified open PR evidence did not outrank the contradictory Done row: $json"
@@ -1232,6 +1234,41 @@ test_bulk_payloads_bypass_exec_argument_limit() {
     || fail "bearings snapshot did not preserve its JSON contract for bulk payloads"
   [ ! -s "$home/net.log" ] || fail "bulk local snapshot made a network call: $(cat "$home/net.log")"
   pass "bulk backlog, task, and registry payloads bypass the exec argument limit"
+}
+
+test_empty_snapshot_producer_fails_loudly_without_payload_shift() {
+  local home fakebin real_jq out rc=0
+  home=$(make_home empty-payload-failure)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+  : > "$home/data/secondmates.md"
+  fakebin=$(make_fakebin "$home")
+  real_jq=$(command -v jq)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 2 ] && [ "$1" = -s ] && [ "$2" = 'sort_by(.id)' ]; then
+  n=$(cat "$EMPTY_JQ_COUNT" 2>/dev/null || printf '0\n')
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$EMPTY_JQ_COUNT"
+  [ "$n" -eq 2 ] && exit 0
+fi
+exec "$REAL_JQ" "$@"
+SH
+  chmod +x "$fakebin/jq"
+  : > "$home/net.log"
+  out=$(REAL_JQ="$real_jq" EMPTY_JQ_COUNT="$home/jq-count" \
+    PATH="$fakebin:$PATH" FM_HOME="$home" NET_LOG="$home/net.log" \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "empty scout-report producer emitted a successful snapshot: $out"
+  assert_contains "$out" "scout_reports payload must contain exactly one JSON value" \
+    "empty producer must fail at its independent binding"
+  case "$out" in *'"schema": "fm-fleet-snapshot.v1"'*) fail "failed producer still emitted a snapshot: $out" ;; esac
+  pass "an empty snapshot producer fails loudly instead of shifting later payloads"
 }
 
 test_default_is_bounded_and_local_only() {
@@ -2527,6 +2564,7 @@ test_terminal_ship_keeps_merge_state_unverified_without_landing_evidence
 test_live_pr_merge_state_requires_durable_provenance_and_mergeability
 test_verified_open_pr_outranks_a_contradictory_done_row
 test_bulk_payloads_bypass_exec_argument_limit
+test_empty_snapshot_producer_fails_loudly_without_payload_shift
 test_default_is_bounded_and_local_only
 test_toon_json_parity
 test_landed_includes_secondmate_home_merges
