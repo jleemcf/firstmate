@@ -96,7 +96,7 @@ Cross-home reads validate the seeded identity and operational-directory boundari
 When only an owned child's current classification is unavailable, the home classification stays unknown while independently trustworthy structured decisions, holds, queued and landed records, endpoint identities, counts, and provenance remain available; every other invalid path stays strict and exposes none of those child-derived surfaces.
 A bounded direct-report terminal tail can help diagnose a mismatch by showing that historical parent wording is still visible, but it is untrusted supplemental evidence because scrollback, prompts, copied output, idle shells, and agent prose are not durable state.
 The snapshot strips control sequences, retains only capture metadata and literal event-corroboration flags, and never lets terminal evidence override a valid structured classification.
-Bearings treats only structured Done rows as landing evidence on its default path, so a terminal ship without that evidence remains Underway with its merge state explicitly unverified.
+On its default path, Bearings derives `landed` only from eligible structured Done rows while excluding completed rows still marked captain-held, so a terminal ship without a projected `landed` row remains Underway with its merge state explicitly unverified.
 Live GitHub enrichment exists only behind the bearings `--include-prs` opt-in and may override weaker evidence only through the task's own durable PR record.
 Optional Relay integrates with the watcher only after explicit opt-in; [configuration.md](configuration.md#relay-env) owns its generated-artifact and dispatch mechanics.
 

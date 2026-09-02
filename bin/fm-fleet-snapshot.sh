@@ -79,6 +79,10 @@
 #
 # Compatibility: JSON is the primary machine-readable surface.
 # Human views must render this output instead of parsing state files again.
+# Large scalar and JSON payloads cross jq boundaries through input streams
+# instead of argv so fleet size cannot hit Linux's per-argument limit. Each JSON
+# payload is independently exact-one validated, and any producer failure stops
+# the snapshot instead of shifting or omitting fields.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1577,8 +1581,8 @@ secondmate_current_json() {  # <parent-tasks-json>
       fi
     fi
     # Failed command substitutions clear their assignment target. Keep the
-    # unsampled record's --argjson input valid without retaining any rejected
-    # or oversized summary fragment.
+    # unsampled record's JSON payload valid without retaining any rejected or
+    # oversized summary fragment.
     if [ -n "$reason" ]; then summary='{}'; fi
     if [ -z "$reason" ]; then
       summary_sampled=true

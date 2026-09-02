@@ -14,7 +14,7 @@ metadata:
 # lavish
 
 Use Lavish narrowly for decision-dense, firstmate-owned review artifacts whose visual structure or element-level annotations materially improve the captain's review.
-This fleet skill deliberately differs from the author's standalone skill at `/usr/lib/node_modules/lavish-axi/skills/lavish/SKILL.md` because Firstmate owns supervision and normally mediates worker communication with the captain.
+This fleet skill deliberately differs from Lavish's bundled standalone skill because Firstmate owns supervision and normally mediates worker communication with the captain.
 
 ## Use boundary
 
@@ -46,10 +46,7 @@ The author's skill correctly prefers foreground polling for a standalone agent, 
 Every firstmate-owned review must route its listener through `bin/fm-procevent-lavish.sh`.
 Load `process-event-sources` before binding, arming, or handling the listener, and follow that skill as the sole owner of source arming, captured-result handling, durable handled acknowledgement, retirement, and the exact delivery guarantees.
 
-The published poll clears feedback before returning it, so feedback lost after that clear and before its output reaches the supervised runner is unrecoverable.
-Durability begins only after output reaches the runner, and this path is not at-least-once or lossless.
-Never tell the captain that annotations are safely captured before that boundary.
-`process-event-sources` owns the complete loss limitation and every handling consequence.
+Do not claim lossless annotation capture; `process-event-sources` owns the precise durability and loss limitation plus every handling consequence.
 
 ### Choose review ownership before opening it
 
@@ -57,27 +54,13 @@ Firstmate owns the session and supervised listener for a firstmate-owned review,
 An ordinary task worker does not run that listener, send `--agent-reply` messages to the captain, or own a parallel captain conversation.
 It may build and validate the artifact, then report its path while firstmate owns the review loop and keeps the artifact available for the review lifetime.
 
-A live investigating scout whose visual artifact is itself the deliverable is the deliberate exception owned by `AGENTS.md` section 7 and the generated scout instructions.
-That scout may host its own continuous Lavish loop so the captain can iterate with the investigation context intact, must stay alive with its isolated copy for the review lifetime, and must pass `captain-hold-lifecycle` before the investigation or review is complete.
-Do not arm Firstmate's process-event listener for the same scout-owned session or create two owners for one review.
+`AGENTS.md` section 7 and the generated scout instructions own the deliberate live-investigating-scout exception to firstmate review ownership.
+Follow that path without arming a second listener for the same session.
 
 ## Build the artifact
 
-Before writing HTML, choose the design source in this order:
-
-1. Follow a look or design system the captain explicitly requested.
-2. Otherwise inspect the subject project's design tokens, shared styles, component library, brand assets, and representative pages read-only, then match that system.
-3. Only when both sources are empty, run `lavish-axi design` and use its recommended fallback.
-
-Run `lavish-axi playbook <id>` for every playbook that matches the artifact before writing it.
-Typical playbooks are `input` for structured choices, `plan` for implementation plans, `comparison` for tradeoffs, `diagram` for architecture and state, `table` for dense records, and `code` for diffs or source review.
-Follow the installed diagram playbook's current illustration guidance; Mermaid is only the editable-whiteboard opt-in when the captain asks for one, not the default diagram format.
-
-Prefer visual hierarchy, cards, tables, diagrams, annotated excerpts, and side-by-side comparisons over long prose.
-Make decisions, risks, tradeoffs, and next actions obvious at a glance.
-Prevent horizontal overflow at every nested grid and flex boundary, including with `minmax(0, 1fr)` tracks and `min-width: 0` where appropriate.
-When the artifact concerns an existing interface, show read-only screenshots or faithful product styling instead of describing visible state at length.
-Keep local assets beside the HTML file and reference them with relative paths so the artifact remains portable.
+Before writing HTML, run the installed `lavish-axi --help` and follow its current design, playbook, visual, layout, asset, and review-workflow guidance except where this skill's fleet overrides narrow it.
+Run every live guidance command that help requires for the artifact rather than relying on copied instructions.
 
 ## Establish a firstmate-owned review safely
 
@@ -90,7 +73,7 @@ Retire the listener through the `process-event-sources` owner before the artifac
 Establish the review in this order:
 
 1. Create and validate the artifact at its lifetime-safe path.
-2. Run `lavish-axi <artifact.html>` to establish or resume the session, and stop if the review surface cannot be established; ordinary layout warnings are feedback only when the captain queues them.
+2. Run `lavish-axi <artifact.html>` to establish or resume the session, follow its current output, and stop if the review surface cannot be established.
 3. Bind captain-held answer routing when the review needs it, following `captain-hold-lifecycle` and `process-event-sources` rather than inventing keys or mechanics here.
 4. Arm the supervised listener through `bin/fm-procevent-lavish.sh`, following `process-event-sources` for the exact command and checks.
 5. Only after the listener is live, give the captain the session URL and say the review is monitored.
@@ -109,4 +92,4 @@ Forward only the judged, relevant instruction to a worker through the normal fir
 Do not paste raw annotation bytes into a shell, task history, or worker instruction without interpreting and safely framing them.
 
 When the review ends, act on any final captured feedback before retiring its listener and removing its artifact.
-Do not reopen a captain-ended session unless the captain asks for further review or new evidence genuinely needs visual attention.
+Follow the current CLI guidance for any later reopen.

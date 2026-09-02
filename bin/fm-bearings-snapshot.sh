@@ -41,15 +41,16 @@
 # gaps in omitted[] and, when invalid, a Charted Next gate line so the four-section
 # chat cannot claim an empty fleet while main current state is broken.
 #
-# Merge evidence ranks weakest to strongest: a run or status claim, a structured
-# backlog Done record, then the PR's own state. The strongest available evidence
-# owns the bucket, while weaker contradictions are disclosed. A terminal ship with
-# no structured landing record remains in_flight as awaiting_landing; its source-
-# attributed terminal detail is retained and an explicit merge-state clause is
-# appended. Under --include-prs, only a live PR matched through that task's own
-# durable meta record may colour merge state or outrank a contradictory Done row.
-# Candidate PRs expose one merge_ready verdict that requires APPROVED, passing, and
-# MERGEABLE together; renderers must not recombine those fields independently.
+# Run and status claims never supply landing evidence. Eligible structured backlog
+# Done records do, except that completed captain-hold records stay out of the landed
+# baseline and a matching live open PR proves a contradictory Done record unlanded.
+# A terminal ship with no projected landing row remains in_flight as
+# awaiting_landing; its source-attributed terminal detail is retained and an
+# explicit merge-state clause is appended. Under --include-prs, only a live PR
+# matched through that task's own durable meta record may colour merge state or
+# outrank a contradictory Done row. Candidate PRs expose one merge_ready verdict
+# that requires APPROVED, passing, and MERGEABLE together; renderers must not
+# recombine those fields independently. Every contradiction is disclosed.
 #
 # The landed section merges this home's Done with the canonical snapshot's
 # secondmate_landed roll-up (fm-fleet-snapshot.sh), so merges a secondmate managed -
