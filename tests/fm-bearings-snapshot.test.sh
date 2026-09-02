@@ -70,6 +70,13 @@ if [ "${FAKE_GH_MANY:-0}" = 1 ]; then
 JSON
   exit 0
 fi
+if [ "${FAKE_GH_REPO_AWARE:-0}" = 1 ]; then
+  case "$*" in
+    *'--repo acme/queried'*) printf '%s\n' '[]' ;;
+    *) exit 91 ;;
+  esac
+  exit 0
+fi
 cat <<JSON
 [{"number":9,"title":"Ship the thing","url":"https://github.com/kunchenguid/firstmate/pull/9","headRefName":"fm/ship-task","reviewDecision":"${FAKE_GH_REVIEW:-APPROVED}","mergeable":"${FAKE_GH_MERGEABLE:-MERGEABLE}","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}]}]
 JSON
@@ -1733,6 +1740,53 @@ test_per_repository_pr_cap_is_disclosed() {
   pass "per-repository open-PR caps are disclosed with an expansion knob"
 }
 
+test_pr_discovery_caps_cannot_turn_unknown_done_rows_into_landings() {
+  local home fakebin json
+  home=$(make_home pr-cap-done-safety)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+- [x] row-capped - Open PR beyond its repository result cap (repo: sample) (kind: ship) (merged 2026-07-10)
+- [x] repo-complete - Landed task in a fully queried repository (repo: sample) (kind: ship) (merged 2026-07-09)
+- [x] repo-omitted - PR state hidden by the repository cap (repo: sample) (kind: ship) (merged 2026-07-08)
+EOF
+  : > "$home/data/secondmates.md"
+  fm_write_meta "$home/state/row-capped.meta" \
+    "project=sample" "harness=claude" "kind=ship" "mode=manual" \
+    "pr=https://github.com/acme/repo/pull/3"
+  fm_write_meta "$home/state/repo-complete.meta" \
+    "project=sample" "harness=claude" "kind=ship" "mode=manual" \
+    "pr=https://github.com/acme/queried/pull/10"
+  fm_write_meta "$home/state/repo-omitted.meta" \
+    "project=sample" "harness=claude" "kind=ship" "mode=manual" \
+    "pr=https://github.com/zeta/omitted/pull/20"
+  fakebin=$(make_fakebin "$home")
+  : > "$home/net.log"
+
+  json=$(FM_BEARINGS_PR_LIMIT=2 FAKE_GH_MANY=1 \
+    run "$home" "$fakebin" --include-prs --json)
+  printf '%s' "$json" | jq -e '
+    (.landed | any(.id == "row-capped") | not)
+      and (.in_flight | any(.id == "row-capped" and .state == "awaiting_landing"
+        and (.doing | contains("live PR state unavailable"))))
+      and (.omitted | any(.surface == "main Done backlog row(s) with unresolved live PR state: 3 (repo-complete, repo-omitted, row-capped)"))
+  ' >/dev/null || fail "a per-repository cap converted unknown Done rows into landings: $json"
+
+  json=$(FM_BEARINGS_PR_REPOS=1 FAKE_GH_REPO_AWARE=1 \
+    run "$home" "$fakebin" --include-prs --json)
+  printf '%s' "$json" | jq -e '
+    (.landed | any(.id == "repo-complete"))
+      and (.landed | any(.id == "repo-omitted") | not)
+      and (.in_flight | any(.id == "repo-omitted" and .state == "awaiting_landing"
+        and (.doing | contains("live PR state unavailable"))))
+      and (.omitted | any(.surface == "main Done backlog row(s) with unresolved live PR state: 2 (repo-omitted, row-capped)"))
+  ' >/dev/null || fail "a repository cap converted an unknown Done row into a landing: $json"
+  pass "bounded PR discovery keeps affected Done rows explicitly unlanded until their PR state is known"
+}
+
 install_failing_jq() {  # <fakebin> <model|toon>
   local fakebin=$1 phase=$2 real
   real=$(command -v jq)
@@ -2822,4 +2876,5 @@ test_section_caps_and_expansion_flags
 test_collapsed_captain_call_deferral_and_landed
 test_pr_repository_cap_and_expansion
 test_per_repository_pr_cap_is_disclosed
+test_pr_discovery_caps_cannot_turn_unknown_done_rows_into_landings
 test_projection_and_toon_fail_closed
