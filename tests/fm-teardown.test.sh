@@ -1752,6 +1752,8 @@ assert_marker_preflight_refused_intact() {
     || fail "$tag: a read-only refusal stashed the marker entry as a recovery half"
   assert_grep "ownership of that path is conflicting or unproved" "$stderr" \
     "$tag: the refusal never said ownership was unproved"
+  assert_grep "keeps its recorded worktree claim and no copy of it was made" "$stderr" \
+    "$tag: the refusal never told the operator the claim survived intact"
   assert_no_grep "Manual recovery drill:" "$stderr" \
     "$tag: a refusal that began no retirement still printed the parked drill"
 }
@@ -1903,6 +1905,65 @@ test_retirement_refuses_a_marker_its_own_record_cannot_bind() {
   assert_no_grep "belongs to another task" "$case_dir/stderr" \
     "secondmate-unprovable-marker: the refusal asserted another task owns a path nothing attributes to one"
   pass "a retirement refuses, without blaming another task, when its own record cannot bind its marker"
+}
+
+# The preflight admits an empty slot, but the claim rewrite sits between that
+# check and the marker retirement, so another task's spawn can take the reissued
+# slot inside that window. The recheck must catch it - and must describe the
+# state it is actually in, because by then the claim is already stripped and the
+# retirement is parking, the opposite of a preflight refusal.
+test_marker_recheck_after_the_claim_strip_parks_and_says_so() {
+  local case_dir home rc real_chmod
+  local -a claim_backups marker_backups
+  case_dir=$(make_case marker-recheck-race)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  write_task_b_marker_fixture "$case_dir"
+  refuse_and_log_secondmate_home_removal "$case_dir"
+  # Stand in for the concurrent spawn: stamp task-b's marker into the slot while
+  # the claim rewrite is in flight, after the preflight has already admitted it.
+  real_chmod=$(command -v chmod)
+  cat > "$case_dir/fakebin/chmod" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    *.worktree-claim-next.*)
+      cp -- "$case_dir/task-b-marker.expected" "$home/.fm-task-owner"
+      ;;
+  esac
+done
+exec "$real_chmod" "\$@"
+EOF
+  "$real_chmod" +x "$case_dir/fakebin/chmod"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "marker-recheck-race: a slot taken mid-retirement must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "marker-recheck-race: the provider released a slot another task had just taken"
+  cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "marker-recheck-race: the recheck touched the new holder's marker"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "marker-recheck-race: the new holder's marker was stashed as a recovery half"
+  # The claim was already stripped, so unlike a preflight refusal this one parks.
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$home" "${claim_backups[0]}" \
+    "marker-recheck-race: the parked retirement lost its claim copy"
+  assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
+    "marker-recheck-race: the fixture never reached the post-strip recheck"
+  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
+    "marker-recheck-race: the refusal never named the conflicting entry"
+  assert_grep "appeared after the worktree claim in $case_dir/state/task-x1.meta was already cleared" \
+    "$case_dir/stderr" \
+    "marker-recheck-race: the refusal did not say the retirement had already begun"
+  assert_no_grep "keeps its recorded worktree claim" "$case_dir/stderr" \
+    "marker-recheck-race: the refusal claimed an intact record while the claim was stripped"
+  assert_grep "Manual recovery drill:" "$case_dir/stderr" \
+    "marker-recheck-race: a parked retirement omitted its recovery drill"
+  pass "a slot taken between the preflight and the marker retirement parks and reports it"
 }
 
 # The drill's live-entry branch is still reachable, just not from the preflight:
@@ -4542,6 +4603,7 @@ test_secondmate_retirement_refuses_a_non_regular_owner_marker
 test_secondmate_retirement_refuses_a_directory_owner_marker
 test_secondmate_retirement_refuses_a_malformed_owner_marker
 test_retirement_refuses_a_marker_its_own_record_cannot_bind
+test_marker_recheck_after_the_claim_strip_parks_and_says_so
 test_parked_retirement_drill_names_a_stray_entry_at_the_marker_path
 test_secondmate_retirement_releases_a_home_with_no_owner_marker
 test_late_teardown_failure_leaves_a_rerunnable_record
