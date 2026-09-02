@@ -1561,9 +1561,10 @@ secondmate_current_json() {  # <parent-tasks-json-file>
       fi
     fi
 
-    # $summary is untrusted producer output: a remote login shell can prepend a
-    # banner, print nothing, or repeat the document while ssh still exits 0.
-    # Only a summary this home accepted reaches $summary_file, so the file
+    # $summary carries another home's published ledger, foreign input this
+    # snapshot never produced: that file can be empty, hold rc-file noise ahead
+    # of the document, repeat it, or carry the wrong shape. Only a ledger the
+    # reads above accepted and canonicalized reaches $summary_file, so the file
     # readers below keep failing loudly on a genuine internal projection fault
     # while an unusable home degrades to its own unknown record instead of
     # aborting the whole fleet snapshot.
