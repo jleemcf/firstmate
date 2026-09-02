@@ -1303,6 +1303,10 @@ if ! retry_wait_secs_is_valid "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"; then
 fi
 # Compatibility alias used by the safety-check wait path and older call sites.
 STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS
+# Only the pre-return safety-check path reports this. A provider return that
+# ends on a live lock is an ordinary failure: it has already retired the claim,
+# so it must park like every other unconfirmed outcome rather than offer a code
+# some caller could read as permission for a different destructive fallback.
 TEARDOWN_TREEHOUSE_LOCK_REFUSED=2
 TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED=3
 TEARDOWN_PROCEVENT_RESTORE_FAILED=4
@@ -1445,7 +1449,7 @@ teardown_treehouse_return_raw() {  # <worktree> <project> <label> [post-cleanup-
     fi
 
     echo "teardown: $label return failed: git lock $lock_desc persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) and is not provably stale (may belong to a live process); leaving it in place" >&2
-    return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
+    return 1
   fi
 
   echo "teardown: $label return failed: git index.lock signature persisted across ${max_retries} retries (waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s each) even after the lock file disappeared" >&2

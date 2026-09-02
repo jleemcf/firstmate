@@ -1748,8 +1748,10 @@ EOF
     "secondmate-foreign-marker: the parked retirement lost its claim copy"
   assert_no_grep "worktree=" "$case_dir/state/task-x1.meta" \
     "secondmate-foreign-marker: the refusal automatically restored the claim"
-  assert_grep "does not bind to task task-x1" "$case_dir/stderr" \
-    "secondmate-foreign-marker: the refusal never named the foreign marker"
+  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the refusal never named the unprovable marker"
+  assert_grep "is marked as task task-b's workspace" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the refusal dropped the binding's own reason"
   assert_grep "live marker remains at $home/.fm-task-owner" "$case_dir/stderr" \
     "secondmate-foreign-marker: the drill misstated the preserved marker state"
   assert_no_grep "preserved owner-marker copy" "$case_dir/stderr" \
@@ -1768,6 +1770,119 @@ EOF
   assert_present "${claim_backups[0]}" \
     "secondmate-foreign-marker: the retry discarded the parked claim copy"
   pass "a secondmate retirement refuses a slot another task's marker still names"
+}
+
+# An entry at the marker path that is not a regular file cannot be attributed to
+# anyone, so it is the same conflicting-or-unproved ownership as a foreign
+# marker and must refuse on the same terms - not be waved through as "no marker
+# to retire". The entry keeps its type and target.
+test_secondmate_retirement_refuses_a_non_regular_owner_marker() {
+  local case_dir home rc real_rm link_target
+  local -a claim_backups marker_backups
+  case_dir=$(make_case secondmate-nonregular-marker)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  printf '%s\n' 'not an ownership marker' > "$case_dir/elsewhere"
+  ln -s "$case_dir/elsewhere" "$home/.fm-task-owner"
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-nonregular-marker: an unattributable marker entry must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-nonregular-marker: the provider was asked to release a slot with an unattributable marker"
+  [ -L "$home/.fm-task-owner" ] \
+    || fail "secondmate-nonregular-marker: the retirement changed the marker entry's type"
+  link_target=$(readlink "$home/.fm-task-owner")
+  [ "$link_target" = "$case_dir/elsewhere" ] \
+    || fail "secondmate-nonregular-marker: the retirement repointed the marker entry"
+  assert_grep 'not an ownership marker' "$case_dir/elsewhere" \
+    "secondmate-nonregular-marker: the retirement followed the link and rewrote its target"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "secondmate-nonregular-marker: an unattributable marker was stashed as a recovery half"
+  claim_backups=("$case_dir/state"/.task-x1.meta.worktree-claim-backup.*)
+  assert_grep "worktree=$home" "${claim_backups[0]}" \
+    "secondmate-nonregular-marker: the parked retirement lost its claim copy"
+  assert_grep "not a regular ownership marker" "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the refusal dropped the binding's own reason"
+  assert_grep "Manual recovery drill:" "$case_dir/stderr" \
+    "secondmate-nonregular-marker: the refusal omitted deliberate recovery"
+  pass "a secondmate retirement refuses a marker entry that is not a regular file"
+}
+
+# A record too incomplete to name the generation its marker would bind cannot
+# prove ownership either - but nothing here establishes that anyone ELSE owns
+# the path, and the marker names this very task. The refusal must say ownership
+# is unproved and carry the binding's reason, so the operator repairs their own
+# record instead of hunting a reissue that never happened.
+test_retirement_refuses_a_marker_its_own_record_cannot_bind() {
+  local case_dir home rc real_rm
+  local -a marker_backups
+  case_dir=$(make_case secondmate-unprovable-marker)
+  write_meta "$case_dir" local-only secondmate
+  seed_secondmate_home "$case_dir"
+  home="$case_dir/secondmate-home"
+  # A second spawn_gen= line makes the record ambiguous: fm_worktree_meta_probe
+  # reports it as unusable rather than absent, so no exact generation remains.
+  printf '%s\n' 'spawn_gen=test-generation-task-x1-duplicate' >> "$case_dir/state/task-x1.meta"
+  # The marker this record would bind if it named one exact generation. A
+  # secondmate home is not a git worktree, so it carries no exclude file to
+  # stamp against - only the marker bytes matter here.
+  {
+    printf '%s\n' 'schema=fm-task-owner.v1'
+    printf '%s\n' 'task_id=task-x1'
+    printf '%s\n' 'spawn_gen=test-generation-task-x1'
+  } > "$case_dir/own-marker.expected"
+  cp -- "$case_dir/own-marker.expected" "$home/.fm-task-owner"
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in
+    */secondmate-home)
+      printf 'home removal attempted\n' >> "$case_dir/provider.log"
+      exit 1
+      ;;
+  esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-unprovable-marker: a record that cannot bind its own marker must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/provider.log" \
+    "secondmate-unprovable-marker: the provider ran on a path whose ownership was never proved"
+  cmp -s "$home/.fm-task-owner" "$case_dir/own-marker.expected" \
+    || fail "secondmate-unprovable-marker: the retirement rewrote the marker it could not bind"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "secondmate-unprovable-marker: an unbound marker was stashed as a recovery half"
+  assert_grep "ownership of that path is conflicting or unproved" "$case_dir/stderr" \
+    "secondmate-unprovable-marker: the refusal never said ownership was unproved"
+  assert_grep "task metadata has no exact spawn generation" "$case_dir/stderr" \
+    "secondmate-unprovable-marker: the refusal dropped the binding's own reason"
+  assert_no_grep "belongs to another task" "$case_dir/stderr" \
+    "secondmate-unprovable-marker: the refusal asserted another task owns a path nothing attributes to one"
+  pass "a retirement refuses, without blaming another task, when its own record cannot bind its marker"
 }
 
 # The same home with no .fm-task-owner at all is the ordinary secondmate slot,
@@ -4355,6 +4470,8 @@ test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_marker_retirement_failure_parks_before_provider_action
 test_secondmate_retirement_refuses_a_foreign_owner_marker
+test_secondmate_retirement_refuses_a_non_regular_owner_marker
+test_retirement_refuses_a_marker_its_own_record_cannot_bind
 test_secondmate_retirement_releases_a_home_with_no_owner_marker
 test_late_teardown_failure_leaves_a_rerunnable_record
 test_unrecorded_release_leaves_evidence_a_rerun_can_finish
