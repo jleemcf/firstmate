@@ -44,7 +44,10 @@
 # removes the exact worktree= claim before a provider return or removal can
 # make the path reusable, while retaining a byte-for-byte recovery copy. It
 # retires the worktree's .fm-task-owner marker in the same step, since that
-# marker is the in-worktree half of the same claim.
+# marker is the in-worktree half of the same claim. Only a marker that binds to
+# this record is retired; one that names another task stays where it is, so a
+# slot proved by something other than that marker never has another owner's
+# marker stashed away.
 # This ordering makes a crash leave an unclaimed retained slot rather than a
 # returned slot with a stale destructive claim.
 #
@@ -1050,12 +1053,30 @@ fm_worktree_claim_retire_begin() {  # <meta-file> <expected-worktree>
 # retired in the same step and gone before the provider can recycle the slot.
 # No runtime path puts it or the worktree claim back after retirement starts;
 # the header above owns the deliberate manual-recovery contract.
+# Only a marker this record's own binding accounts for is ever retired. A
+# secondmate home is proved by its .fm-secondmate-home identity and never
+# carries a marker of its own, so any .fm-task-owner sitting in that slot is by
+# construction another task's and is left exactly where it is - retiring it
+# would stash another owner's marker and then offer it back through the manual
+# drill. On every path whose proof already ran the same binding this is a no-op.
 fm_worktree_marker_retire() {  # <state-dir> <meta-basename> <expected-worktree>
-  local dir=$1 base=$2 expected=$3 marker stash
+  local dir=$1 base=$2 expected=$3 marker stash meta id generation awareness
+  local marker_aware=0 bind_rc=0
   FM_WORKTREE_CLAIM_RETIRE_MARKER_BACKUP=
   [ -n "$expected" ] && [ -d "$expected" ] || return 0
   marker="$expected/$FM_WORKTREE_TASK_OWNER_MARKER"
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 0
+  meta="$dir/$base"
+  id=$(fm_worktree_record_identity "$meta")
+  generation=$(fm_worktree_meta_probe "$meta" spawn_gen) || generation=
+  awareness=$(fm_worktree_meta_probe "$meta" task_owner_marker) || awareness=
+  [ "$awareness" != 1 ] || marker_aware=1
+  fm_worktree_task_owner_marker_binding "$expected" "$id" "$generation" "$marker_aware" "$dir" \
+    2>/dev/null || bind_rc=$?
+  if [ "$bind_rc" -ne 0 ]; then
+    echo "warning: $marker does not bind to task $id, so it is left untouched and only the worktree claim is retired; it belongs to whoever holds $expected next." >&2
+    return 0
+  fi
   stash=$(umask 077; mktemp "$dir/.${base}.task-owner-backup.XXXXXX") || return 1
   if ! cp -p -- "$marker" "$stash" || ! rm -f -- "$marker"; then
     rm -f -- "$stash"

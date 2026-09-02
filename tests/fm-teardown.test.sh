@@ -1683,6 +1683,53 @@ EOF
   pass "marker-retirement preparation failure parks before provider action"
 }
 
+# A secondmate home is proved by its own .fm-secondmate-home identity and never
+# carries an owner marker of its own, so any .fm-task-owner sitting in that
+# pooled slot belongs to another task. Retiring the claim must leave it exactly
+# where it is, and the parked drill must describe the live marker instead of
+# offering a stashed copy of it back to the operator.
+test_secondmate_retirement_leaves_a_foreign_owner_marker_alone() {
+  local case_dir home rc real_rm
+  local -a marker_backups
+  case_dir=$(make_case secondmate-foreign-marker)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  sed -i.bak "s#^worktree=.*#worktree=$home#" "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  rm -f "$case_dir/wt/.fm-task-owner"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  write_task_b_marker_fixture "$case_dir"
+  cp -- "$case_dir/task-b-marker.expected" "$home/.fm-task-owner"
+  # Fail the home removal itself, so the retirement parks and its preserved
+  # state is observable; a successful removal would delete the whole home.
+  real_rm=$(command -v rm)
+  cat > "$case_dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case "\$arg" in */secondmate-home) exit 1 ;; esac
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$case_dir/fakebin/rm"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "secondmate-foreign-marker: the failed home removal must refuse"$'\n'"$(cat "$case_dir/stderr")"
+  cmp -s "$home/.fm-task-owner" "$case_dir/task-b-marker.expected" \
+    || fail "secondmate-foreign-marker: the retirement touched another task's owner marker"
+  marker_backups=("$case_dir/state"/.task-x1.meta.task-owner-backup.*)
+  [ ! -e "${marker_backups[0]}" ] \
+    || fail "secondmate-foreign-marker: another task's marker was stashed as this record's recovery half"
+  assert_grep "live marker remains at $home/.fm-task-owner" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the drill misstated the preserved marker state"
+  assert_no_grep "preserved owner-marker copy" "$case_dir/stderr" \
+    "secondmate-foreign-marker: the drill offered another task's marker back for restoration"
+  pass "a secondmate retirement leaves another task's owner marker untouched"
+}
+
 # The record must stay usable until the whole teardown has succeeded: a step
 # that fails after the pool return still leaves a task a plain rerun can finish.
 test_late_teardown_failure_leaves_a_rerunnable_record() {
@@ -4264,6 +4311,7 @@ test_retirement_receipt_survives_a_failed_record_removal
 test_owner_marker_carries_a_foreign_branch_checkout
 test_owner_marker_is_retired_before_the_pool_return
 test_marker_retirement_failure_parks_before_provider_action
+test_secondmate_retirement_leaves_a_foreign_owner_marker_alone
 test_late_teardown_failure_leaves_a_rerunnable_record
 test_unrecorded_release_leaves_evidence_a_rerun_can_finish
 test_receipt_outranks_a_leftover_claim_copy
