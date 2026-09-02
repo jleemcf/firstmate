@@ -377,7 +377,7 @@ exit 0
 fi
 
 # Ship task: shape Setup / Rule 1 by this task's explicit delivery mode, validated
-# above, and render the Definition of done from its single owner, bin/fm-dod-lib.sh,
+# above, and render the delivery contract from its single owner, bin/fm-dod-lib.sh,
 # which bin/fm-promote.sh renders too so a promoted scout receives the same contract.
 # The block opens with the fixed "Delivery contract: mode=<mode>" line that
 # bin/fm-spawn.sh checks against its own explicit --mode before launching.
@@ -397,20 +397,6 @@ case "$MODE" in
     ;;
 esac
 DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
-
-PUSH_SCAN_SECTION=
-if [ "$MODE" != local-only ]; then
-IFS= read -r -d '' PUSH_SCAN_SECTION <<EOF || true
-# Guarded push scan
-Before starting a delivery run or pushing, save the exact intended pull-request title and body in files.
-Set \`PUSH_SCAN_LIST\` to exactly \`company\` or \`sensitive\` as the task requires; if the task does not select a direction, stop and ask firstmate rather than defaulting.
-Set \`PR_TITLE_FILE\` and \`PR_BODY_FILE\` to the paths of those exact files.
-Run \`"$FM_ROOT/bin/fm-push-scan.sh" "\$PUSH_SCAN_LIST" --pr-title-file "\$PR_TITLE_FILE" --pr-body-file "\$PR_BODY_FILE"\` from the project branch and stop on any nonzero result.
-After the pull request is published, use gh-axi to save its live title and body into those files and run the same command again before reporting it ready.
-The script's \`--help\` owns the complete scan and failure contract; do not substitute a hand-written grep.
-EOF
-PUSH_SCAN_SECTION=${PUSH_SCAN_SECTION%$'\n'}
-fi
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -456,8 +442,6 @@ $RULE1
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
 $INBOX_SECTION
-
-$PUSH_SCAN_SECTION
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
