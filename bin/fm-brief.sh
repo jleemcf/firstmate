@@ -52,6 +52,9 @@
 # Every scaffold also carries the steering-inbox receive-and-ack section:
 # process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
 # handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
+# PR-delivery ship tasks include the guarded bin/fm-push-scan.sh invocation for
+# the explicitly task-selected company or sensitive direction, both before the
+# delivery attempt and against title/body text read back from the live PR.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
@@ -395,6 +398,20 @@ case "$MODE" in
 esac
 DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
 
+PUSH_SCAN_SECTION=
+if [ "$MODE" != local-only ]; then
+IFS= read -r -d '' PUSH_SCAN_SECTION <<EOF || true
+# Guarded push scan
+Before starting a delivery run or pushing, save the exact intended pull-request title and body in files.
+Set \`PUSH_SCAN_LIST\` to exactly \`company\` or \`sensitive\` as the task requires; if the task does not select a direction, stop and ask firstmate rather than defaulting.
+Set \`PR_TITLE_FILE\` and \`PR_BODY_FILE\` to the paths of those exact files.
+Run \`"$FM_ROOT/bin/fm-push-scan.sh" "\$PUSH_SCAN_LIST" --pr-title-file "\$PR_TITLE_FILE" --pr-body-file "\$PR_BODY_FILE"\` from the project branch and stop on any nonzero result.
+After the pull request is published, use gh-axi to save its live title and body into those files and run the same command again before reporting it ready.
+The script's \`--help\` owns the complete scan and failure contract; do not substitute a hand-written grep.
+EOF
+PUSH_SCAN_SECTION=${PUSH_SCAN_SECTION%$'\n'}
+fi
+
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -439,6 +456,8 @@ $RULE1
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 
 $INBOX_SECTION
+
+$PUSH_SCAN_SECTION
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
