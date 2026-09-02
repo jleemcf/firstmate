@@ -1545,9 +1545,8 @@ secondmate_current_json() {  # <parent-tasks-json-file>
         summary_observed=$(printf '%s' "$summary" | jq -r '.generated')
       fi
     fi
-    # Failed command substitutions clear their assignment target. Keep the
-    # unsampled record's --argjson input valid without retaining any rejected
-    # or oversized summary fragment.
+    # Failed command substitutions clear their assignment target, so a rejected
+    # sample can leave $summary empty or holding the text this home refused.
     if [ -n "$reason" ]; then summary='{}'; fi
     if [ -z "$reason" ]; then
       summary_sampled=true
@@ -1562,6 +1561,12 @@ secondmate_current_json() {  # <parent-tasks-json-file>
       fi
     fi
 
+    # $summary is untrusted producer output: a remote login shell can prepend a
+    # banner, print nothing, or repeat the document while ssh still exits 0.
+    # Only a summary this home accepted reaches $summary_file, so the file
+    # readers below keep failing loudly on a genuine internal projection fault
+    # while an unusable home degrades to its own unknown record instead of
+    # aborting the whole fleet snapshot.
     [ "$summary_sampled" = true ] || summary='{}'
     printf '%s' "$summary" > "$summary_file" || return 1
 
