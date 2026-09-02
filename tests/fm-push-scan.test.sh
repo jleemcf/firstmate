@@ -76,6 +76,50 @@ run_scan_with_printf_failure() { # <repo> <home> <list> <failure>
   ) 2>&1
 }
 
+run_scan_with_temp_failure() { # <repo> <home> <list> <failure>
+  local repo=$1 home=$2 list=$3 failure=$4 case_root fakebin scan_tmp real_cat
+  case_root="$TMP_ROOT/temp-failure-$failure"
+  fakebin="$case_root/bin"
+  scan_tmp="$case_root/scan-tmp"
+  real_cat=$(command -v cat)
+  mkdir -p "$fakebin"
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+set -u
+mkdir -p "$FM_TEST_SCAN_TMP"
+if [ "$FM_TEST_TEMP_FAILURE" = match-output ]; then
+  mkdir -p "$FM_TEST_SCAN_TMP/matches"
+fi
+printf '%s\n' "$FM_TEST_SCAN_TMP"
+SH
+  cat > "$fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+set -u
+count=0
+if [ -f "$FM_TEST_CAT_COUNT" ]; then
+  IFS= read -r count < "$FM_TEST_CAT_COUNT" || true
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$FM_TEST_CAT_COUNT"
+"$FM_TEST_REAL_CAT" "$@"
+rc=$?
+if [ "$FM_TEST_TEMP_FAILURE" = pattern-input ] && [ "$count" -eq 2 ]; then
+  rm -f "$FM_TEST_SCAN_TMP/patterns"
+fi
+exit "$rc"
+SH
+  chmod +x "$fakebin/mktemp" "$fakebin/cat"
+  (
+    cd "$repo/nested" || exit 99
+    PATH="$fakebin:$PATH" FM_TEST_SCAN_TMP="$scan_tmp" \
+      FM_TEST_TEMP_FAILURE="$failure" FM_TEST_CAT_COUNT="$case_root/cat-count" \
+      FM_TEST_REAL_CAT="$real_cat" FM_HOME="$home" \
+      "$SCAN" "$list" \
+        --pr-title-file "$home/pr/title.txt" \
+        --pr-body-file "$home/pr/body.txt"
+  ) 2>&1
+}
+
 assert_no_result() { # <output> <label>
   assert_not_contains "$1" "fm-push-scan: result:" \
     "$2 emitted a scan result even though preflight failed"
@@ -267,6 +311,32 @@ test_required_write_failures_stop_without_a_result() {
   pass "fm-push-scan.sh: source and result write failures cannot report clean"
 }
 
+test_temp_descriptor_failures_stop_without_a_result() {
+  local repo home out rc
+  repo=$(new_repo descriptor-failure feature/safe-descriptor 'contains forbidden-token' 'safe message' 'Safe Author' 'safe@example.invalid')
+  home="$TMP_ROOT/descriptor-failure-home"
+  mkdir -p "$home/config"
+  write_pr_text "$home/pr" 'Safe title' 'Safe body'
+  printf '%s\n' 'forbidden[ _-]token' > "$home/config/company-push-terms.txt"
+
+  out=$(run_scan_with_temp_failure "$repo" "$home" company match-output); rc=$?
+  expect_code 2 "$rc" "an unopened match-output descriptor must fail closed"
+  assert_contains "$out" "patterns loaded: 1 (list=company" \
+    "match-output failure did not reach surface scanning"
+  assert_contains "$out" "opening the match output for diff pattern 1 failed" \
+    "match-output failure was interpreted as a grep result"
+  assert_no_result "$out" "match-output descriptor failure"
+
+  out=$(run_scan_with_temp_failure "$repo" "$home" company pattern-input); rc=$?
+  expect_code 2 "$rc" "an unopened pattern-input descriptor must fail closed"
+  assert_contains "$out" "patterns loaded: 1 (list=company" \
+    "pattern-input failure did not reach surface scanning"
+  assert_contains "$out" "opening the pattern input for diff failed" \
+    "pattern-input failure was interpreted as an empty scan"
+  assert_no_result "$out" "pattern-input descriptor failure"
+  pass "fm-push-scan.sh: temporary descriptor failures cannot report clean"
+}
+
 test_missing_list_fails_without_cwd_or_other_list_fallback
 test_script_root_default_is_cwd_independent
 test_empty_list_fails_for_zero_patterns
@@ -275,3 +345,4 @@ test_unreadable_list_fails_for_the_list_reason
 test_every_required_surface_is_scanned
 test_clean_scan_passes_with_count_and_comments_removed
 test_required_write_failures_stop_without_a_result
+test_temp_descriptor_failures_stop_without_a_result

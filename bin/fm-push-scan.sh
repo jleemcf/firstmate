@@ -162,8 +162,12 @@ emit_scan_record "loaded-pattern count" \
   fail_after_patterns "$LIST_KIND pattern list yielded zero usable patterns after comments and blank lines were removed: $LIST_PATH"
 
 GREP_ERROR="$TMP_ROOT/grep-error"
-LC_ALL=C grep -aEi -f "$PATTERNS" /dev/null >/dev/null 2> "$GREP_ERROR"
+if ! exec 3> "$GREP_ERROR"; then
+  fail_after_patterns "opening the regular-expression diagnostic output failed"
+fi
+LC_ALL=C grep -aEi -f "$PATTERNS" /dev/null >/dev/null 2>&3
 GREP_RC=$?
+exec 3>&-
 case "$GREP_RC" in
   0|1) ;;
   *)
@@ -233,18 +237,38 @@ while [ "$SOURCE_INDEX" -lt "${#SOURCE_FILES[@]}" ]; do
   SOURCE=${SOURCE_FILES[$SOURCE_INDEX]}
   LABEL=${SOURCE_LABELS[$SOURCE_INDEX]}
   PATTERN_INDEX=0
-  while IFS= read -r PATTERN || [ -n "$PATTERN" ]; do
+  if ! exec 3< "$PATTERNS"; then
+    fail_after_patterns "opening the pattern input for $LABEL failed"
+  fi
+  while IFS= read -r PATTERN <&3 || [ -n "$PATTERN" ]; do
     PATTERN_INDEX=$((PATTERN_INDEX + 1))
     MATCHES="$TMP_ROOT/matches"
-    LC_ALL=C grep -aEin -- "$PATTERN" "$SOURCE" > "$MATCHES" 2> "$GREP_ERROR"
+    if ! exec 4> "$MATCHES"; then
+      fail_after_patterns "opening the match output for $LABEL pattern $PATTERN_INDEX failed"
+    fi
+    if ! exec 5> "$GREP_ERROR"; then
+      exec 4>&-
+      fail_after_patterns "opening the grep diagnostic output for $LABEL pattern $PATTERN_INDEX failed"
+    fi
+    LC_ALL=C grep -aEin -- "$PATTERN" "$SOURCE" >&4 2>&5
     GREP_RC=$?
+    exec 4>&-
+    exec 5>&-
     case "$GREP_RC" in
       0)
         HITS=1
-        while IFS= read -r MATCH || [ -n "$MATCH" ]; do
+        if ! exec 4< "$MATCHES"; then
+          fail_after_patterns "opening the match input for $LABEL pattern $PATTERN_INDEX failed"
+        fi
+        MATCH_COUNT=0
+        while IFS= read -r MATCH <&4 || [ -n "$MATCH" ]; do
+          MATCH_COUNT=$((MATCH_COUNT + 1))
           emit_scan_record "hit" \
             "fm-push-scan: hit: source=$LABEL pattern[$PATTERN_INDEX]=$PATTERN match=$MATCH"
-        done < "$MATCHES"
+        done
+        exec 4<&-
+        [ "$MATCH_COUNT" -gt 0 ] || \
+          fail_after_patterns "grep reported a hit without readable match output for $LABEL pattern $PATTERN_INDEX"
         ;;
       1) ;;
       *)
@@ -252,7 +276,10 @@ while [ "$SOURCE_INDEX" -lt "${#SOURCE_FILES[@]}" ]; do
         fail_after_patterns "grep failed while scanning $LABEL with pattern $PATTERN_INDEX: ${GREP_DETAIL:-exit $GREP_RC}"
         ;;
     esac
-  done < "$PATTERNS"
+  done
+  exec 3<&-
+  [ "$PATTERN_INDEX" -eq "$PATTERN_COUNT" ] || \
+    fail_after_patterns "pattern input ended early while scanning $LABEL (read $PATTERN_INDEX of $PATTERN_COUNT)"
   SOURCE_INDEX=$((SOURCE_INDEX + 1))
 done
 
