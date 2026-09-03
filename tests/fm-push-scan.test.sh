@@ -51,6 +51,7 @@ run_scan_with_printf_failure() { # <repo> <home> <list> <failure>
   branch=$(git -C "$repo" symbolic-ref --short HEAD)
   (
     cd "$repo/nested" || exit 99
+    # shellcheck disable=SC2329 # Exported for the scanner subprocess to invoke indirectly.
     printf() {
       case "${FM_TEST_PRINTF_FAILURE:-}" in
         branch)
@@ -65,6 +66,7 @@ run_scan_with_printf_failure() { # <repo> <home> <list> <failure>
           [ "${2:-}" = 'fm-push-scan: result: clean' ] && return 1
           ;;
       esac
+      # shellcheck disable=SC2059 # Forward the shim's variadic printf interface unchanged.
       builtin printf "$@"
     }
     printf '' || exit 99
