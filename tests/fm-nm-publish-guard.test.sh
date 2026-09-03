@@ -48,20 +48,24 @@ test_current_base_passes() {
 }
 
 test_stale_base_refuses() {
-  local world out rc
+  local world out rc refs_before refs_after
   world=$(make_world stale)
   printf 'main advanced\n' >> "$world/admin/value"
   git -C "$world/admin" add value
   git -C "$world/admin" commit -qm "advance main"
   git -C "$world/admin" push -q origin main
 
+  refs_before=$(git -C "$world/work" for-each-ref --format='%(refname) %(objectname)' | sort)
   rc=0
   out=$(run_guard "$world/work") || rc=$?
+  refs_after=$(git -C "$world/work" for-each-ref --format='%(refname) %(objectname)' | sort)
   [ "$rc" -ne 0 ] || fail "a stale-base head passed the publication guard"
   assert_contains "$out" "REFUSED" "the stale-base failure was not an explicit refusal"
   assert_contains "$out" "does not contain origin/main" \
     "the stale-base refusal did not identify the missing current base"
-  pass "fm-nm-publish-guard: a stale-base head is refused"
+  [ "$refs_before" = "$refs_after" ] \
+    || fail "the stale-base check moved a named ref"
+  pass "fm-nm-publish-guard: a stale-base head is refused without moving refs"
 }
 
 test_undeterminable_base_refuses() {

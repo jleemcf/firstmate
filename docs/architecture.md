@@ -288,7 +288,7 @@ A ship brief records its mode as a fixed machine-readable line and the spawn ref
 When a selected delivery path calls for a diff, `bin/fm-review-diff.sh` refreshes the authoritative base and, when task meta records `pr=`, always fetches and compares against `refs/pull/<n>/head` by default (recorded `pr_head=` is only an offline fallback) before falling back to the local branch with a warning.
 Where a no-mistakes pipeline stores evidence in the repo, it publishes that PR-viewable validation evidence to an orphan evidence branch that shares no history with code branches, so it never enters the crew branch or the default branch.
 This repo uses that setting, and its own `.no-mistakes/` directory remains local state that stays gitignored and is rejected by CI if tracked; [`configuration.md`](configuration.md) owns the setting.
-The trusted no-mistakes config invokes [`bin/fm-nm-publish-guard.sh`](../bin/fm-nm-publish-guard.sh) as Push's first action, so this repo refuses publication unless the current upstream default tip is proven in the validated head.
+The trusted no-mistakes config runs [`bin/fm-nm-publish-guard.sh`](../bin/fm-nm-publish-guard.sh) from `commands.format` as an upstream-base check; the helper's header owns its mechanics and the command-to-publication boundary.
 PR-based task merges go through `bin/fm-pr-merge.sh`, which records `pr=` and any available `pr_head=` through `bin/fm-pr-check.sh` before calling the forge CLI.
 The helper requires a full canonical URL and rejects malformed URLs or repo override flags before recording merge state.
 A `https://github.com/<owner>/<repo>/pull/<n>` URL invokes `gh-axi pr merge <n> --repo <owner>/<repo>`, defaults to `--squash`, and preserves explicit merge-method flags.

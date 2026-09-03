@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Refuse a no-mistakes publication unless the validated head contains the
+# Check whether the current no-mistakes publication candidate contains the
 # current upstream default-branch tip.
 #
 # firstmate wires this executable into no-mistakes' trusted commands.format
-# slot, which runs after validation and immediately before the Push step's
-# commit and remote mutation.
-# The guard deliberately chooses refusal instead of another rebase because the
-# pipeline already owns branch custody and validation; rewriting here would
-# publish a head the completed validation steps never exercised.
+# slot after validation and before the Push step's commit and remote mutation.
+# This helper exits nonzero when the proof fails; installed no-mistakes owns
+# whether a failing formatter blocks the surrounding publication.
+# The helper deliberately exits instead of rebasing because the pipeline
+# already owns branch custody and validation; rewriting here would publish a
+# head the completed validation steps never exercised.
 #
 # The current base comes from one live `git ls-remote --symref origin HEAD`
 # observation, then an exact fetch of that advertised branch into FETCH_HEAD.
 # The branch is not moved and no named ref is written.
 # If the remote default, its commit, the fetch, or ancestry cannot be proved,
-# publication is refused.
+# the check exits nonzero.
 # A default branch that moves between observation and fetch is also refused so
 # a racing read cannot certify either tip.
 #
@@ -48,7 +49,7 @@ esac
 git check-ref-format "$default_ref" >/dev/null 2>&1 \
   || refuse "origin's advertised default branch is invalid"
 
-if ! git fetch --no-tags --quiet origin "$default_ref"; then
+if ! git fetch --refmap= --no-tags --quiet origin "$default_ref"; then
   refuse "could not fetch origin's current default branch"
 fi
 fetched_head=$(git rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) \

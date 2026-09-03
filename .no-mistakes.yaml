@@ -36,8 +36,8 @@ document:
 # would duplicate CI and defeat the targeted Test contract.
 commands:
   lint: 'bin/fm-lint.sh'
-  # no-mistakes runs commands.format as Push's first action after validation.
-  # Use that supported slot to refuse publication when the validated head is not based on current upstream main.
+  # Run the upstream-base check from no-mistakes' supported commands.format slot.
+  # The helper's header owns its mechanics and the command-to-publication boundary.
   format: 'bin/fm-nm-publish-guard.sh'
 
 # Publish each run's test evidence to the orphan no-mistakes/evidence branch linked from the PR.
