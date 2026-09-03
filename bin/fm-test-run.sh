@@ -287,7 +287,7 @@ family_for_basename() {
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
-    fm-check-unregister.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
+    fm-check-unregister.test.sh|fm-nm-publish-guard.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
     fm-review-diff.test.sh|fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
       ;;
@@ -565,6 +565,7 @@ tests/fm-kimi-harness.test.sh 18015
 tests/fm-lint-workflows.test.sh 855
 tests/fm-muse-harness.test.sh 55572
 tests/fm-muse-signals-live-e2e.test.sh 23
+tests/fm-nm-publish-guard.test.sh 400
 tests/fm-no-mistakes-required.test.sh 370
 tests/fm-on.test.sh 11692
 tests/fm-opencode-primary-live-e2e.test.sh 21
@@ -1238,6 +1239,9 @@ families_for_changed_path() {
     bin/fm-x-*|bin/fm-check*)
       printf '%s\n' pr-forge
       ;;
+    bin/fm-nm-publish-guard.sh)
+      printf '%s\n' "__script__:fm-nm-publish-guard.test.sh"
+      ;;
     bin/fm-nm-run-lib.sh)
       # Shared no-mistakes run-attribution primitives, sourced by both
       # bin/fm-crew-state.sh (pure-contract-unit) and bin/fm-teardown.sh's
@@ -1302,7 +1306,12 @@ families_for_changed_path() {
     .agents/skills/*/SKILL.md)
       printf '%s\n' pure-contract-unit
       ;;
-    .github/workflows/ci.yml|.no-mistakes.yaml)
+    .no-mistakes.yaml)
+      printf '%s\n' "__script__:fm-nm-publish-guard.test.sh"
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' real-herdr-gated
+      ;;
+    .github/workflows/ci.yml)
       printf '%s\n' pure-contract-unit
       printf '%s\n' real-herdr-gated
       ;;
