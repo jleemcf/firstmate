@@ -1,0 +1,27 @@
+Firstmate no-mistakes publication guard end-to-end transcript
+Guard: bin/fm-nm-publish-guard.sh
+
+CASE current-base
+exit=0
+fm-nm-publish-guard: verified: validated head contains current origin/main
+local_named_refs=unchanged
+remote_refs=unchanged
+
+CASE stale-base-after-upstream-advance
+exit=1
+fm-nm-publish-guard: REFUSED: the validated publication head does not contain origin/main
+local_named_refs=unchanged
+remote_refs=unchanged
+
+CASE rebased-current-base
+exit=0
+fm-nm-publish-guard: verified: validated head contains current origin/main
+local_named_refs=unchanged
+remote_refs=unchanged
+
+CASE undeterminable-default-base
+exit=1
+fm-nm-publish-guard: REFUSED: could not determine origin's current default branch
+local_named_refs=unchanged
+remote_refs=unchanged
+
