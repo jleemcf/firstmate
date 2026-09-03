@@ -17,10 +17,13 @@ fm_dod_push_scan_block() {
 
 # Guarded push scan
 Before starting a delivery run or pushing, save the exact intended pull-request title and body in files.
+Never name a matched pattern, paste scanner output, or include an unverified evidence link in generated pull-request text.
 Set \`PUSH_SCAN_LIST\` to exactly \`company\` or \`sensitive\` as the task requires; if the task does not select a direction, stop and ask firstmate rather than defaulting.
 Set \`PR_TITLE_FILE\` and \`PR_BODY_FILE\` to the paths of those exact files.
-Run \`"$FM_ROOT/bin/fm-push-scan.sh" "\$PUSH_SCAN_LIST" --pr-title-file "\$PR_TITLE_FILE" --pr-body-file "\$PR_BODY_FILE"\` from the project branch and stop on any nonzero result.
-After the pull request is published, use gh-axi to save its live title and body into those files and run the same command again before reporting it ready.
+Before writing each publishable evidence artifact, pipe its raw producer output through \`"$FM_ROOT/bin/fm-push-scan.sh" redact-evidence --output "\$EVIDENCE_FILE"\` so operator-home paths never reach the artifact.
+Run \`"$FM_ROOT/bin/fm-push-scan.sh" "\$PUSH_SCAN_LIST" --pr-title-file "\$PR_TITLE_FILE" --pr-body-file "\$PR_BODY_FILE"\` from the project branch, append one \`--evidence-file "\$EVIDENCE_FILE"\` argument for every artifact that could be published or linked, and stop on any nonzero result.
+Do not publish or link evidence unless that exact artifact set passes the scan.
+After the pull request is published, use gh-axi to save its live title and body into those files and run the same command with the same evidence arguments before reporting it ready.
 The script's \`--help\` owns the complete scan and failure contract; do not substitute a hand-written grep.
 
 EOF

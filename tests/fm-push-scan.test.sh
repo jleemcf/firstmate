@@ -5,7 +5,8 @@
 # selected list cannot produce a clean result, and that list selection never
 # falls back to a caller-relative or opposite-direction file. They also prove
 # all six required push surfaces are scanned and every completed record carries
-# the usable-pattern count.
+# the usable-pattern count. Evidence regressions prove separate sensitive-list
+# enforcement, non-echoing hit records, and pre-write operator-home redaction.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -36,13 +37,14 @@ write_pr_text() { # <directory> <title> <body>
   printf '%s\n' "$3" > "$1/body.txt"
 }
 
-run_scan() { # <repo> <home> <list>
+run_scan() { # <repo> <home> <list> [scanner-arguments...]
   local repo=$1 home=$2 list=$3
+  shift 3
   (
     cd "$repo/nested" || exit 99
     FM_HOME="$home" "$SCAN" "$list" \
       --pr-title-file "$home/pr/title.txt" \
-      --pr-body-file "$home/pr/body.txt"
+      --pr-body-file "$home/pr/body.txt" "$@"
   ) 2>&1
 }
 
@@ -240,8 +242,18 @@ assert_surface_hit() { # <case> <branch> <content> <message> <author> <email> <t
   expect_code 1 "$rc" "$case_name planted hit must fail the scan"
   assert_contains "$out" "patterns loaded: 1 (list=company" \
     "$case_name hit record omitted the usable-pattern count"
-  assert_contains "$out" "hit: source=$source pattern[1]=forbidden[ _-]token" \
-    "$case_name hit did not identify its source and matching pattern"
+  assert_contains "$out" "hit: file=$source lines=" \
+    "$case_name hit did not identify its safe source and line location"
+  assert_contains "$out" "count=1" \
+    "$case_name hit did not report its matching-line count"
+  assert_not_contains "$out" "forbidden" \
+    "$case_name hit record echoed the matched pattern or source text"
+  assert_not_contains "$out" "Forbidden" \
+    "$case_name hit record echoed case-variant matched source text"
+  assert_not_contains "$out" "pattern[" \
+    "$case_name hit record exposed a pattern index and pattern text"
+  assert_not_contains "$out" "match=" \
+    "$case_name hit record exposed matching source text"
   assert_contains "$out" "fm-push-scan: result: hits found" \
     "$case_name hit did not report a completed hit result"
 }
@@ -279,6 +291,87 @@ test_clean_scan_passes_with_count_and_comments_removed() {
   assert_not_contains "$out" "fm-push-scan: hit:" \
     "comment lines were incorrectly loaded as patterns"
   pass "fm-push-scan.sh: clean complete set passes and prints its pattern count"
+}
+
+test_evidence_uses_the_sensitive_list_without_echoing_hits() {
+  local repo home evidence out rc
+  repo=$(new_repo evidence-sensitive feature/safe-evidence 'safe diff' 'safe message' 'Safe Author' 'safe@example.invalid')
+  home="$TMP_ROOT/evidence-sensitive-home"
+  evidence="$home/publishable-evidence.txt"
+  mkdir -p "$home/config"
+  write_pr_text "$home/pr" 'Safe title' 'Safe body'
+  printf '%s\n' 'company-only-never' > "$home/config/company-push-terms.txt"
+  printf '%s\n' 'contains private-marker detail' > "$evidence"
+
+  out=$(run_scan "$repo" "$home" company --evidence-file "$evidence"); rc=$?
+  expect_code 2 "$rc" "company scan evidence must not fall back when the sensitive list is missing"
+  assert_contains "$out" "patterns loaded: 0 (list=sensitive" \
+    "missing evidence-sensitive list did not report a zero count"
+  assert_contains "$out" "sensitive pattern list is missing" \
+    "evidence scan did not require its separate sensitive list"
+  assert_no_result "$out" "missing evidence-sensitive list"
+
+  printf '%s\n' 'private[-_]marker' > "$home/config/sensitive-terms.txt"
+  out=$(run_scan "$repo" "$home" company --evidence-file "$evidence"); rc=$?
+  expect_code 1 "$rc" "sensitive content in publishable evidence must refuse publication"
+  assert_contains "$out" "patterns loaded: 1 (scope=evidence, list=sensitive" \
+    "evidence scan did not record its separate sensitive pattern count"
+  assert_contains "$out" "hit: file=evidence[1] lines=1 count=1" \
+    "evidence hit did not report only its safe file index, line, and count"
+  assert_not_contains "$out" "private-marker" \
+    "evidence hit record echoed the matched source text"
+  assert_not_contains "$out" "private[-_]marker" \
+    "evidence hit record echoed the matched pattern text"
+  assert_contains "$out" "fm-push-scan: result: hits found" \
+    "unsafe evidence did not produce a refusing hit result"
+  pass "fm-push-scan.sh: publishable evidence uses the separate sensitive list without echoing hits"
+}
+
+test_evidence_writer_redacts_operator_home_before_output() {
+  local repo home operator_home raw_path raw_file redacted_file out rc
+  repo=$(new_repo evidence-redaction feature/safe-redaction 'safe diff' 'safe message' 'Safe Author' 'safe@example.invalid')
+  operator_home="$TMP_ROOT/evidence-redaction-operator"
+  home="$operator_home/fleet"
+  raw_path="$operator_home/private/tool/output.log"
+  raw_file="$operator_home/raw-input.txt"
+  redacted_file="$home/redacted-evidence.txt"
+  mkdir -p "$home/config"
+  write_pr_text "$home/pr" 'Safe title' 'Safe body'
+  printf '%s\n' 'never-match-this' > "$home/config/sensitive-terms.txt"
+  printf 'command used %s\nand alias ~/.private/tool\n' "$raw_path" > "$raw_file"
+
+  HOME="$operator_home" "$SCAN" redact-evidence --output "$redacted_file" < "$raw_file" \
+    || fail "redact-evidence mode refused valid input"
+  assert_present "$redacted_file" "redact-evidence mode did not write its destination"
+  assert_no_grep "$operator_home" "$redacted_file" \
+    "redacted evidence retained the absolute operator home"
+  # shellcheck disable=SC2088 # Assert the literal home alias was redacted from evidence.
+  assert_no_grep "~/" "$redacted_file" \
+    "redacted evidence retained the operator-home alias"
+  assert_grep "<HOME>/private/tool/output.log" "$redacted_file" \
+    "redacted evidence did not replace the absolute operator home"
+  assert_grep "<HOME>/.private/tool" "$redacted_file" \
+    "redacted evidence did not replace the operator-home alias"
+
+  out=$(cd "$repo/nested" && HOME="$operator_home" FM_HOME="$home" "$SCAN" sensitive \
+    --pr-title-file "$home/pr/title.txt" --pr-body-file "$home/pr/body.txt" \
+    --evidence-file "$raw_file" 2>&1); rc=$?
+  expect_code 1 "$rc" "unredacted operator-home evidence must refuse publication"
+  assert_contains "$out" "hit: file=evidence[1]" \
+    "operator-home evidence refusal omitted its safe evidence location"
+  assert_not_contains "$out" "$operator_home" \
+    "operator-home evidence refusal leaked the personal path"
+  # shellcheck disable=SC2088 # Assert the literal home alias was not emitted.
+  assert_not_contains "$out" "~/" \
+    "operator-home evidence refusal leaked the home alias"
+
+  out=$(cd "$repo/nested" && HOME="$operator_home" FM_HOME="$home" "$SCAN" sensitive \
+    --pr-title-file "$home/pr/title.txt" --pr-body-file "$home/pr/body.txt" \
+    --evidence-file "$redacted_file" 2>&1); rc=$?
+  expect_code 0 "$rc" "pre-write redacted evidence should pass a clean sensitive scan"
+  assert_contains "$out" "fm-push-scan: result: clean" \
+    "pre-write redacted evidence did not complete cleanly"
+  pass "fm-push-scan.sh: evidence writer redacts operator-home paths before destination output"
 }
 
 test_required_write_failures_stop_without_a_result() {
@@ -346,5 +439,7 @@ test_comment_only_list_fails_for_zero_patterns
 test_unreadable_list_fails_for_the_list_reason
 test_every_required_surface_is_scanned
 test_clean_scan_passes_with_count_and_comments_removed
+test_evidence_uses_the_sensitive_list_without_echoing_hits
+test_evidence_writer_redacts_operator_home_before_output
 test_required_write_failures_stop_without_a_result
 test_temp_descriptor_failures_stop_without_a_result

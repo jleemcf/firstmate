@@ -221,6 +221,14 @@ test_ship_modes_generate_clean_briefs() {
         "$id: PR-delivery brief did not emit the guarded scan invocation"
       assert_grep "use gh-axi to save its live title and body" "$brief" \
         "$id: PR-delivery brief did not require a live published-text rescan"
+      # shellcheck disable=SC2016 # Generated brief variables must remain literal.
+      assert_grep 'redact-evidence --output "$EVIDENCE_FILE"' "$brief" \
+        "$id: PR-delivery brief did not require pre-write evidence redaction"
+      # shellcheck disable=SC2016 # Generated brief variables must remain literal.
+      assert_grep 'one `--evidence-file "$EVIDENCE_FILE"` argument for every artifact' "$brief" \
+        "$id: PR-delivery brief did not put publishable evidence inside the scan set"
+      assert_grep "Never name a matched pattern, paste scanner output, or include an unverified evidence link" "$brief" \
+        "$id: PR-delivery brief did not protect generated pull-request text"
       assert_no_grep "grep -f" "$brief" \
         "$id: PR-delivery brief still tells workers to hand-roll grep"
     fi

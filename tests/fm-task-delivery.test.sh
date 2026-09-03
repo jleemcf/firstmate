@@ -345,6 +345,14 @@ STUB
         "$mode: promoted PR-delivery worker did not receive the guarded scan invocation"
       assert_grep "use gh-axi to save its live title and body" "$payload" \
         "$mode: promoted PR-delivery worker did not receive the published-text rescan"
+      # shellcheck disable=SC2016 # Delivered instruction variables must remain literal.
+      assert_grep 'redact-evidence --output "$EVIDENCE_FILE"' "$payload" \
+        "$mode: promoted PR-delivery worker did not receive pre-write evidence redaction"
+      # shellcheck disable=SC2016 # Delivered instruction variables must remain literal.
+      assert_grep 'one `--evidence-file "$EVIDENCE_FILE"` argument for every artifact' "$payload" \
+        "$mode: promoted PR-delivery worker did not receive evidence-inclusive scanning"
+      assert_grep "Never name a matched pattern, paste scanner output, or include an unverified evidence link" "$payload" \
+        "$mode: promoted PR-delivery worker did not receive generated-text safety"
       assert_no_grep "grep -f" "$payload" \
         "$mode: promoted PR-delivery worker was told to hand-roll the scan"
     fi

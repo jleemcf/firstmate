@@ -32,8 +32,11 @@ The scanner never defaults one list to the other and never merges them; `local-o
 Each non-blank line that is not an optionally indented `#` comment is one case-insensitive extended regular expression.
 The selected path must be a readable regular file and must yield at least one usable expression, or the scan stops without a clean or hit result.
 `bin/fm-push-scan.sh` resolves the list below the effective `FM_HOME`, which must be absolute when explicitly set, and otherwise below the tracked root containing that script.
+Hit records expose only safe publication-surface, line, and count metadata, never the matched expression or matching source text.
+Every evidence artifact intended for publication or linking is scanned separately against `config/sensitive-terms.txt`, even when the repository-direction scan uses the company list, and an unsafe artifact refuses publication.
+The scanner's evidence writer replaces the current operator-home prefix before atomically writing an artifact, and the evidence scan independently rejects an unredacted absolute or home-alias path.
 These lists are not inherited, so configure the applicable list separately in every primary or secondmate home that owns PR-delivery work.
-The script's header and `--help` output own the exact invocation, scanned publication surfaces, result records, and failure behavior.
+The script's header and `--help` output own the exact invocation, scanned publication surfaces, result records, redaction mode, and failure behavior.
 
 ## Pi Calm preference (config/calm)
 
