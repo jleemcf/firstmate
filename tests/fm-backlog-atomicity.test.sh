@@ -2972,7 +2972,7 @@ test_bitbucket_replay_preserves_validated_notes() {
     marker="$home/state/$id.backlog-close"
     printf 'id=%s\ndata=%s\nspawn_gen=note-replay\narg=--note\narg=%s\n' \
       "$id" "$home/data" "$note" > "$marker"
-    break_verb "$case_dir" done
+    break_verb "$case_dir" "done"
     out=$(run_bootstrap "$case_dir")
     assert_absent "$home/state/$id.meta" "replay did not remove the matching incarnation: $out"
     assert_grep "arg=$note" "$marker" "failed replay changed the serialized note"
@@ -2980,7 +2980,7 @@ test_bitbucket_replay_preserves_validated_notes() {
       || fail "failed note replay closed the backlog item"
     rm "$case_dir/fakebin/tasks-axi"
     out=$(run_bootstrap "$case_dir")
-    [ "$(row_state "$case_dir" "$id")" = done ] || fail "note replay did not recover: $out"
+    [ "$(row_state "$case_dir" "$id")" = "done" ] || fail "note replay did not recover: $out"
     assert_grep "$expected" "$(backlog_of "$case_dir")" "replay lost the recorded note"
     assert_absent "$marker" "successful note replay left residue"
   done
@@ -3038,7 +3038,7 @@ test_bitbucket_completion_refuses_unbound_landing_evidence() {
       commit=abcdef1234567890
       printf 'merge_commit=%s\n' "$commit" >> "$home/state/$id.meta"
       out=$(run_teardown "$case_dir" "$id") || fail "task-bound metadata did not permit cleanup: $out"
-      [ "$(row_state "$case_dir" "$id")" = done ] || fail "task-bound completion left the row open"
+      [ "$(row_state "$case_dir" "$id")" = "done" ] || fail "task-bound completion left the row open"
       assert_grep "$commit" "$(backlog_of "$case_dir")" "completion lost the task-bound commit"
       assert_present "$case_dir/pool/1/project/.git" "completion removed the reassigned worktree"
       assert_grep 'task=another-task' "$case_dir/pool/1/.fm-slot-owner" "completion changed slot ownership"
@@ -3069,7 +3069,7 @@ test_bitbucket_retry_preserves_captured_landing_evidence() {
   rm "$case_dir/fakebin/rm"
   git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
   out=$(run_teardown "$case_dir" "$id") || fail "retry lost captured landing evidence: $out"
-  [ "$(row_state "$case_dir" "$id")" = done ] || fail "retry left the backlog item open"
+  [ "$(row_state "$case_dir" "$id")" = "done" ] || fail "retry left the backlog item open"
   assert_grep "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=$commit" \
     "$(backlog_of "$case_dir")" "retry lost the recorded PR and commit"
   assert_absent "$home/state/$id.meta" "retry left task metadata behind"
