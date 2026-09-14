@@ -1,0 +1,159 @@
+Targeted Bitbucket teardown verification
+Git: git version 2.43.0
+tasks-axi: 0.2.5
+
+Fixture: real Git and tasks-axi; simulated terminal and pool boundary (pool stub removes the real Git worktree).
+$ bin/fm-teardown.sh atomic-close-bitbucket-pr
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 1s ago).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair a missing or failed watcher cycle with the Pi tool fm_watch_arm_pi, or restart Pi with -e /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.pi/extensions/fm-primary-turnend-guard.ts -e /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.pi/extensions/fm-primary-pi-watch.ts if the extensions are not loaded.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.test-tmp/fm-backlog-atomicity.0igfZC/close-bitbucket-pr/project: already current
+teardown atomic-close-bitbucket-pr complete (window firstmate:fm-atomic-close-bitbucket-pr, worktree /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.test-tmp/fm-backlog-atomicity.0igfZC/close-bitbucket-pr/wt)
+Backlog: atomic-close-bitbucket-pr is closed in /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.test-tmp/fm-backlog-atomicity.0igfZC/close-bitbucket-pr/home/data/backlog.md. Run bin/fm-tasks-axi.sh ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due.
+
+Pool request: return --force /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2GM8MGTAK65K8PY7JW7XK27/.test-tmp/fm-backlog-atomicity.0igfZC/close-bitbucket-pr/wt
+Endpoint request: kill-window -t =firstmate:=fm-atomic-close-bitbucket-pr
+Task copy present: no
+Task metadata present: no
+
+$ tasks-axi show atomic-close-bitbucket-pr --file <fixture>/home/data/backlog.md
+task:
+  id: atomic-close-bitbucket-pr
+  title: item for atomic-close-bitbucket-pr
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=3d8ed55686aad1dbb238accce4544646e1299e44"
+ok - completion closes a Bitbucket PR with its URL and landed commit and leaves no residue
+Replayable close marker present after success: no (asserted)
+
+ok - replay preserves validated notes across failures and decodes only the legacy note
+
+Persisted backlog after failed done + bootstrap retry (bitbucket):
+task:
+  id: atomic-note-replay-bitbucket
+  title: item for atomic-note-replay-bitbucket
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=abcdef1234567890"
+Replayable close marker present: no
+
+Persisted backlog after failed done + bootstrap retry (arbitrary):
+task:
+  id: atomic-note-replay-arbitrary
+  title: item for atomic-note-replay-arbitrary
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: release=local%20main;build=42
+Replayable close marker present: no
+
+Persisted backlog after failed done + bootstrap retry (legacy):
+task:
+  id: atomic-note-replay-legacy
+  title: item for atomic-note-replay-legacy
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: local main
+Replayable close marker present: no
+
+ok - Bitbucket teardown refuses missing or unbound evidence and never borrows another slot's HEAD
+
+$ bin/fm-teardown.sh atomic-bitbucket-evidence-missing
+WARNING: watcher still down (same stale episode; last beat: 9s ago, grace 300s) - full banner already printed this episode.
+error: Bitbucket task atomic-bitbucket-evidence-missing lacks valid incarnation-matching landed-commit evidence; restore its landing record before teardown
+error: the pending backlog close for atomic-bitbucket-evidence-missing is not replayable; refusing destructive teardown
+Exit status: 1
+task:
+  id: atomic-bitbucket-evidence-missing
+  title: item for atomic-bitbucket-evidence-missing
+  state: in_flight
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: 2026-09-14
+  closed: "-"
+  deps: none
+  links: none
+  body: ""
+Task metadata retained: yes
+Replayable close marker present: no
+
+ok - Bitbucket teardown retries with incarnation-matching evidence after its worktree disappears
+ok - completion keeps GitHub PR teardown behavior unchanged
+
+GitHub persisted backlog:
+task:
+  id: atomic-close-github-pr
+  title: "item for atomic-close-github-pr https://github.com/example/repo/pull/7"
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: "pr:https://github.com/example/repo/pull/7"
+  body: ""
