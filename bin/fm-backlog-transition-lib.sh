@@ -46,6 +46,11 @@
 # that record before destructive cleanup, so it never publishes or acts on a close
 # replay would reject. The validator pins the data path to this home's configured
 # root before any recovery mutation, then re-runs exactly that close.
+# Validated --note values survive replay unchanged, except the exact legacy
+# local%20main value, which round-trips as "local main". This is not general
+# percent decoding: embedded local%20main and other percent sequences stay
+# literal. fm_backlog_close_marker_validate owns the bounded character allowlist;
+# tests/fm-backlog-atomicity.test.sh covers note preservation across failed replay.
 # `tasks-axi done` on an already-closed task backfills links
 # without moving the close date, so replay is idempotent. Spawn needs no marker:
 # it publishes the meta first, so a crash

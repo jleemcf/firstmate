@@ -2901,13 +2901,47 @@ test_completion_closes_a_bitbucket_pr_with_landing_note() {
   write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=spawn-close-bitbucket"
   perl -0pi -e 's#worktree=[^\n]*#worktree='"$case_dir"'/wt#; s#project=[^\n]*#project='"$case_dir"'/project#' \
     "$home/state/$id.meta"
-  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t \
-    commit -q --allow-empty -m "land Bitbucket pull request"
+  # Make a real landed change rather than bypassing the safety gate with --force.
+  printf 'landed Bitbucket change\n' > "$case_dir/project/landed.txt"
+  git -C "$case_dir/project" add landed.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -qm "land Bitbucket pull request"
+  git -C "$case_dir/project.origin.git" fetch --quiet "$case_dir/project" main:main
+  git -C "$case_dir/wt" merge --ff-only main >/dev/null
   commit=$(git -C "$case_dir/wt" rev-parse HEAD)
   printf '%s\n' 'pr=https://bitbucket.example/repo/pull-requests/7' >> "$home/state/$id.meta"
+  # Exercise real Git cleanup behind the pool boundary and record the exact
+  # endpoint requested, without touching a developer's live terminal or pool.
+  mv "$case_dir/fakebin/tmux" "$case_dir/fakebin/tmux-original"
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/tmux-calls"
+exec "$case_dir/fakebin/tmux-original" "\$@"
+SH
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+[ "\$*" = 'return --force $case_dir/wt' ] || exit 1
+git -C "$case_dir/project" worktree remove "$case_dir/wt" || exit 1
+printf '%s\n' "\$*" > "$case_dir/treehouse-calls"
+SH
+  chmod +x "$case_dir/fakebin/tmux" "$case_dir/fakebin/treehouse"
 
-  out=$(run_teardown "$case_dir" "$id" --force) \
+  out=$(run_teardown "$case_dir" "$id") \
     || fail "Bitbucket PR teardown failed: $out"
+  assert_absent "$case_dir/wt" "Bitbucket PR teardown did not return the task copy"
+  assert_absent "$home/state/$id.meta" "Bitbucket PR teardown left task metadata"
+  [ "$(grep '^kill-window ' "$case_dir/tmux-calls")" = "kill-window -t =firstmate:=fm-$id" ] \
+    || fail "Bitbucket PR teardown did not close exactly the recorded endpoint"
+  assert_present "$case_dir/treehouse-calls" "Bitbucket PR teardown did not return through the pool interface"
+  if [ "${FM_TEST_SHOW_COMPLETION_EVIDENCE:-0}" = 1 ]; then
+    printf '%s\n' 'Fixture: real Git and tasks-axi; simulated terminal and pool boundary (pool stub removes the real Git worktree).'
+    printf '$ bin/fm-teardown.sh %s\n%s\n' "$id" "$out"
+    printf '\nPool request: %s\nEndpoint request: %s\n' \
+      "$(< "$case_dir/treehouse-calls")" "$(grep '^kill-window ' "$case_dir/tmux-calls")"
+    printf 'Task copy present: no\nTask metadata present: no\n'
+    printf '\n$ tasks-axi show %s --file <fixture>/home/data/backlog.md\n' "$id"
+    tasks-axi show "$id" --file "$(backlog_of "$case_dir")"
+  fi
   [ "$(row_state "$case_dir" "$id")" = "done" ] \
     || fail "Bitbucket PR teardown left the backlog item outside Done"
   assert_grep 'https://bitbucket.example/repo/pull-requests/7' "$(backlog_of "$case_dir")" \

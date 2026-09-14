@@ -8,8 +8,8 @@
 # Removing state/<id>.meta and landing the backlog transition are one step, not
 # two: bin/fm-backlog-transition-lib.sh owns that invariant, and both halves run
 # under the task's own meta lock before this script reports success. Because the
-# completion links (the PR, the report path, a local-main note) live only in the
-# record being removed, the intended transition is recorded in
+# completion evidence can disappear with the task record or worktree, the
+# intended transition is recorded in
 # state/<id>.backlog-close first, so a process killed between the halves leaves
 # the next session start enough to finish it; a landed close removes that record.
 # A close that fails is fatal and loud, preserves its pending-close record, and
@@ -18,6 +18,18 @@
 # data/backlog.md; those cases print the manual follow-up. A configured
 # non-markdown adapter remains active without a markdown file; any active
 # automatic backend without compatible tasks-axi refuses before cleanup.
+# For automatic PR-based ship completion, Bitbucket-style HTTPS URLs ending in
+# /pull-requests/<positive-number> use --note "PR=<url>;landed-commit=<commit>"
+# because tasks-axi's --pr accepts GitHub pull-request URLs only; GitHub keeps
+# its existing --pr path. The Bitbucket commit comes first from a validated
+# pending-close note matching this spawn incarnation and exact PR URL, then
+# from the task's merge_commit, landed_commit, or pr_head metadata, in that
+# order, accepting only nonempty hexadecimal values. The last fallback is HEAD
+# from an existing worktree that teardown owns, never a reassigned slot.
+# Without that evidence teardown refuses before destructive cleanup, even with
+# --force; restore the task's landing record before retrying. Captured evidence
+# permits a retry after the worktree disappears. This records completion, not
+# a new forge merge check; tests/fm-backlog-atomicity.test.sh pins the contract.
 # None of this loosens the landed-work gates below: the transition runs only on
 # the paths that already proceed to remove the record.
 # The close - and only the close - is replaced by `tasks-axi reopen` with the
@@ -90,7 +102,8 @@
 # owns the claim, its location, and its states. A claim naming another task is
 # proof of reassignment: the slot is no longer this task's, so teardown warns,
 # names the claimant, and then finishes only this task's own cleanup - endpoint,
-# status, records, checks, backlog - while every step that would read or touch
+# status, records, checks, backlog - subject to the completion-evidence gate
+# above, while every step that would read or touch
 # that slot is skipped: no process kill under it, no dirty or landed-work
 # inspection of it, no branch or hook removal in it, no Treehouse return, and
 # never the other task's claim. Skipping the inspection discards nothing of this
@@ -1392,12 +1405,8 @@ work_is_landed() {
   content_in_default
 }
 
-# The completion links this teardown already holds locally. A scout's
-# deliverable is its report, a local-only ship lands on local main, and a
-# GitHub ship carries the PR recorded on its own record. A Bitbucket pull
-# request is recorded as a note because tasks-axi's --pr flag accepts GitHub
-# pull-request URLs only. The note also carries the landed commit captured
-# before cleanup.
+# Completion evidence selection and the Bitbucket compatibility boundary are
+# owned by this script's header.
 BACKLOG_DONE_ARGS=()
 backlog_landed_commit() {
   local candidate marker note
