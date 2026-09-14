@@ -2919,6 +2919,130 @@ test_completion_closes_a_bitbucket_pr_with_landing_note() {
   pass "completion closes a Bitbucket PR with its URL and landed commit and leaves no residue"
 }
 
+test_bitbucket_replay_preserves_validated_notes() {
+  local case_dir home id note expected marker out variant
+  for variant in bitbucket arbitrary legacy; do
+    id="atomic-note-replay-$variant"
+    case_dir=$(make_home "note-replay-$variant" "$id")
+    home=$(home_of "$case_dir")
+    add_item "$case_dir" "$id"
+    start_item "$case_dir" "$id"
+    write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=note-replay"
+    case "$variant" in
+      bitbucket) note='PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=abcdef1234567890' ;;
+      arbitrary) note='release=local%20main;build=42' ;;
+      legacy) note='local%20main' ;;
+    esac
+    expected=$note
+    [ "$variant" != legacy ] || expected='local main'
+    marker="$home/state/$id.backlog-close"
+    printf 'id=%s\ndata=%s\nspawn_gen=note-replay\narg=--note\narg=%s\n' \
+      "$id" "$home/data" "$note" > "$marker"
+    break_verb "$case_dir" done
+    out=$(run_bootstrap "$case_dir")
+    assert_absent "$home/state/$id.meta" "replay did not remove the matching incarnation: $out"
+    assert_grep "arg=$note" "$marker" "failed replay changed the serialized note"
+    [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+      || fail "failed note replay closed the backlog item"
+    rm "$case_dir/fakebin/tasks-axi"
+    out=$(run_bootstrap "$case_dir")
+    [ "$(row_state "$case_dir" "$id")" = done ] || fail "note replay did not recover: $out"
+    assert_grep "$expected" "$(backlog_of "$case_dir")" "replay lost the recorded note"
+    assert_absent "$marker" "successful note replay left residue"
+  done
+  pass "replay preserves validated notes across failures and decodes only the legacy note"
+}
+
+test_bitbucket_completion_refuses_unbound_landing_evidence() {
+  local case_dir home id marker out rc variant note gen commit
+  for variant in missing reassigned stale wrong-pr invalid; do
+    id="atomic-bitbucket-evidence-$variant"
+    case_dir=$(make_home "bitbucket-evidence-$variant" "$id")
+    home=$(home_of "$case_dir")
+    add_item "$case_dir" "$id"
+    start_item "$case_dir" "$id"
+    write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=current-incarnation" \
+      'pr=https://bitbucket.example/repo/pull-requests/7'
+    marker="$home/state/$id.backlog-close"
+    case "$variant" in
+      reassigned)
+        mkdir -p "$case_dir/pool/1"
+        git -C "$case_dir/project" worktree move "$case_dir/wt" "$case_dir/pool/1/project"
+        printf '{}\n' > "$case_dir/pool/treehouse-state.json"
+        printf 'task=another-task\nhome=%s\n' "$home" > "$case_dir/pool/1/.fm-slot-owner"
+        perl -0pi -e 's#worktree=[^\n]*#worktree='"$case_dir"'/pool/1/project#; s#project=[^\n]*#project='"$case_dir"'/project#' \
+          "$home/state/$id.meta"
+        ;;
+      stale|wrong-pr|invalid)
+        gen=current-incarnation
+        note='PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=abcdef1234567890'
+        case "$variant" in
+          stale) gen=previous-incarnation ;;
+          wrong-pr) note='PR=https://bitbucket.example/repo/pull-requests/8;landed-commit=abcdef1234567890' ;;
+          invalid) note='PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=not-a-commit' ;;
+        esac
+        printf 'id=%s\ndata=%s\nspawn_gen=%s\narg=--note\narg=%s\n' \
+          "$id" "$home/data" "$gen" "$note" > "$marker"
+        cp "$marker" "$case_dir/marker-before"
+        ;;
+    esac
+    cp "$home/state/$id.meta" "$case_dir/meta-before"
+    track_teardown_resource_actions "$case_dir"
+    rc=0
+    out=$(run_teardown "$case_dir" "$id" --force) || rc=$?
+    [ "$rc" -ne 0 ] || fail "Bitbucket teardown accepted $variant landing evidence"
+    assert_contains "$out" 'landed-commit evidence' "refusal did not identify missing landing evidence"
+    cmp -s "$case_dir/meta-before" "$home/state/$id.meta" || fail "refusal changed task metadata"
+    [ "$(row_state "$case_dir" "$id")" = in_flight ] || fail "refusal closed the backlog item"
+    assert_absent "$case_dir/local-copy-resource-action" "refusal returned a worktree"
+    if [ -f "$case_dir/marker-before" ]; then
+      cmp -s "$case_dir/marker-before" "$marker" || fail "refusal overwrote previous close evidence"
+    else
+      assert_absent "$marker" "refusal published a replayable close"
+    fi
+    if [ "$variant" = reassigned ]; then
+      commit=abcdef1234567890
+      printf 'merge_commit=%s\n' "$commit" >> "$home/state/$id.meta"
+      out=$(run_teardown "$case_dir" "$id") || fail "task-bound metadata did not permit cleanup: $out"
+      [ "$(row_state "$case_dir" "$id")" = done ] || fail "task-bound completion left the row open"
+      assert_grep "$commit" "$(backlog_of "$case_dir")" "completion lost the task-bound commit"
+      assert_present "$case_dir/pool/1/project/.git" "completion removed the reassigned worktree"
+      assert_grep 'task=another-task' "$case_dir/pool/1/.fm-slot-owner" "completion changed slot ownership"
+      assert_absent "$case_dir/local-copy-resource-action" "completion returned another task's worktree"
+      assert_absent "$marker" "task-bound completion left close residue"
+    fi
+  done
+  pass "Bitbucket teardown refuses missing or unbound evidence and never borrows another slot's HEAD"
+}
+
+test_bitbucket_retry_preserves_captured_landing_evidence() {
+  local case_dir home id commit out rc=0 marker
+  id=atomic-bitbucket-retry
+  case_dir=$(make_home bitbucket-retry "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=retry-incarnation" \
+    'pr=https://bitbucket.example/repo/pull-requests/7'
+  perl -0pi -e 's#worktree=[^\n]*#worktree='"$case_dir"'/wt#; s#project=[^\n]*#project='"$case_dir"'/project#' \
+    "$home/state/$id.meta"
+  commit=$(git -C "$case_dir/wt" rev-parse HEAD)
+  marker="$home/state/$id.backlog-close"
+  break_meta_removal "$case_dir" "$home/state/$id.meta"
+  out=$(run_teardown "$case_dir" "$id" --force) || rc=$?
+  [ "$rc" -ne 0 ] || fail "teardown ignored failed metadata removal"
+  assert_grep "landed-commit=$commit" "$marker" "interrupted teardown did not capture landing evidence"
+  rm "$case_dir/fakebin/rm"
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  out=$(run_teardown "$case_dir" "$id") || fail "retry lost captured landing evidence: $out"
+  [ "$(row_state "$case_dir" "$id")" = done ] || fail "retry left the backlog item open"
+  assert_grep "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=$commit" \
+    "$(backlog_of "$case_dir")" "retry lost the recorded PR and commit"
+  assert_absent "$home/state/$id.meta" "retry left task metadata behind"
+  assert_absent "$marker" "retry left close residue"
+  pass "Bitbucket teardown retries with incarnation-matching evidence after its worktree disappears"
+}
+
 test_completion_keeps_github_pr_link_behavior() {
   local case_dir home id out
   id=atomic-close-github-pr
@@ -3137,6 +3261,9 @@ test_spawn_refuses_a_data_directory_symlinked_outside_the_home
 test_configured_adapter_refuses_a_data_directory_outside_the_home
 test_dispatch_and_completion_are_structural
 test_completion_closes_a_bitbucket_pr_with_landing_note
+test_bitbucket_replay_preserves_validated_notes
+test_bitbucket_completion_refuses_unbound_landing_evidence
+test_bitbucket_retry_preserves_captured_landing_evidence
 test_completion_keeps_github_pr_link_behavior
 test_refused_teardown_leaves_the_item_live
 test_environment_selected_adapter_is_not_forced_to_markdown

@@ -1400,7 +1400,24 @@ work_is_landed() {
 # before cleanup.
 BACKLOG_DONE_ARGS=()
 backlog_landed_commit() {
-  local candidate
+  local candidate marker note
+  marker=$(fm_backlog_close_marker_path "$STATE" "$ID") || return 1
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    fm_backlog_close_marker_validate "$marker" "$DATA" "$ID" "$STATE" || return 1
+    if [ "$FM_BACKLOG_CLOSE_VALIDATED_SPAWN_GEN" = "$TEARDOWN_META_SPAWN_GEN" ] \
+       && [ "${FM_BACKLOG_CLOSE_VALIDATED_ARGS[0]-}" = --note ]; then
+      note=${FM_BACKLOG_CLOSE_VALIDATED_ARGS[1]-}
+      case "$note" in
+        "PR=$PR_URL;landed-commit="*)
+          candidate=${note#"PR=$PR_URL;landed-commit="}
+          case "$candidate" in
+            ''|*[!0-9a-fA-F]*) ;;
+            *) printf '%s\n' "$candidate"; return 0 ;;
+          esac
+          ;;
+      esac
+    fi
+  fi
   for candidate in \
     "$(grep '^merge_commit=' "$META" | tail -1 | cut -d= -f2- || true)" \
     "$(grep '^landed_commit=' "$META" | tail -1 | cut -d= -f2- || true)" \
@@ -1410,7 +1427,7 @@ backlog_landed_commit() {
       *) printf '%s\n' "$candidate"; return 0 ;;
     esac
   done
-  [ -n "$WT" ] && [ -d "$WT" ] \
+  teardown_owns_worktree && [ -n "$WT" ] && [ -d "$WT" ] \
     && git -C "$WT" rev-parse --verify "HEAD^{commit}" 2>/dev/null
 }
 backlog_bitbucket_pr_url() {
@@ -1438,12 +1455,11 @@ backlog_done_args() {
         BACKLOG_DONE_ARGS=(--note "local main")
       elif [ -n "$PR_URL" ]; then
         if backlog_bitbucket_pr_url "$PR_URL"; then
-          commit=$(backlog_landed_commit || true)
-          if [ -n "$commit" ]; then
-            BACKLOG_DONE_ARGS=(--note "PR=$PR_URL;landed-commit=$commit")
-          else
-            BACKLOG_DONE_ARGS=(--note "PR=$PR_URL")
+          if ! commit=$(backlog_landed_commit) || [ -z "$commit" ]; then
+            echo "error: Bitbucket task $ID lacks valid incarnation-matching landed-commit evidence; restore its landing record before teardown" >&2
+            return 1
           fi
+          BACKLOG_DONE_ARGS=(--note "PR=$PR_URL;landed-commit=$commit")
         else
           BACKLOG_DONE_ARGS=(--pr "$PR_URL")
         fi
