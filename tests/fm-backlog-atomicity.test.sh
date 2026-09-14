@@ -2891,6 +2891,55 @@ test_dispatch_and_completion_are_structural() {
   pass "dispatch and completion transition structurally with evidence"
 }
 
+test_completion_closes_a_bitbucket_pr_with_landing_note() {
+  local case_dir home id commit out
+  id=atomic-close-bitbucket-pr
+  case_dir=$(make_home close-bitbucket-pr "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=spawn-close-bitbucket"
+  perl -0pi -e 's#worktree=[^\n]*#worktree='"$case_dir"'/wt#; s#project=[^\n]*#project='"$case_dir"'/project#' \
+    "$home/state/$id.meta"
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t \
+    commit -q --allow-empty -m "land Bitbucket pull request"
+  commit=$(git -C "$case_dir/wt" rev-parse HEAD)
+  printf '%s\n' 'pr=https://bitbucket.example/repo/pull-requests/7' >> "$home/state/$id.meta"
+
+  out=$(run_teardown "$case_dir" "$id" --force) \
+    || fail "Bitbucket PR teardown failed: $out"
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "Bitbucket PR teardown left the backlog item outside Done"
+  assert_grep 'https://bitbucket.example/repo/pull-requests/7' "$(backlog_of "$case_dir")" \
+    "Bitbucket PR teardown did not preserve the pull-request URL"
+  assert_grep "$commit" "$(backlog_of "$case_dir")" \
+    "Bitbucket PR teardown did not preserve the landed commit"
+  assert_absent "$home/state/$id.backlog-close" \
+    "Bitbucket PR teardown left a replayable close marker"
+  pass "completion closes a Bitbucket PR with its URL and landed commit and leaves no residue"
+}
+
+test_completion_keeps_github_pr_link_behavior() {
+  local case_dir home id out
+  id=atomic-close-github-pr
+  case_dir=$(make_home close-github-pr "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=spawn-close-github"
+  printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$home/state/$id.meta"
+
+  out=$(run_teardown "$case_dir" "$id" --force) \
+    || fail "GitHub PR teardown failed: $out"
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "GitHub PR teardown left the backlog item outside Done"
+  assert_grep 'https://github.com/example/repo/pull/7' "$(backlog_of "$case_dir")" \
+    "GitHub PR teardown did not preserve the pull-request URL"
+  assert_absent "$home/state/$id.backlog-close" \
+    "GitHub PR teardown left a pending close marker"
+  pass "completion keeps GitHub PR teardown behavior unchanged"
+}
+
 test_refused_teardown_leaves_the_item_live() {
   local case_dir home id out rc=0
   id=fm-structural-refusal-b15
@@ -3087,6 +3136,8 @@ test_spawn_refuses_an_unsafe_tasks_config_before_exempting_a_missing_backlog
 test_spawn_refuses_a_data_directory_symlinked_outside_the_home
 test_configured_adapter_refuses_a_data_directory_outside_the_home
 test_dispatch_and_completion_are_structural
+test_completion_closes_a_bitbucket_pr_with_landing_note
+test_completion_keeps_github_pr_link_behavior
 test_refused_teardown_leaves_the_item_live
 test_environment_selected_adapter_is_not_forced_to_markdown
 test_manual_backend_home_dispatches_and_completes_without_touching_the_backlog

@@ -1393,11 +1393,40 @@ work_is_landed() {
 }
 
 # The completion links this teardown already holds locally. A scout's
-# deliverable is its report, a local-only ship lands on local main, and every
-# other ship carries the PR recorded on its own record.
+# deliverable is its report, a local-only ship lands on local main, and a
+# GitHub ship carries the PR recorded on its own record. A Bitbucket pull
+# request is recorded as a note because tasks-axi's --pr flag accepts GitHub
+# pull-request URLs only. The note also carries the landed commit captured
+# before cleanup.
 BACKLOG_DONE_ARGS=()
+backlog_landed_commit() {
+  local candidate
+  for candidate in \
+    "$(grep '^merge_commit=' "$META" | tail -1 | cut -d= -f2- || true)" \
+    "$(grep '^landed_commit=' "$META" | tail -1 | cut -d= -f2- || true)" \
+    "$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)"; do
+    case "$candidate" in
+      ''|*[!0-9a-fA-F]*) ;;
+      *) printf '%s\n' "$candidate"; return 0 ;;
+    esac
+  done
+  [ -n "$WT" ] && [ -d "$WT" ] \
+    && git -C "$WT" rev-parse --verify "HEAD^{commit}" 2>/dev/null
+}
+backlog_bitbucket_pr_url() {
+  local number
+  case "$1" in
+    https://github.com/*) return 1 ;;
+    https://*/*/pull-requests/[1-9]*)
+      number=${1##*/pull-requests/}
+      case "$number" in ''|*[!0-9]*) return 1 ;; esac
+      return 0
+      ;;
+  esac
+  return 1
+}
 backlog_done_args() {
-  local data_relative
+  local data_relative commit
   BACKLOG_DONE_ARGS=()
   case "$KIND" in
     scout)
@@ -1408,7 +1437,16 @@ backlog_done_args() {
       if [ "$MODE" = local-only ]; then
         BACKLOG_DONE_ARGS=(--note "local main")
       elif [ -n "$PR_URL" ]; then
-        BACKLOG_DONE_ARGS=(--pr "$PR_URL")
+        if backlog_bitbucket_pr_url "$PR_URL"; then
+          commit=$(backlog_landed_commit || true)
+          if [ -n "$commit" ]; then
+            BACKLOG_DONE_ARGS=(--note "PR=$PR_URL;landed-commit=$commit")
+          else
+            BACKLOG_DONE_ARGS=(--note "PR=$PR_URL")
+          fi
+        else
+          BACKLOG_DONE_ARGS=(--pr "$PR_URL")
+        fi
       fi
       ;;
   esac

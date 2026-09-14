@@ -992,7 +992,15 @@ fm_backlog_close_marker_validate() {  # <marker-path> <authorized-data-dir> <exp
     0) ;;
     2)
       case "${args[0]}" in
-        --note) [ "${args[1]}" = "local%20main" ] ;;
+        --note)
+          arg_value=${args[1]}
+          [ "${#arg_value}" -le 8192 ] \
+            && [ -n "$arg_value" ] \
+            && case "$arg_value" in
+              *[[:space:]]*|*[!A-Za-z0-9:/?\&=._#%+~@\;,-]*) false ;;
+              *) true ;;
+            esac
+          ;;
         --pr)
           arg_value=${args[1]}
           [ "${#arg_value}" -le 2048 ] \
