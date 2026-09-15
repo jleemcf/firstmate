@@ -45,12 +45,22 @@
 # The writer and replay share one complete-record validator, and teardown stages
 # that record before destructive cleanup, so it never publishes or acts on a close
 # replay would reject. The validator pins the data path to this home's configured
-# root before any recovery mutation, then re-runs exactly that close.
+# root before any recovery mutation, then replays the recorded transition.
+# Legacy Bitbucket --pr markers migrate to the completion-note form owned by
+# bin/fm-teardown.sh's header, using a nonempty hexadecimal merge_commit from
+# metadata with the same spawn_gen. Replay persists that migrated evidence before
+# removing metadata, so a failed backlog mutation can retry without losing it.
+# Missing metadata or missing/invalid merge_commit refuses without changing the
+# marker or metadata; restore the incarnation's landing record before retrying.
+# A marker for a different live spawn_gen keeps the existing stale-marker path:
+# retire the marker without changing that incarnation's metadata or backlog row.
+# GitHub --pr markers are not migrated.
 # Validated --note values survive replay unchanged, except the exact legacy
 # local%20main value, which round-trips as "local main". This is not general
 # percent decoding: embedded local%20main and other percent sequences stay
 # literal. fm_backlog_close_marker_validate owns the bounded character allowlist;
-# tests/fm-backlog-atomicity.test.sh covers note preservation across failed replay.
+# tests/fm-backlog-atomicity.test.sh covers legacy migration, missing-evidence
+# refusals, and note preservation across failed replay.
 # `tasks-axi done` on an already-closed task backfills links
 # without moving the close date, so replay is idempotent. Spawn needs no marker:
 # it publishes the meta first, so a crash
@@ -898,8 +908,8 @@ fm_backlog_close_marker_path() {  # <state-dir> <id>
   printf '%s/%s.backlog-close\n' "$1" "$2"
 }
 
-# tasks-axi accepts GitHub pull-request links through --pr, but Bitbucket
-# pull-request links must be retained as a note in the task body.
+# Shared URL classification for teardown's completion-evidence contract and the
+# legacy-marker migration described in this library's header.
 fm_backlog_bitbucket_pr_url() {  # <url>
   local number
   case "$1" in
