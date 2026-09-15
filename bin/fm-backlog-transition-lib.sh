@@ -1176,7 +1176,7 @@ fm_backlog_close_marker_clear() {  # <state-dir> <id>
 # any meta or backlog mutation.
 fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data-dir>
   local state=$1 marker=$2 marker_name expected_id
-  local id data marker_spawn_gen meta meta_spawn_gen row_state cleanup_incomplete mode
+  local id data marker_spawn_gen meta meta_spawn_gen='' row_state cleanup_incomplete mode commit
   local args=() mode_flags=()
   FM_BACKLOG_CLOSE_REPLAY_RESULT=noop
   fm_backlog_directory_present "$state" "state directory" || return 1
@@ -1196,10 +1196,6 @@ fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data
   args=("${FM_BACKLOG_CLOSE_VALIDATED_ARGS[@]+"${FM_BACKLOG_CLOSE_VALIDATED_ARGS[@]}"}")
   if [ "${args[0]-}" = --note ] && [ "${args[1]-}" = 'local%20main' ]; then
     args[1]="local main"
-  elif [ "${args[0]-}" = --pr ] && fm_backlog_bitbucket_pr_url "${args[1]-}"; then
-    # A pre-compatibility marker has no note argument, so retain its URL in
-    # the task body instead of replaying the rejected Bitbucket --pr flag.
-    args=(--note "PR=${args[1]}")
   fi
   meta="$state/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
@@ -1214,6 +1210,21 @@ fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data
       FM_BACKLOG_CLOSE_REPLAY_RESULT=stale
       return 0
     fi
+  fi
+  if [ "${args[0]-}" = --pr ] && fm_backlog_bitbucket_pr_url "${args[1]-}"; then
+    commit=
+    if [ "$meta_spawn_gen" = "$marker_spawn_gen" ]; then
+      commit=$(grep '^merge_commit=' "$meta" | tail -1 | cut -d= -f2- || true)
+    fi
+    case "$commit" in
+      ''|*[!0-9a-fA-F]*)
+        FM_BACKLOG_TRANSITION_ERROR="Bitbucket task $id lacks valid incarnation-matching merge_commit evidence; restore its landing record before replay"
+        return 1
+        ;;
+    esac
+    args=(--note "PR=${args[1]};landed-commit=$commit")
+  fi
+  if [ -n "$meta_spawn_gen" ]; then
     fm_backlog_close_marker_mark_cleanup_incomplete "$state" "$marker" "$id" "$data" \
       "$marker_spawn_gen" "${mode_flags[@]+"${mode_flags[@]}"}" "${args[@]+"${args[@]}"}" \
       || return 1

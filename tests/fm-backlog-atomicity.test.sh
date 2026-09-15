@@ -2996,9 +2996,7 @@ test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record() {
   start_item "$case_dir" "$id"
   write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=legacy-marker"
   commit=$(git -C "$case_dir/wt" rev-parse HEAD)
-  printf 'Landed commit: %s\n' "$commit" > "$case_dir/landing-body"
-  tasks-axi update "$id" --body-file "$case_dir/landing-body" --archive-body \
-    --file "$(backlog_of "$case_dir")" >/dev/null
+  printf 'merge_commit=%s\n' "$commit" >> "$home/state/$id.meta"
   marker="$home/state/$id.backlog-close"
   printf 'id=%s\ndata=%s\nspawn_gen=legacy-marker\narg=--pr\narg=https://bitbucket.example/repo/pull-requests/7\n' \
     "$id" "$home/data" > "$marker"
@@ -3007,6 +3005,9 @@ test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record() {
   out=$(run_bootstrap "$case_dir")
   assert_present "$marker" "failed legacy Bitbucket replay discarded its marker"
   assert_grep 'arg=--note' "$marker" "legacy Bitbucket replay did not migrate its PR argument"
+  assert_grep "arg=PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=$commit" \
+    "$marker" "legacy Bitbucket migration lost metadata commit evidence"
+  assert_absent "$home/state/$id.meta" "legacy Bitbucket replay did not remove matching metadata: $out"
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
     || fail "failed legacy Bitbucket replay closed the backlog item"
   rm "$case_dir/fakebin/tasks-axi"
@@ -3016,9 +3017,52 @@ test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record() {
   assert_grep 'https://bitbucket.example/repo/pull-requests/7' "$(backlog_of "$case_dir")" \
     "legacy Bitbucket replay lost the pull-request URL"
   assert_grep "$commit" "$(backlog_of "$case_dir")" \
-    "legacy Bitbucket replay lost the existing landed commit"
+    "legacy Bitbucket replay lost the metadata landed commit"
   assert_absent "$marker" "legacy Bitbucket replay left close residue"
   pass "legacy Bitbucket PR markers migrate to notes and replay without stranding"
+}
+
+test_legacy_bitbucket_replay_refuses_missing_commit_evidence() {
+  local case_dir home id marker out variant
+  for variant in missing-meta missing-commit invalid-commit mismatched-incarnation; do
+    id="atomic-legacy-bitbucket-$variant"
+    case_dir=$(make_home "legacy-bitbucket-$variant" "$id")
+    home=$(home_of "$case_dir")
+    add_item "$case_dir" "$id"
+    start_item "$case_dir" "$id"
+    write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=legacy-marker"
+    case "$variant" in
+      missing-meta) rm "$home/state/$id.meta" ;;
+      invalid-commit) printf 'merge_commit=not-a-commit\n' >> "$home/state/$id.meta" ;;
+      mismatched-incarnation)
+        write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=new-owner" \
+          'merge_commit=abcdef1234567890'
+        ;;
+    esac
+    marker="$home/state/$id.backlog-close"
+    printf 'id=%s\ndata=%s\nspawn_gen=legacy-marker\narg=--pr\narg=https://bitbucket.example/repo/pull-requests/7\n' \
+      "$id" "$home/data" > "$marker"
+    cp "$marker" "$case_dir/marker-before"
+    [ "$variant" = missing-meta ] || cp "$home/state/$id.meta" "$case_dir/meta-before"
+    out=$(run_bootstrap "$case_dir")
+    [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+      || fail "legacy Bitbucket replay closed without matching commit evidence: $out"
+    if [ "$variant" = mismatched-incarnation ]; then
+      assert_absent "$marker" "legacy Bitbucket replay retained a stale incarnation marker"
+    else
+      cmp -s "$case_dir/marker-before" "$marker" \
+        || fail "refused legacy Bitbucket replay changed its marker: $out"
+      assert_contains "$out" 'incarnation-matching merge_commit evidence' \
+        "legacy Bitbucket replay did not explain missing commit evidence"
+    fi
+    if [ "$variant" = missing-meta ]; then
+      assert_absent "$home/state/$id.meta" "refused replay created metadata"
+    else
+      cmp -s "$case_dir/meta-before" "$home/state/$id.meta" \
+        || fail "legacy Bitbucket replay changed metadata without matching commit evidence"
+    fi
+  done
+  pass "legacy Bitbucket replay refuses missing commit evidence and ignores stale incarnations"
 }
 
 test_bitbucket_completion_refuses_unbound_landing_evidence() {
@@ -3331,6 +3375,7 @@ test_dispatch_and_completion_are_structural
 test_completion_closes_a_bitbucket_pr_with_landing_note
 test_bitbucket_replay_preserves_validated_notes
 test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record
+test_legacy_bitbucket_replay_refuses_missing_commit_evidence
 test_bitbucket_completion_refuses_unbound_landing_evidence
 test_bitbucket_retry_preserves_captured_landing_evidence
 test_completion_keeps_github_pr_link_behavior
