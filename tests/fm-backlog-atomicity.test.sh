@@ -2987,6 +2987,40 @@ test_bitbucket_replay_preserves_validated_notes() {
   pass "replay preserves validated notes across failures and decodes only the legacy note"
 }
 
+test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record() {
+  local case_dir home id marker commit out
+  id=atomic-legacy-bitbucket-marker
+  case_dir=$(make_home legacy-bitbucket-marker "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship no-mistakes "spawn_gen=legacy-marker"
+  commit=$(git -C "$case_dir/wt" rev-parse HEAD)
+  printf 'Landed commit: %s\n' "$commit" > "$case_dir/landing-body"
+  tasks-axi update "$id" --body-file "$case_dir/landing-body" --archive-body \
+    --file "$(backlog_of "$case_dir")" >/dev/null
+  marker="$home/state/$id.backlog-close"
+  printf 'id=%s\ndata=%s\nspawn_gen=legacy-marker\narg=--pr\narg=https://bitbucket.example/repo/pull-requests/7\n' \
+    "$id" "$home/data" > "$marker"
+
+  break_verb "$case_dir" "done"
+  out=$(run_bootstrap "$case_dir")
+  assert_present "$marker" "failed legacy Bitbucket replay discarded its marker"
+  assert_grep 'arg=--note' "$marker" "legacy Bitbucket replay did not migrate its PR argument"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "failed legacy Bitbucket replay closed the backlog item"
+  rm "$case_dir/fakebin/tasks-axi"
+  out=$(run_bootstrap "$case_dir")
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "legacy Bitbucket replay did not close the backlog item: $out"
+  assert_grep 'https://bitbucket.example/repo/pull-requests/7' "$(backlog_of "$case_dir")" \
+    "legacy Bitbucket replay lost the pull-request URL"
+  assert_grep "$commit" "$(backlog_of "$case_dir")" \
+    "legacy Bitbucket replay lost the existing landed commit"
+  assert_absent "$marker" "legacy Bitbucket replay left close residue"
+  pass "legacy Bitbucket PR markers migrate to notes and replay without stranding"
+}
+
 test_bitbucket_completion_refuses_unbound_landing_evidence() {
   local case_dir home id marker out rc variant note gen commit
   for variant in missing reassigned stale wrong-pr invalid; do
@@ -3296,6 +3330,7 @@ test_configured_adapter_refuses_a_data_directory_outside_the_home
 test_dispatch_and_completion_are_structural
 test_completion_closes_a_bitbucket_pr_with_landing_note
 test_bitbucket_replay_preserves_validated_notes
+test_legacy_bitbucket_pr_marker_replays_with_existing_landing_record
 test_bitbucket_completion_refuses_unbound_landing_evidence
 test_bitbucket_retry_preserves_captured_landing_evidence
 test_completion_keeps_github_pr_link_behavior

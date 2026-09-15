@@ -898,6 +898,21 @@ fm_backlog_close_marker_path() {  # <state-dir> <id>
   printf '%s/%s.backlog-close\n' "$1" "$2"
 }
 
+# tasks-axi accepts GitHub pull-request links through --pr, but Bitbucket
+# pull-request links must be retained as a note in the task body.
+fm_backlog_bitbucket_pr_url() {  # <url>
+  local number
+  case "$1" in
+    https://github.com/*) return 1 ;;
+    https://*/*/pull-requests/[1-9]*)
+      number=${1##*/pull-requests/}
+      case "$number" in ''|*[!0-9]*) return 1 ;; esac
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 fm_backlog_close_marker_validate() {  # <marker-path> <authorized-data-dir> <expected-id> <state-dir>
   local marker=$1 authorized_data data_resolved expected_id=$3 state=$4
   local id='' data='' marker_spawn_gen='' cleanup_incomplete=0 mode=close line raw_bytes arg_value
@@ -1181,6 +1196,10 @@ fm_backlog_close_marker_replay() {  # <state-dir> <marker-path> <authorized-data
   args=("${FM_BACKLOG_CLOSE_VALIDATED_ARGS[@]+"${FM_BACKLOG_CLOSE_VALIDATED_ARGS[@]}"}")
   if [ "${args[0]-}" = --note ] && [ "${args[1]-}" = 'local%20main' ]; then
     args[1]="local main"
+  elif [ "${args[0]-}" = --pr ] && fm_backlog_bitbucket_pr_url "${args[1]-}"; then
+    # A pre-compatibility marker has no note argument, so retain its URL in
+    # the task body instead of replaying the rejected Bitbucket --pr flag.
+    args=(--note "PR=${args[1]}")
   fi
   meta="$state/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then

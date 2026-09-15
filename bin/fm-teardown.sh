@@ -1439,18 +1439,6 @@ backlog_landed_commit() {
   teardown_owns_worktree && [ -n "$WT" ] && [ -d "$WT" ] \
     && git -C "$WT" rev-parse --verify "HEAD^{commit}" 2>/dev/null
 }
-backlog_bitbucket_pr_url() {
-  local number
-  case "$1" in
-    https://github.com/*) return 1 ;;
-    https://*/*/pull-requests/[1-9]*)
-      number=${1##*/pull-requests/}
-      case "$number" in ''|*[!0-9]*) return 1 ;; esac
-      return 0
-      ;;
-  esac
-  return 1
-}
 backlog_done_args() {
   local data_relative commit
   BACKLOG_DONE_ARGS=()
@@ -1463,7 +1451,7 @@ backlog_done_args() {
       if [ "$MODE" = local-only ]; then
         BACKLOG_DONE_ARGS=(--note "local main")
       elif [ -n "$PR_URL" ]; then
-        if backlog_bitbucket_pr_url "$PR_URL"; then
+        if fm_backlog_bitbucket_pr_url "$PR_URL"; then
           if ! commit=$(backlog_landed_commit) || [ -z "$commit" ]; then
             echo "error: Bitbucket task $ID lacks valid incarnation-matching landed-commit evidence; restore its landing record before teardown" >&2
             return 1
