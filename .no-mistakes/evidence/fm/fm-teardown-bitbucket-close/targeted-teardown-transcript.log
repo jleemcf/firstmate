@@ -1,0 +1,49 @@
+Fixture: real Git and tasks-axi; simulated terminal and pool boundary (pool stub removes the real Git worktree).
+$ bin/fm-teardown.sh atomic-close-bitbucket-pr
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 1s ago).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair a missing or failed watcher cycle with the Pi tool fm_watch_arm_pi, or restart Pi with -e /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.pi/extensions/fm-primary-turnend-guard.ts -e /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.pi/extensions/fm-primary-pi-watch.ts if the extensions are not loaded.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.EyOTGG/close-bitbucket-pr/project: already current
+teardown atomic-close-bitbucket-pr complete (window firstmate:fm-atomic-close-bitbucket-pr, worktree /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.EyOTGG/close-bitbucket-pr/wt)
+Backlog: atomic-close-bitbucket-pr is closed in /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.EyOTGG/close-bitbucket-pr/home/data/backlog.md. Run bin/fm-tasks-axi.sh ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due.
+
+Pool request: return --force /home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.EyOTGG/close-bitbucket-pr/wt
+Endpoint request: kill-window -t =firstmate:=fm-atomic-close-bitbucket-pr
+Task copy present: no
+Task metadata present: no
+
+$ tasks-axi show atomic-close-bitbucket-pr --file <fixture>/home/data/backlog.md
+task:
+  id: atomic-close-bitbucket-pr
+  title: item for atomic-close-bitbucket-pr
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=0a61239ee7f849c72d8d721351c32fea91778a9a"
+ok - completion closes a Bitbucket PR with its URL and landed commit and leaves no residue
+ok - replay preserves validated notes across failures and decodes only the legacy note
+ok - legacy Bitbucket PR markers migrate to notes and replay without stranding
+ok - legacy Bitbucket replay refuses missing commit evidence and ignores stale incarnations
+ok - Bitbucket teardown refuses missing or unbound evidence and never borrows another slot's HEAD
+ok - Bitbucket teardown retries with incarnation-matching evidence after its worktree disappears
+ok - completion keeps GitHub PR teardown behavior unchanged
+ok - session start finishes a close an interrupted cleanup recorded but never landed
+ok - recovery backfills recorded links onto already Done items
+ok - session start finishes a close for the matching meta incarnation
+ok - recovery rejects malformed PR URL values
+ok - recovery rejects close-marker arguments outside its protocol

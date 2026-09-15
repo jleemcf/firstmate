@@ -1,0 +1,72 @@
+Legacy migration fixture: real Git and tasks-axi; external terminal/pool commands stubbed; bootstrap network disabled.
+
+BEFORE: metadata-only merge_commit=9d5e59062292e5a386e43f45bef4f1b9d2ca6761; no commit in backlog body
+$ tasks-axi show evidence-legacy-bitbucket
+task:
+  id: evidence-legacy-bitbucket
+  title: item for evidence-legacy-bitbucket
+  state: in_flight
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: 2026-09-14
+  closed: "-"
+  deps: none
+  links: none
+  body: ""
+
+Persisted legacy marker:
+id=evidence-legacy-bitbucket
+data=/home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.dlzegk/evidence-legacy-bitbucket/home/data
+spawn_gen=evidence-incarnation
+arg=--pr
+arg=https://bitbucket.example/repo/pull-requests/7
+
+$ bin/fm-bootstrap.sh  # injected tasks-axi done failure
+BACKLOG_RECONCILE: evidence-legacy-bitbucket: recorded backlog close could not be replayed: error: "backlog is unwritable"
+MISSING: treehouse (install: curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh)
+MISSING: no-mistakes (install: curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh)
+MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)
+
+Persisted migrated marker after failed close (metadata removed):
+id=evidence-legacy-bitbucket
+data=/home/jameslee/.no-mistakes/worktrees/e0101dd4c498/01M2H8X74YA9TMD0BKKVPK3JYW/.test-phase-tmp/tmp/fm-backlog-atomicity.dlzegk/evidence-legacy-bitbucket/home/data
+spawn_gen=evidence-incarnation
+cleanup_incomplete=1
+arg=--note
+arg=PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=9d5e59062292e5a386e43f45bef4f1b9d2ca6761
+
+$ bin/fm-bootstrap.sh  # retry with real tasks-axi
+BOOTSTRAP_INFO: closed the backlog item for evidence-legacy-bitbucket after interrupted cleanup; its endpoint or local copy may remain and should be reconciled
+MISSING: treehouse (install: curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh)
+MISSING: no-mistakes (install: curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh)
+MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)
+
+AFTER: $ tasks-axi show evidence-legacy-bitbucket
+task:
+  id: evidence-legacy-bitbucket
+  title: item for evidence-legacy-bitbucket
+  state: done
+  blocked: no
+  blocked_by: none
+  held: no
+  hold_reason: "-"
+  hold_kind: "-"
+  hold_until: "-"
+  kind: ship
+  repo: "-"
+  priority: "-"
+  created: "-"
+  closed: 2026-09-14
+  deps: none
+  links: none
+  body: "PR=https://bitbucket.example/repo/pull-requests/7;landed-commit=9d5e59062292e5a386e43f45bef4f1b9d2ca6761"
+
+Task metadata present: no
+Replayable backlog-close marker present: no
